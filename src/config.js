@@ -1,6 +1,7 @@
 import fs from 'node:fs';
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 import YAML from 'yaml';
+import { validateWorkPolicy } from './work-policy.js';
 
 const DURATION_RE = /^([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)$/;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -97,6 +98,7 @@ const DEFAULTS = {
     max_pause: '168h',
     state_path: '/app/state/maintenance.json',
   },
+  work_policy: { timezone: 'America/New_York', schedules: {} },
   frigate: {
     enabled: false,
     url: '',
@@ -120,6 +122,8 @@ const DEFAULTS = {
     page_size: 100,
     max_jobs: 10000,
     history_limit: 1000,
+    catchup_order: 'newest_first',
+    safety_retry_interval: '30s',
     context_rescue: {
       enabled: false,
       model: '',
@@ -130,6 +134,10 @@ const DEFAULTS = {
   },
   clients: {
     default: {
+      enabled: true,
+      header_enabled: true,
+      listener_port: 0,
+      queue_while_paused: false,
       priority: 50,
       queue_limit: 20,
       request_ttl: '10m',
@@ -186,6 +194,7 @@ function durationFields(config) {
     poll_interval: 'pollIntervalMs', live_grace: 'liveGraceMs',
     confirmation_interval: 'confirmationIntervalMs', cleanup_interval: 'cleanupIntervalMs',
     retry_interval: 'retryIntervalMs', max_retry_interval: 'maxRetryIntervalMs',
+    safety_retry_interval: 'safetyRetryIntervalMs',
     attention_after: 'attentionAfterMs',
     request_timeout: 'requestTimeoutMs', generation_timeout: 'generationTimeoutMs',
   })) config.frigate[derived] = parseDuration(config.frigate[field], `frigate.${field}`);
@@ -384,7 +393,16 @@ function validate(config) {
     throw new Error('scheduler.max_parallel_generations must be 1; this release intentionally serializes GPU work');
   }
   if (!config.clients.default) throw new Error('clients.default is required');
+  if (Object.keys(config.clients).length > 100) throw new Error('clients must contain at most 100 sources');
+  const ipRules = [];
   for (const [name, client] of Object.entries(config.clients)) {
+    for (const field of ['enabled', 'header_enabled', 'queue_while_paused']) {
+      if (typeof client[field] !== 'boolean') throw new Error(`clients.${name}.${field} must be true or false`);
+    }
+    if (!Number.isInteger(client.listener_port) || client.listener_port < 0 || client.listener_port > 65535) {
+      throw new Error(`clients.${name}.listener_port must be 0 (off) or an available port`);
+    }
+    if (client.listener_port) listenerAddresses.push({ host: '0.0.0.0', port: client.listener_port });
     if (!Number.isFinite(client.priority)) throw new Error(`clients.${name}.priority must be a number`);
     if (!Number.isInteger(client.queue_limit) || client.queue_limit < 1) throw new Error(`clients.${name}.queue_limit must be a positive integer`);
     if (!['reject', 'drop_newest', 'drop_oldest'].includes(client.overflow_policy)) {
@@ -403,8 +421,26 @@ function validate(config) {
           throw new Error(`clients.${name}.source_ips.${index} has an invalid CIDR prefix`);
         }
       }
+      const type = family === 4 ? 'ipv4' : 'ipv6';
+      const block = new BlockList();
+      block.addSubnet(address, prefix === undefined ? (family === 4 ? 32 : 128) : Number(prefix), type);
+      if (ipRules.some((rule) => rule.name !== name && rule.type === type
+        && (rule.block.check(address, type) || block.check(rule.address, type)))) {
+        throw new Error(`clients.${name}.source_ips overlaps another source; use a dedicated port or non-overlapping IP mappings`);
+      }
+      ipRules.push({ name, address, type, block });
+      if (ipRules.length > 1000) throw new Error('clients.source_ips must contain at most 1000 total mappings');
     }
   }
+  const claimedPorts = new Set();
+  for (const listener of listenerAddresses) {
+    if (listener.port === 0) continue; // ephemeral listeners used by tests
+    if (claimedPorts.has(listener.port)) throw new Error('listener port conflicts with another intermediary listener');
+    claimedPorts.add(listener.port);
+  }
+  if (!['newest_first', 'oldest_first'].includes(config.frigate.catchup_order)) throw new Error('frigate.catchup_order must be newest_first or oldest_first');
+  if (config.frigate.safetyRetryIntervalMs < 5000 || config.frigate.safetyRetryIntervalMs > 300000) throw new Error('frigate.safety_retry_interval must be between 5s and 5m');
+  validateWorkPolicy(config);
   if (!['hold', 'reject_new'].includes(config.circuit_breaker.queue_behavior)) {
     throw new Error('circuit_breaker.queue_behavior must be hold or reject_new');
   }
@@ -476,7 +512,8 @@ export function normalizeConfig(raw = {}) {
   const config = deepMerge(clone(DEFAULTS), raw);
   // Every named client inherits operational defaults, while retaining its own identity fields.
   for (const [name, client] of Object.entries(config.clients)) {
-    if (name !== 'default') config.clients[name] = deepMerge(clone(config.clients.default), client);
+    if (name !== 'default') config.clients[name] = deepMerge({ ...clone(config.clients.default), enabled: true,
+      header_enabled: true, queue_while_paused: false, listener_port: 0, source_ips: [], models: [] }, client);
   }
   durationFields(config);
   validate(config);

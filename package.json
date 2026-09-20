@@ -1,6 +1,6 @@
 {
   "name": "ollama-scheduling-proxy",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Model-aware scheduling reverse proxy for a single Ollama backend",
   "type": "module",
   "private": true,

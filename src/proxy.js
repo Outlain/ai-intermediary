@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import { BackendClient, BackendState, OperationGate, RECOVERY_REASONS } from './backend.js';
 import { HostHelperClient } from './host-helper.js';
 import { AutomaticRecovery } from './auto-recovery.js';
@@ -13,13 +14,14 @@ import {
   summarizeRequest,
 } from './observability.js';
 import { createJob, Scheduler } from './scheduler.js';
-import { MaintenanceState } from './maintenance.js';
+import { MaintenanceState, parsePauseDuration } from './maintenance.js';
+import { WorkPolicy } from './work-policy.js';
 import { parseListen } from './config.js';
 import { DASHBOARD_CSS, DASHBOARD_HTML, DASHBOARD_JS } from './dashboard.js';
 import { FrigateCatchup } from './frigate-catchup.js';
 import { FrigateController } from './frigate-controller.js';
 import { BUILD_INFO } from './build-info.js';
-import { contextOverflow, contextRequest, rescueHardwareBlock } from './context-rescue.js';
+import { DEFERRAL_REASONS, contextOverflow, contextRequest, rescueHardwareBlock } from './context-rescue.js';
 import { memoryBlock } from './memory-guard.js';
 
 function contentHeaders(headers, body) {
@@ -73,11 +75,14 @@ export class ProxyService {
     this.metrics = options.metrics ?? new Metrics();
     this.observability = options.observability ?? new Observability(config, { clock: this.clock });
     this.classifier = new Classifier(config);
+    this.workPolicy = new WorkPolicy(config, { clock: this.clock });
     this.scheduler = new Scheduler(config, {
       logger: this.logger,
       metrics: this.metrics,
       observability: this.observability,
       clock: this.clock,
+      pauseCheck: (client, traffic) => this.workPolicy.block(client, traffic)
+        ?? (this.releasePaused ? { reason: 'maintenance_paused' } : null),
     });
     this.backendClient = new BackendClient(config);
     this.gate = new OperationGate(() => this.scheduler.wake());
@@ -88,13 +93,14 @@ export class ProxyService {
       onChange: () => {
         this.scheduler.wake();
         this.recordBackendTransition();
-        if (this.maintenance?.paused) this.kickMaintenanceQuiescence();
+        if (this.releasePaused) this.kickMaintenanceQuiescence();
       },
       clock: this.clock,
     });
     this.backendSignature = null;
     this.backendObservation = null;
     this.servers = [];
+    this.listenerFailures = [];
     this.sequence = 0;
     this.workerController = new AbortController();
     this.running = false;
@@ -110,6 +116,14 @@ export class ProxyService {
       onAutoResume: () => this.resumeMaintenance('timer'),
     });
     if (this.maintenance.paused) this.scheduler.pause();
+    this.scheduledMaintenance = new MaintenanceState({ ...config, maintenance: {
+      ...config.maintenance, enabled: true, state_path: `${config.maintenance.state_path}.scheduled`,
+    } }, { clock: this.clock, logger: this.logger, onChange: () => this.scheduler.wake() });
+    const service = this;
+    const recoveryPause = {
+      get paused() { return service.releasePaused; },
+      get revision() { return `${service.maintenance.revision}:${service.scheduledMaintenance.revision}`; },
+    };
     this.catchup = options.catchup ?? new FrigateCatchup(config, {
       logger: this.logger,
       clock: this.clock,
@@ -126,7 +140,7 @@ export class ProxyService {
     });
     this.automaticRecovery = new AutomaticRecovery(config, {
       clock: this.clock, helper: this.hostHelper, backend: this.backend, backendClient: this.backendClient,
-      gate: this.gate, scheduler: this.scheduler, catchup: this.catchup, maintenance: this.maintenance,
+      gate: this.gate, scheduler: this.scheduler, catchup: this.catchup, maintenance: recoveryPause,
       isStopping: () => !this.running || this.settingsRestartPending,
       onChange: () => this.scheduler.wake(),
       onEvent: (event, fields) => this.observability.record(event, fields),
@@ -136,6 +150,7 @@ export class ProxyService {
   async start({ listen = true } = {}) {
     if (this.running) return this.addresses();
     this.running = true;
+    await this.syncWorkPolicy();
     this.backend.start();
     this.catchup.start();
     if (this.catchup.requiresRecovery) {
@@ -144,7 +159,10 @@ export class ProxyService {
     this.hostHelper.start();
     this.automaticRecovery.start();
     this.workerPromise = this.dispatchLoop();
-    this.expiryTimer = setInterval(() => this.scheduler.expire(), Math.min(1_000, this.config.ollama.healthIntervalMs));
+    this.expiryTimer = setInterval(() => {
+      this.scheduler.enforcePauses();
+      void this.syncWorkPolicy();
+    }, Math.min(1_000, this.config.ollama.healthIntervalMs));
     this.expiryTimer.unref?.();
     if (this.maintenance.paused) {
       this.observability.record('maintenance_pause_restored', this.maintenance.status());
@@ -155,6 +173,18 @@ export class ProxyService {
       for (const listener of this.config.server.dedicated_listeners) {
         if (!this.config.clients[listener.client]) throw new Error(`dedicated listener references unknown client ${listener.client}`);
         await this.startServer(listener.listen, listener.client);
+      }
+      for (const [client, policy] of Object.entries(this.config.clients)) {
+        if (!policy.listener_port) continue;
+        try { await this.startServer(`0.0.0.0:${policy.listener_port}`, client); }
+        catch (error) {
+          if (!['EADDRINUSE', 'EACCES', 'EPERM'].includes(error.code)) throw error;
+          // Keep the main settings listener reachable so an optional port can
+          // be repaired instead of trapping the service in a restart loop.
+          this.listenerFailures.push({ port: policy.listener_port, source: client, state: 'unavailable', reason: error.code, publication: 'unverified' });
+          this.logger.error('source listener unavailable; correct its port in Settings', { client, port: policy.listener_port, code: error.code });
+          this.observability.record('source_listener_failed', { client, port: policy.listener_port, reason: error.code });
+        }
       }
     }
     return this.addresses();
@@ -180,6 +210,35 @@ export class ProxyService {
 
   addresses() {
     return this.servers.map(({ server, forcedClient }) => ({ address: server.address(), forcedClient }));
+  }
+
+  get releasePaused() {
+    return Boolean(this.maintenance?.paused || this.scheduledMaintenance?.paused || this.workPolicy.releaseRequested());
+  }
+
+  get releaseState() { return this.maintenance.paused ? this.maintenance : this.scheduledMaintenance; }
+
+  async syncWorkPolicy() {
+    if (this.policySync) return this.policySync;
+    this.policySync = (async () => {
+      const requested = this.workPolicy.releaseRequested();
+      if (requested && !this.scheduledMaintenance.paused) {
+        await this.scheduledMaintenance.begin({ reason: 'Scheduled GPU reservation' });
+      } else if (!requested && this.scheduledMaintenance.paused) {
+        // Let any bounded model unload finish instead of aborting it at the
+        // window boundary and losing proof that it stopped.
+        await this.maintenanceTask;
+        if (!this.running) return;
+        await this.scheduledMaintenance.resume('schedule_ended');
+      }
+      this.scheduler.enforcePauses();
+      if (this.releasePaused) this.kickMaintenanceQuiescence();
+    })().catch((error) => {
+      this.workPolicy.error = 'Scheduled pause state could not be persisted; admission is blocked.';
+      this.scheduler.enforcePauses();
+      this.logger.error('scheduled pause failed closed', { error: error.message });
+    }).finally(() => { this.policySync = null; });
+    return this.policySync;
   }
 
   async handle(request, response, forcedClient = null) {
@@ -228,7 +287,8 @@ export class ProxyService {
     }
     if (request.method === 'GET' && url.pathname === '/healthz') return sendJson(response, 200, { status: 'ok' }, id);
     if (request.method === 'GET' && url.pathname === '/readyz') {
-      const ready = !this.settingsRestartPending && !this.maintenance.paused && this.backend.canDispatch();
+      const ready = !this.settingsRestartPending && !this.releasePaused && !this.workPolicy.error && this.backend.canDispatch()
+        && Object.keys(this.config.clients).some((client) => !this.scheduler.pauseReason({ client, trafficClass: 'live' }));
       const permitted = authorized(request, this.config.observability.auth_token);
       const snapshot = permitted ? this.observabilitySnapshot() : null;
       return sendJson(response, ready ? 200 : 503, {
@@ -246,7 +306,7 @@ export class ProxyService {
     }
     if (endpointClass === 'generation') return this.withBodyBudget(request, response, id, () => this.handleGeneration(request, response, url, id, forcedClient));
     if (endpointClass === 'management') return this.withBodyBudget(request, response, id, () => this.handleManagement(request, response, url, id));
-    if (this.maintenance.paused && !isSafeMetadataEndpoint(request.method, url.pathname)) {
+    if (this.releasePaused && !isSafeMetadataEndpoint(request.method, url.pathname)) {
       return this.sendMaintenancePaused(response, id);
     }
     if (endpointClass !== 'metadata') {
@@ -279,7 +339,7 @@ export class ProxyService {
     const readiness = this.scheduler.backgroundReadiness();
     if (!this.running || this.settingsRestartPending) return { allowed: false, reason: 'service_stopping' };
     if (this.incomingRequests) return { allowed: false, reason: 'live_requests_pending' };
-    if (this.maintenance.paused) return { allowed: false, reason: 'maintenance_paused' };
+    if (this.releasePaused) return { allowed: false, reason: 'maintenance_paused' };
     if (!this.backend.canDispatch()) return { allowed: false, reason: this.backend.recoveryRequired ? 'recovery_required' : 'backend_unavailable' };
     if (this.gate.active || this.gate.managementPending || this.gate.maintenancePending) return { allowed: false, reason: 'backend_operation' };
     const memoryReason = this.config.host_helper.enabled
@@ -422,7 +482,8 @@ export class ProxyService {
     const scheduler = this.scheduler.details(now);
     const { service: hostService, bound: hostBound, restart_policy: hostPolicy, ...hostGpu } = this.hostHelper.snapshot();
     const maintenance = this.maintenance.status(now);
-    const ready = !maintenance.paused && scheduler.accepting && this.backend.canDispatch(now);
+    const allSourcesPaused = Object.keys(this.config.clients).every((client) => this.scheduler.pauseReason({ client, trafficClass: 'live' }));
+    const ready = !this.releasePaused && !this.workPolicy.error && !allSourcesPaused && scheduler.accepting && this.backend.canDispatch(now);
     let schedulerState = 'idle';
     if (!scheduler.accepting) schedulerState = 'shutting_down';
     if (maintenance.paused) schedulerState = `maintenance_${maintenance.state}`;
@@ -431,6 +492,7 @@ export class ProxyService {
     else if (scheduler.upstream_draining) schedulerState = 'draining';
     else if (scheduler.active_request) schedulerState = 'busy';
     else if (scheduler.queue.total) schedulerState = 'queued';
+    else if (this.releasePaused || allSourcesPaused) schedulerState = 'source_paused';
     return {
       schema_version: 1,
       build: BUILD_INFO,
@@ -447,6 +509,9 @@ export class ProxyService {
       host_gpu: hostGpu,
       recovery: this.automaticRecovery.status(),
       maintenance,
+      work_policy: this.workPolicy.status(now),
+      scheduled_maintenance: this.scheduledMaintenance.status(now),
+      listeners: [...this.addresses().map(({ address, forcedClient }) => ({ port: address?.port, source: forcedClient, state: 'listening', publication: 'unverified' })), ...this.listenerFailures],
       frigate: this.catchup.status(),
       scheduler: {
         state: schedulerState,
@@ -554,6 +619,25 @@ export class ProxyService {
       return sendJson(response, 405, { error: 'maintenance controls only support POST', code: 'method_not_allowed' }, id);
     }
 
+    if (['/_intermediary/v1/maintenance/scopes/pause', '/_intermediary/v1/maintenance/scopes/resume'].includes(url.pathname)) {
+      try {
+        const body = parseJson(await readBody(request, 4_096));
+        if (url.pathname.endsWith('/pause')) {
+          const duration = parsePauseDuration(body.duration, this.config.maintenance.maxPauseMs);
+          this.workPolicy.pause({ sources: body.sources, traffic: body.traffic, until: duration === null ? null : this.clock() + duration });
+        } else {
+          if (typeof body.id !== 'string' || !this.workPolicy.manual.some((item) => item.id === body.id)) {
+            return sendJson(response, 404, { error: 'Scoped pause not found.' }, id);
+          }
+          this.workPolicy.resume(body.id);
+        }
+        this.scheduler.enforcePauses();
+        this.observability.record('source_pause_changed', {});
+        return sendJson(response, 200, { work_policy: this.workPolicy.status() }, id);
+      } catch (error) {
+        return sendJson(response, this.workPolicy.error ? 503 : 400, { error: this.workPolicy.error ?? error.message }, id);
+      }
+    }
     if (url.pathname === '/_intermediary/v1/maintenance/pause') {
       let body;
       try {
@@ -588,7 +672,7 @@ export class ProxyService {
   }
 
   sendMaintenancePaused(response, id) {
-    const maintenance = this.maintenance.status();
+    const maintenance = this.releaseState.status();
     if (maintenance.remaining_seconds !== null) {
       response.setHeader('retry-after', String(Math.max(1, Math.ceil(maintenance.remaining_seconds))));
     }
@@ -646,27 +730,29 @@ export class ProxyService {
   }
 
   kickMaintenanceQuiescence() {
-    if (!this.running || !this.maintenance.paused || this.maintenanceTask) return;
-    const status = this.maintenance.status();
+    if (!this.running || !this.releasePaused || this.maintenanceTask) return;
+    const state = this.releaseState;
+    if (!state?.paused) return;
+    const status = state.status();
     if (status.gpu_released && this.backend.loadedModels.length === 0) return;
-    const revision = this.maintenance.currentRevision;
-    const signal = this.maintenance.signal;
-    this.maintenanceTask = this.runMaintenanceQuiescence(revision, signal)
+    const revision = state.currentRevision;
+    const signal = state.signal;
+    this.maintenanceTask = this.runMaintenanceQuiescence(revision, signal, state)
       .catch((error) => {
         if (!signal?.aborted) this.logger.error('maintenance GPU release task failed', { error: error.message });
       })
       .finally(() => {
         this.maintenanceTask = null;
-        const latest = this.maintenance.status();
+        const latest = this.releaseState.status();
         if (this.running && latest.paused && !latest.gpu_released) this.scheduleMaintenanceRetry();
       });
   }
 
-  async runMaintenanceQuiescence(revision, signal) {
+  async runMaintenanceQuiescence(revision, signal, state = this.maintenance) {
     let release;
     try {
-      await this.maintenance.markReleasing(revision);
-      if (signal?.aborted || !this.maintenance.paused || revision !== this.maintenance.currentRevision) return;
+      await state.markReleasing(revision);
+      if (signal?.aborted || !state.paused || revision !== state.currentRevision) return;
       const active = this.scheduler.active;
       if (active) {
         this.logger.warn('maintenance pause is waiting for the active Ollama request to drain', {
@@ -679,10 +765,10 @@ export class ProxyService {
           await this.scheduler.waitForChange(100, signal);
         }
       }
-      if (signal?.aborted || !this.maintenance.paused || revision !== this.maintenance.currentRevision) return;
+      if (signal?.aborted || !state.paused || revision !== state.currentRevision) return;
 
       release = await this.gate.acquire('maintenance', signal);
-      if (signal?.aborted || !this.maintenance.paused || revision !== this.maintenance.currentRevision) return;
+      if (signal?.aborted || !state.paused || revision !== state.currentRevision) return;
       this.observability.record('maintenance_gpu_release_started', {});
       const models = [...new Set(await this.backendClient.loadedModels(
         signal,
@@ -706,7 +792,7 @@ export class ProxyService {
       }
       this.backend.loadedModels = [];
       this.scheduler.reconcile(null);
-      const result = await this.maintenance.markReleased(revision);
+      const result = await state.markReleased(revision);
       if (!result.changed) return;
       this.metrics.increment('proxy_maintenance_gpu_releases_total');
       this.logger.info('maintenance pause is quiescent; Ollama reports no loaded models', {
@@ -717,11 +803,11 @@ export class ProxyService {
         resume_at: result.status.resume_at,
       });
     } catch (error) {
-      if (signal?.aborted || !this.maintenance.paused || revision !== this.maintenance.currentRevision) return;
+      if (signal?.aborted || !state.paused || revision !== state.currentRevision) return;
       try {
-        await this.maintenance.markError(revision, error);
+        await state.markError(revision, error);
       } catch (stateError) {
-        this.maintenance.failClosed(`cannot persist maintenance failure: ${stateError.message}`);
+        state.failClosed(`cannot persist maintenance failure: ${stateError.message}`);
       }
       this.logger.error('maintenance pause could not confirm GPU release; inference remains blocked', {
         error: error.message,
@@ -831,7 +917,6 @@ export class ProxyService {
   }
 
   async handleGeneration(request, response, url, id, forcedClient) {
-    if (this.maintenance.paused) return this.sendMaintenancePaused(response, id);
     if (!this.scheduler.accepting) return sendJson(response, 503, { error: 'proxy is shutting down', code: 'shutting_down' }, id);
     if (this.backend.recoveryRequired) {
       return sendJson(response, 503, {
@@ -961,7 +1046,8 @@ export class ProxyService {
     const admission = this.scheduler.enqueue(job);
     if (!admission.accepted) {
       removeDisconnectListeners();
-      this.finishCatchupInference(job, { certain: true, status: admission.status });
+      this.finishCatchupInference(job, { certain: true, status: admission.status, deferred: admission.code });
+      if (admission.code === 'maintenance_paused') return this.sendMaintenancePaused(response, id);
       return sendJson(response, admission.status, { error: admission.message, code: admission.code }, id);
     }
     if (request.aborted || response.destroyed) disconnect();
@@ -971,7 +1057,7 @@ export class ProxyService {
       removeDisconnectListeners();
       // Dispatched jobs are reported by dispatchLoop only after the physical
       // gate is released. Queue rejections/cancellations never touched Ollama.
-      if (!job.dispatchedAt) this.finishCatchupInference(job, { certain: true, status: result.status });
+      if (!job.dispatchedAt) this.finishCatchupInference(job, { certain: true, status: result.status, deferred: result.code });
       return sendJson(response, result.status, { error: result.message, code: result.code }, id);
     }
 
@@ -1062,7 +1148,7 @@ export class ProxyService {
   }
 
   async handleManagement(request, response, url, id) {
-    if (this.maintenance.paused) return this.sendMaintenancePaused(response, id);
+    if (this.releasePaused) return this.sendMaintenancePaused(response, id);
     if (this.backend.recoveryRequired) {
       return sendJson(response, 503, { error: 'GPU recovery verification is required before model operations can resume', code: 'gpu_recovery_required' }, id);
     }
@@ -1079,7 +1165,7 @@ export class ProxyService {
       return;
     }
     response.removeListener('close', abort);
-    if (this.maintenance.paused) {
+    if (this.releasePaused) {
       release();
       return this.sendMaintenancePaused(response, id);
     }
@@ -1130,6 +1216,15 @@ export class ProxyService {
     let host;
     try { host = await this.hostHelper.refresh(); }
     catch { block('rescue_telemetry_unavailable'); }
+    // GPU counters can lag a just-finished request. Allow a bounded settling
+    // window under the same gate; never reinterpret nonzero/unknown as idle.
+    for (let probe = 0; probe < 3 && rescueHardwareBlock(host) === 'rescue_gpu_busy'; probe++) {
+      this.assertRescueDispatchAllowed(job);
+      if (this.scheduler.jobs.some((queued) => queued.trafficClass !== 'catchup' && !this.scheduler.pauseReason(queued))) break;
+      await delay(350, undefined, { signal: job.signal });
+      try { host = await this.hostHelper.refresh(); }
+      catch { block('rescue_telemetry_unavailable'); }
+    }
     const hardwareBlock = rescueHardwareBlock(host);
     if (hardwareBlock) block(hardwareBlock);
     // Rescue always requires system RAM evidence, even if the ordinary
@@ -1147,7 +1242,7 @@ export class ProxyService {
     // Pause/shutdown/recovery may have arrived during either read-only probe.
     // A skipped preflight must not consume the one enlarged attempt.
     this.assertRescueDispatchAllowed(job);
-    this.catchup.recordContextRescue(job.attemptRef, job.attemptRequestId, { context: plan.context });
+    job.rescueContext = plan.context;
     if (job.bodyReservation) {
       this.reservedBodyBytes += extra;
       job.bodyReservation.bytes += extra;
@@ -1159,7 +1254,7 @@ export class ProxyService {
 
   assertRescueDispatchAllowed(job) {
     if (job.signal.aborted) throw job.signal.reason;
-    if (this.maintenance.paused || !this.running || !this.scheduler.accepting || this.settingsRestartPending
+    if (this.scheduler.pauseReason(job) || !this.running || !this.scheduler.accepting || this.settingsRestartPending
       || !this.backend.canDispatch()) {
       const error = new Error('Context rescue stopped before dispatch because inference admission changed.');
       error.code = 'context_rescue_interrupted';
@@ -1210,6 +1305,7 @@ export class ProxyService {
           await this.scheduler.waitForChange(Math.min(1_000, this.config.ollama.healthIntervalMs), job.signal);
         }
         if (job.signal.aborted) throw job.signal.reason;
+        this.assertRescueDispatchAllowed(job);
         if (job.attemptRef) this.catchup.inferenceStarted?.(job.attemptRef, job.attemptRequestId);
         if (job.switching && job.previousModel && this.config.gpu_safety.unload_on_model_switch) {
           job.phase = 'unloading_model';
@@ -1253,7 +1349,8 @@ export class ProxyService {
         }
         await this.prepareCatchupMemory(job);
         await this.prepareContextRescue(job);
-        if (job.phase === 'context_rescue_preflight') this.assertRescueDispatchAllowed(job);
+        this.assertRescueDispatchAllowed(job);
+        if (job.rescueContext) this.catchup.recordContextRescue(job.attemptRef, job.attemptRequestId, { context: job.rescueContext });
         job.phase = 'connecting';
         const { response, cleanup } = await this.backendClient.request({
           method: job.method, path: job.path, headers: job.headers, body: job.body, signal: job.signal,
@@ -1344,9 +1441,10 @@ export class ProxyService {
           // A local safety refusal is not an Ollama failure and must not open
           // the circuit breaker or trigger a host-service restart.
           const status = error.code === 'context_rescue_blocked' ? 422 : 503;
-          catchupOutcome = { certain: true, status };
+          const deferred = DEFERRAL_REASONS.has(error.reason ?? error.code) ? error.reason ?? error.code : null;
+          catchupOutcome = { certain: true, status, deferred };
           job.settle({ type: 'local_error', status, code: error.code, message: error.message });
-          finalEvent = ['request_failed', this.scheduler.eventFields(job, {
+          finalEvent = [deferred ? 'request_deferred' : 'request_failed', this.scheduler.eventFields(job, {
             status, reason: error.reason ?? error.code,
             duration_seconds: (Date.now() - job.dispatchedAt) / 1000,
           })];
@@ -1397,6 +1495,7 @@ export class ProxyService {
     this.scheduler.stop();
     this.backend.stop();
     this.maintenance.stop();
+    this.scheduledMaintenance.stop();
     this.clearMaintenanceRetry();
     for (const close of [...this.eventStreams]) close();
     if (this.expiryTimer) clearInterval(this.expiryTimer);

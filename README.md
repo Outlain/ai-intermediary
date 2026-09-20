@@ -1,6 +1,6 @@
 # Ollama Scheduling Proxy
 
-A streaming reverse proxy for multiple applications sharing one Ollama server and one GPU. It runs at most one inference at a time, prioritizes Odysseus, and can recover missing Frigate object and review descriptions later using a persistent backlog.
+A streaming reverse proxy for multiple applications sharing one Ollama server and one GPU. It runs at most one inference at a time, uses configurable priorities (Odysseus first by default), and recovers missing Frigate descriptions through a persistent backlog. See [sources, dedicated ports and pause schedules](docs/SOURCES_AND_SCHEDULES.md) for the new controls and migration steps.
 
 The supplied defaults target these workloads without tying them to particular model names:
 
@@ -56,7 +56,7 @@ X-Ollama-Client: odysseus
 X-Ollama-Client: frigate
 ```
 
-The explicit header wins. Without it, the proxy tries optional model mappings, then configured source IP/subnet mappings, then `scheduler.default_client`. The supplied configuration sets that fallback to `odysseus`, so Odysseus needs no stable Docker IP. Configure only Frigate's stable host IP/CIDR; every address that does not match Frigate uses the Odysseus policy. The example intentionally contains no model mappings, so every model sent in a request works automatically.
+Dedicated listeners win, then enabled client headers, then source IP/subnet mappings, legacy model mappings, and `scheduler.default_client`. The supplied configuration retains the `odysseus` fallback for compatibility. For more sources, assign Odysseus a dedicated port, verify routing, then optionally add `misc` as the default. Cross-source IP overlaps and duplicate listener ports are rejected. The example contains no model mappings, so every model works automatically.
 
 `clients` are workload-policy identities, not model registrations. They let the proxy give interactive Odysseus work higher priority while applying short TTL and overflow rules to Frigate. Each client's `model_policy` applies to every model that client requests. The `models` section is empty by default and exists only for rare exact-model overrides.
 
@@ -69,9 +69,9 @@ Inference endpoints enter an in-memory queue. A single dispatcher is the only co
 `scheduler.mode: strict_priority` is the default, including for older configuration files without a mode field. At each dispatch boundary:
 
 1. Expired and disconnected live HTTP requests are removed.
-2. Waiting Odysseus requests go first, in arrival order, regardless of model name.
-3. Other live clients use their configured priority, then arrival order. A lower-priority client waits for the previous client's idle hold; a higher-priority client does not.
-4. Frigate catch-up starts one native regeneration attempt only when live queues, active inference, and idle holds are clear. With the pinned Frigate bridge, subsequent inference is identified as catch-up and remains behind live Frigate work. Finished attempts can await saved-result verification separately, up to `frigate.max_verifying`. Discovered, eligible catch-up items whose retry delay has elapsed are newest-event-first.
+2. Eligible live requests use numeric priority (larger first), then arrival order across all sources and models. There is no hard-coded Odysseus exception.
+3. A lower-priority client waits for the previous client's idle hold; equal/higher priority clients do not. Paused sources do not retain a hold over eligible sources.
+4. Frigate catch-up starts one native regeneration only when eligible live queues, active inference and idle holds are clear. Correlated catch-up stays behind live work. Finished attempts can await saving separately, up to `frigate.max_verifying`. Eligible jobs use configurable `frigate.catchup_order`: `newest_first` by default or `oldest_first`.
 
 Active inference is never interrupted to give another client a turn. In strict mode, priority aging, `max_wait`, model affinity, and batch limits cannot force Frigate ahead of Odysseus. Continuous Odysseus work can therefore postpone Frigate indefinitely; that is intentional. With the default one-minute Odysseus hold, a short web-search pause does not immediately hand the GPU to Frigate.
 

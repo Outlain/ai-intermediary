@@ -27,6 +27,10 @@ const MODEL_POLICY_FIELDS = Object.freeze({
 });
 
 const CLIENT_FIELDS = Object.freeze({
+  enabled: boolean(),
+  header_enabled: boolean(),
+  listener_port: integer({ min: 0, max: 65535 }),
+  queue_while_paused: boolean(),
   priority: number(),
   queue_limit: integer({ min: 1 }),
   request_ttl: duration(),
@@ -110,6 +114,16 @@ const EDITABLE_TREE = Object.freeze({
     enabled: boolean(),
     max_pause: duration({ greaterThanZero: true }),
   }),
+  work_policy: Object.freeze({
+    timezone: string({ required: true, maxLength: 100 }),
+    schedules: Object.freeze({ $dynamic: Object.freeze({
+      enabled: boolean(), days: stringArray({ maxItems: 7, itemMaxLength: 3 }),
+      start: string({ required: true, maxLength: 5 }), end: string({ required: true, maxLength: 5 }),
+      sources: stringArray({ maxItems: 100, itemMaxLength: 64 }),
+      traffic: descriptor('enum', { values: ['all', 'live', 'catchup'] }),
+      mode: descriptor('enum', { values: ['pause', 'release_gpu'] }),
+    }) }),
+  }),
   frigate: Object.freeze({
     enabled: boolean(),
     url: descriptor('url', { schemes: ['http:', 'https:'] }),
@@ -129,6 +143,8 @@ const EDITABLE_TREE = Object.freeze({
     page_size: integer({ min: 1, max: 1000 }),
     max_jobs: integer({ min: 1, max: 100000 }),
     history_limit: integer({ min: 1, max: 5000 }),
+    catchup_order: descriptor('enum', { values: ['newest_first', 'oldest_first'] }),
+    safety_retry_interval: duration({ minMs: 5000, maxMs: 300000 }),
     context_rescue: Object.freeze({
       enabled: boolean(),
       model: string({ maxLength: 256 }),
@@ -166,7 +182,7 @@ export const SETTINGS_SCHEMA = Object.freeze({
   ]),
   notes: Object.freeze({
     compose: 'Docker Compose is intentionally read-only and is never mounted or edited by the service.',
-    restart: 'Listener, container port, volume, and Docker runtime changes must be made by an administrator on the host.',
+    restart: 'Source listeners start after a safe restart. Docker port publication, volumes and runtime changes remain host-admin tasks.',
   }),
 });
 
@@ -362,7 +378,7 @@ function redact(message, secretValues = []) {
 }
 
 function inferPath(message) {
-  const match = String(message).match(/\b(server|ollama|scheduler|circuit_breaker|model_management|gpu_safety|observability|maintenance|frigate|clients|models)(?:\.[A-Za-z0-9_.-]+)+/);
+  const match = String(message).match(/\b(server|ollama|scheduler|circuit_breaker|model_management|gpu_safety|observability|maintenance|work_policy|frigate|clients|models)(?:\.[A-Za-z0-9_.-]+)+/);
   return match?.[0] ?? '$';
 }
 

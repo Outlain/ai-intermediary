@@ -30,6 +30,95 @@ const post = (url, token, body) => fetch(url, {
   method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
 });
 
+test('dedicated source ports share one inference gate and override conflicting headers/models', async (t) => {
+  const probe = new MockOllama(); await probe.start();
+  const port = Number(new URL(probe.url).port); await probe.stop();
+  const { service, base, backend } = await fixture(t, { clients: { odysseus: { listener_port: port } } });
+  const send = (origin, client, id) => fetch(origin + '/api/generate', { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-ollama-client': client },
+    body: JSON.stringify({ model: 'f-model', id, stream: false, delay_ms: 25 }) });
+  const results = await Promise.all([send(`http://127.0.0.1:${port}`, 'frigate', 'dedicated'), send(base, 'frigate', 'main')]);
+  for (const response of results) { assert.equal(response.status, 200); await response.text(); }
+  assert.equal(backend.maxActive, 1);
+  const queued = service.observability.recent(100).filter((event) => event.type === 'request_queued');
+  assert.deepEqual(queued.map((event) => event.client).sort(), ['frigate', 'odysseus']);
+  assert.equal(service.addresses().find((listener) => listener.forcedClient === 'odysseus').address.port, port);
+});
+
+test('startup applies active recurring pauses before inference admission', async (t) => {
+  const { base, backend, service } = await fixture(t, { work_policy: { timezone: 'UTC', schedules: {
+    night: { enabled: true, days: ['sun'], start: '01:00', end: '03:00', sources: ['*'], traffic: 'all', mode: 'pause' },
+  } } }, { clock: () => Date.parse('2026-09-20T02:00:00Z') });
+  const response = await post(base + '/api/generate', '', { model: 'f-model' });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).code, 'scheduled_pause');
+  assert.equal(backend.order.length, 0);
+  assert.equal(service.observabilitySnapshot().service.ready, false);
+});
+
+test('an occupied optional source port leaves main Settings available for repair', async (t) => {
+  const occupied = new MockOllama();
+  await new Promise((resolve) => occupied.server.listen(0, '0.0.0.0', resolve));
+  t.after(() => occupied.stop());
+  const port = occupied.server.address().port;
+  const { service, base } = await fixture(t, { clients: { odysseus: { listener_port: port } } });
+  assert.equal((await fetch(base + '/api/version')).status, 200);
+  assert.equal(service.observabilitySnapshot().listeners.find((item) => item.source === 'odysseus').state, 'unavailable');
+  assert.equal(service.listenerFailures[0].reason, 'EADDRINUSE');
+});
+
+test('scoped pauses are authenticated, preserve other sources and resume only their own rule', async (t) => {
+  const { service, base, backend } = await fixture(t);
+  const endpoint = `${base}/_intermediary/v1/maintenance/scopes`;
+  assert.equal((await post(endpoint + '/pause', 'settings-test', { sources: ['frigate'], traffic: 'all' })).status, 401);
+  const paused = await post(endpoint + '/pause', 'maintenance-test', { sources: ['frigate'], traffic: 'all' });
+  assert.equal(paused.status, 200);
+  const id = (await paused.json()).work_policy.manual[0].id;
+  const generate = (client) => fetch(base + '/api/generate', { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-ollama-client': client }, body: JSON.stringify({ model: 'od-model', stream: false }) });
+  assert.equal((await generate('frigate')).status, 503);
+  const live = await generate('odysseus'); assert.equal(live.status, 200); await live.text();
+  assert.equal(service.maintenance.paused, false);
+  assert.equal(backend.maxActive, 1);
+  await service.pauseMaintenance();
+  await post(endpoint + '/resume', 'maintenance-test', { id });
+  assert.equal(service.maintenance.paused, true);
+  assert.equal((await generate('frigate')).status, 503);
+});
+
+test('scheduled GPU release drains and unloads, and schedule end preserves manual maintenance', async (t) => {
+  let now = Date.parse('2026-09-20T00:30:00Z');
+  const { service, backend } = await fixture(t, { work_policy: { timezone: 'UTC', schedules: {
+    nightly: { enabled: true, days: ['sun'], start: '01:00', end: '03:00', sources: ['*'], traffic: 'all', mode: 'release_gpu' },
+  } } }, { clock: () => now });
+  backend.loadedModel = 'od-model';
+  now = Date.parse('2026-09-20T01:00:00Z');
+  await service.syncWorkPolicy();
+  assert.equal(service.workPolicy.block('odysseus').reason, 'scheduled_pause');
+  await waitFor(() => service.scheduledMaintenance.status().gpu_released);
+  assert.equal(backend.loadedModel, null);
+  await service.pauseMaintenance();
+  now = Date.parse('2026-09-20T03:00:00Z');
+  await service.syncWorkPolicy();
+  assert.equal(service.scheduledMaintenance.paused, false);
+  assert.equal(service.maintenance.paused, true);
+  assert.equal(service.releasePaused, true);
+  assert.equal(service.scheduler.pauseReason({ client: 'odysseus' }).reason, 'maintenance_paused');
+});
+
+test('configured live pause queue holds the connected response, without starting GPU work', async (t) => {
+  const { service, base, backend } = await fixture(t, { clients: { odysseus: { queue_while_paused: true } } });
+  const rule = service.workPolicy.pause({ sources: ['odysseus'], traffic: 'live' });
+  const pending = fetch(base + '/api/generate', { method: 'POST', headers: { 'content-type': 'application/json', 'x-ollama-client': 'odysseus' },
+    body: JSON.stringify({ model: 'od-model', stream: false }) });
+  await waitFor(() => service.scheduler.jobs.length === 1);
+  assert.equal(backend.active, 0);
+  assert.equal(service.observabilitySnapshot().queue.items[0].wait_reason, 'manual_source_pause');
+  service.workPolicy.resume(rule.id); service.scheduler.enforcePauses();
+  const response = await pending; assert.equal(response.status, 200); await response.text();
+  assert.equal(backend.maxActive, 1);
+});
+
 test('catch-up status accepts read/admin tokens but historical scans require admin confirmation', async (t) => {
   let scans = 0;
   const catchup = { start() {}, async stop() {}, status: () => ({ enabled: true, state: 'running' }),

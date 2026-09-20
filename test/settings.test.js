@@ -79,6 +79,24 @@ function fixture(t) {
   };
 }
 
+test('source policies and weekly schedules round-trip without replacing legacy fallback or secrets', async (t) => {
+  const options = fixture(t);
+  const store = new SettingsStore(options); await store.load();
+  const before = store.getEffectiveConfig();
+  const draft = { clients: { odysseus: { listener_port: 11436, header_enabled: false }, misc: { priority: 10, queue_while_paused: false } },
+    work_policy: { timezone: 'America/New_York', schedules: { night: { enabled: true, days: ['mon','tue'], start: '01:00', end: '03:00', sources: ['frigate'], traffic: 'catchup', mode: 'pause' } } },
+    frigate: { catchup_order: 'oldest_first' } };
+  const result = store.validate(draft);
+  assert.equal(result.valid, true, JSON.stringify(result.diagnostics));
+  assert.equal(result.effectiveConfig.scheduler.default_client, before.scheduler.default_client);
+  assert.equal(result.effectiveConfig.maintenance.auth_token, before.maintenance.auth_token);
+  assert.equal(result.effectiveConfig.clients.odysseus.listener_port, 11436);
+  assert.equal(result.effectiveConfig.work_policy.schedules.night.traffic, 'catchup');
+  await store.save(draft);
+  const restored = new SettingsStore(options); await restored.load();
+  assert.deepEqual(restored.getEffectiveConfig(), result.effectiveConfig);
+});
+
 test('explicit open Frigate API mode is editable without a missing-credentials warning', (t) => {
   const options = fixture(t);
   const result = validateSettingsDraft({ ...options, draft: { frigate: { enabled: true, url: 'http://frigate.test:5000', auth_mode: 'none' } } });

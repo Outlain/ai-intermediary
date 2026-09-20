@@ -163,6 +163,10 @@ main { padding-block: 28px 16px; }
 }
 .card-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; }
 .maintenance-card { grid-column: 1 / -1; grid-row: 1; }
+.work-policy-card { grid-column: 1 / -1; grid-row: 7; }
+.work-policy-card input, .work-policy-card select { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border-soft); border-radius: 8px; color: var(--text); background: var(--surface); }
+.work-policy-card .maintenance-action-row { flex-wrap: wrap; }
+.work-policy-card p { overflow-wrap: anywhere; }
 .recovery-card { grid-column: 1 / -1; grid-row: 2; }
 .host-gpu-card { grid-column: 1 / -1; grid-row: 5; }
 .catchup-card { grid-column: 1 / -1; grid-row: 6; }

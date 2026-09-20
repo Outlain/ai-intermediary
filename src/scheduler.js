@@ -21,12 +21,13 @@ export function createJob(fields) {
 }
 
 export class Scheduler {
-  constructor(config, { logger, metrics, observability = null, clock = () => Date.now() }) {
+  constructor(config, { logger, metrics, observability = null, clock = () => Date.now(), pauseCheck = () => null }) {
     this.config = config;
     this.logger = logger;
     this.metrics = metrics;
     this.observability = observability;
     this.clock = clock;
+    this.pauseCheck = pauseCheck;
     this.jobs = [];
     this.active = null;
     this.currentModel = null;
@@ -69,7 +70,8 @@ export class Scheduler {
 
   enqueue(job) {
     if (!this.accepting) return { accepted: false, status: 503, code: 'shutting_down', message: 'proxy is shutting down' };
-    if (this.paused) return { accepted: false, status: 503, code: 'maintenance_paused', message: 'inference is paused for GPU maintenance' };
+    const blocked = this.pauseReason(job);
+    if (blocked && !this.mayQueuePaused(job, blocked)) return { accepted: false, status: 503, code: blocked.reason, message: 'This source is paused; retry after it resumes.' };
     this.expire();
     const clientPolicy = this.config.clients[job.client];
     let sameClient = this.jobs.filter((item) => item.client === job.client && item.state === 'queued');
@@ -182,11 +184,30 @@ export class Scheduler {
     return client.priority + intervals * this.config.scheduler.aging_bonus;
   }
 
+  pauseReason(job) {
+    return this.pauseCheck(job.client, job.trafficClass ?? 'live')
+      ?? (this.paused ? { reason: 'maintenance_paused' } : null);
+  }
+
+  mayQueuePaused(job, blocked) {
+    return job.trafficClass !== 'catchup' && this.config.clients[job.client]?.queue_while_paused === true
+      && !['source_disabled', 'pause_state_error'].includes(blocked.reason);
+  }
+
+  enforcePauses() {
+    for (const job of [...this.jobs]) {
+      const blocked = this.pauseReason(job);
+      if (blocked && !this.mayQueuePaused(job, blocked)) this.drop(job, 503, blocked.reason, 'This source is paused; retry after it resumes.');
+    }
+    this.expire();
+    this.wake();
+  }
+
   candidates() {
     const seen = new Set();
     const result = [];
     for (const job of this.jobs) {
-      if (job.state !== 'queued' || job.signal?.aborted) continue;
+      if (job.state !== 'queued' || job.signal?.aborted || this.pauseReason(job)) continue;
       const key = `${job.client}\u0000${job.model}\u0000${job.trafficClass === 'catchup' ? 'catchup' : 'live'}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -200,10 +221,6 @@ export class Scheduler {
 
   best(candidates, now) {
     return [...candidates].sort((left, right) => {
-      if (this.strictPriority && left.client !== right.client) {
-        if (left.client === 'odysseus') return -1;
-        if (right.client === 'odysseus') return 1;
-      }
       const priority = this.effectivePriority(right, now) - this.effectivePriority(left, now);
       return priority || left.enqueuedAt - right.enqueuedAt || left.sequence - right.sequence;
     })[0];
@@ -211,19 +228,20 @@ export class Scheduler {
 
   lowerPriorityThanLease(job) {
     if (!this.leaseClient || job.client === this.leaseClient) return false;
-    if (job.client === 'odysseus') return false;
-    if (this.leaseClient === 'odysseus') return true;
+    if (this.pauseReason({ client: this.leaseClient, trafficClass: 'live' })) return false;
     return this.config.clients[job.client].priority < this.config.clients[this.leaseClient].priority;
   }
 
   backgroundReadiness(now = this.clock()) {
     if (!this.accepting) return { ready: false, reason: 'shutting_down', wait_seconds: null };
     if (this.paused) return { ready: false, reason: 'maintenance_paused', wait_seconds: null };
+    const blocked = this.pauseCheck('frigate', 'catchup');
+    if (blocked) return { ready: false, reason: blocked.reason, wait_seconds: null };
     if (this.active) return { ready: false, reason: 'active_request', wait_seconds: null };
-    if (this.jobs.some((job) => job.state === 'queued' && !job.signal?.aborted && job.deadline > now)) {
+    if (this.jobs.some((job) => job.state === 'queued' && !job.signal?.aborted && job.deadline > now && !this.pauseReason(job))) {
       return { ready: false, reason: 'live_requests_queued', wait_seconds: null };
     }
-    if (now < this.leaseUntil) return { ready: false, reason: 'model_lease', wait_seconds: (this.leaseUntil - now) / 1000 };
+    if (this.leaseClient && now < this.leaseUntil && !this.pauseReason({ client: this.leaseClient, trafficClass: 'live' })) return { ready: false, reason: 'model_lease', wait_seconds: (this.leaseUntil - now) / 1000 };
     return { ready: true, reason: 'idle', wait_seconds: 0 };
   }
 
@@ -236,7 +254,8 @@ export class Scheduler {
     this.expire(now);
     const candidates = this.candidates();
     if (!candidates.length) return { job: null, delayMs: null };
-    if (candidates.every((job) => job.trafficClass === 'catchup') && now < this.leaseUntil) {
+    if (candidates.every((job) => job.trafficClass === 'catchup') && now < this.leaseUntil
+      && this.leaseClient && !this.pauseReason({ client: this.leaseClient, trafficClass: 'live' })) {
       return { job: null, delayMs: Math.max(1, this.leaseUntil - now), reason: 'model_lease' };
     }
 
@@ -417,10 +436,18 @@ export class Scheduler {
 
   requestDetails(job, now = this.clock()) {
     const active = job.state === 'active';
+    const blocked = this.pauseReason(job);
+    const waitReason = active ? null : blocked?.reason ?? (this.active ? 'active_request'
+      : now < this.leaseUntil && this.lowerPriorityThanLease(job) ? 'follow_up_hold'
+        : this.jobs.some((other) => other !== job && !this.pauseReason(other)
+          && this.config.clients[other.client].priority > this.config.clients[job.client].priority) ? 'higher_priority'
+          : 'arrival_order_or_backend');
     return {
       id: `r-${job.sequence}`,
       client: job.client,
       classification_method: job.identificationMethod,
+      blocked_by: active ? null : this.pauseReason(job),
+      wait_reason: waitReason,
       model: safeDisplay(job.model),
       type: job.requestType,
       endpoint: job.pathname,
@@ -490,9 +517,9 @@ export class Scheduler {
     const changed = !this.paused;
     this.paused = true;
     const queued = this.jobs.filter((job) => job.state === 'queued').length;
-    this.failQueued(503, 'maintenance_paused', 'inference is paused for GPU maintenance');
+    this.enforcePauses();
     this.wake();
-    return { changed, queuedDropped: queued };
+    return { changed, queuedDropped: queued - this.jobs.filter((job) => job.state === 'queued').length };
   }
 
   resume() {

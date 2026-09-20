@@ -131,6 +131,11 @@ main { padding-block: 28px 112px; }
 .field > label, .field label:not(.check-field), .secret-label strong { display: grid; gap: 7px; color: #dce6f3; font-size: 0.75rem; font-weight: 700; }
 input, select { width: 100%; min-height: 42px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; outline: none; color: var(--text); background: #0a111b; }
 input::placeholder { color: #59687d; }
+.field.policy-checkbox label { display: flex; align-items: center; gap: 10px; min-height: 42px; }
+.policy-checkbox input { order: -1; width: 18px; height: 18px; min-height: 18px; flex: 0 0 18px; padding: 0; accent-color: var(--green-strong); }
+#sources pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: #0a111b; }
+#source-editors fieldset, #schedule-editors fieldset { min-width: 0; margin-block: 18px; }
+#add-source, #add-schedule { margin-top: 10px; }
 input:focus, select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(110,170,255,0.12); }
 .field-help { margin: 7px 0 0; color: var(--faint); font-size: 0.7rem; line-height: 1.4; }
 .field-error { min-height: 0; margin: 6px 0 0; color: var(--red); font-size: 0.7rem; font-weight: 650; line-height: 1.35; }

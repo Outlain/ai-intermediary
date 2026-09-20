@@ -274,6 +274,7 @@
         : 'Maintenance controls are ready. This token authorizes pause, resume, and protected recovery actions.');
     }
     syncRecoveryControls();
+    if (snapshot) renderWorkPolicy(snapshot);
   }
 
   function renderMaintenance(data) {
@@ -304,8 +305,11 @@
         ? 'The intermediary will resume inference automatically when the timer expires.'
         : 'Inference will remain paused until it is manually resumed.'));
     } else {
-      setText('maintenance-title', 'Inference is running normally');
-      setText('maintenance-detail', 'Ollama requests are being accepted and scheduled. Pause mode is ready when you need the GPU elsewhere.');
+      var scheduled = data.scheduled_maintenance || {};
+      var scoped = data.work_policy && data.work_policy.sources && data.work_policy.sources.some(function (source) { return source.live || source.catchup; });
+      setText('maintenance-title', scheduled.paused ? 'Scheduled GPU reservation' : scoped ? 'Source pause rules are active' : 'Inference is running normally');
+      setText('maintenance-detail', scheduled.paused ? 'A schedule blocks all inference and drains Ollama. Ending it does not cancel a manual pause. See schedules below.' : scoped ? 'Only eligible sources may generate. See source pauses and schedules below.' : 'Ollama requests are being accepted and scheduled. Pause mode is ready when you need the GPU elsewhere.');
+      if (scheduled.paused) setText('maintenance-state', 'Scheduled pause');
     }
 
     var resumeTimestamp = maintenance.resume_at ? new Date(maintenance.resume_at).getTime() : NaN;
@@ -323,6 +327,7 @@
       setText('maintenance-countdown', (state === 'paused' || state === 'pausing') ? 'Manual' : '—');
     }
     if (recoveryBlocked) setText('maintenance-gpu-released', 'Not verified');
+    else if (data.scheduled_maintenance && data.scheduled_maintenance.paused) setText('maintenance-gpu-released', data.scheduled_maintenance.gpu_released ? 'Yes · scheduled' : 'Scheduled release pending');
     else if (maintenance.gpu_released === true) setText('maintenance-gpu-released', 'Yes');
     else if (state === 'pausing') setText('maintenance-gpu-released', 'Waiting for drain');
     else if (state === 'paused' || state === 'error') setText('maintenance-gpu-released', 'No');
@@ -397,6 +402,8 @@
       formatInteger(metadata.message_count) + ' msgs',
       formatInteger(metadata.image_count) + ' imgs'
     ];
+    if (item.classification_method) values.push('Identified by ' + titleCase(item.classification_method));
+    if (item.wait_reason) values.push('Waiting: ' + titleCase(item.wait_reason));
     values.forEach(function (value) { meta.appendChild(create('span', '', value)); });
     li.appendChild(meta);
     return li;
@@ -414,6 +421,46 @@
     var list = byId('queue-items');
     list.replaceChildren();
     items.forEach(function (item) { list.appendChild(queueItem(item)); });
+  }
+
+  function renderWorkPolicy(data) {
+    var policy = data.work_policy || {}, sources = policy.sources || [];
+    var enabled = Boolean(getMaintenanceToken()) && data.maintenance && data.maintenance.control_available === true && !maintenanceActionPending;
+    byId('scope-pause').disabled = !enabled;
+    setText('policy-timezone', policy.error || ('Schedule timezone: ' + (policy.timezone || 'America/New_York')));
+    var list = byId('policy-sources'); list.replaceChildren();
+    sources.forEach(function (source) {
+      var listeners = (data.listeners || []).filter(function (listener) { return listener.source === source.id; });
+      var queue = data.queue && data.queue.by_client || {};
+      list.appendChild(create('p', 'muted', source.id + ' · Priority ' + source.priority + ' · Queued ' + (queue[source.id] || 0)
+        + ' · Live: ' + (source.live ? titleCase(source.live.reason) : 'eligible')
+        + (source.id === 'frigate' ? ' · Catch-up: ' + (source.catchup ? titleCase(source.catchup.reason) : 'eligible') : '')
+        + (listeners.length ? ' · Container port: ' + listeners.map(function (listener) { return listener.port + ' ' + (listener.state || 'listening') + (listener.reason ? ' (' + listener.reason + ')' : ''); }).join(', ') + ' (publication unverified)' : '')));
+    });
+    var rules = byId('policy-rules'); rules.replaceChildren();
+    (policy.manual || []).forEach(function (rule) {
+      var row = create('p', 'muted', 'Manual: ' + rule.sources.join(', ') + ' · ' + rule.traffic + ' · ' + (rule.until ? 'until ' + formatDate(rule.until) : 'until resumed') + ' ');
+      var button = create('button', 'quiet-button', 'Resume this scope'); button.type = 'button'; button.disabled = !enabled;
+      button.addEventListener('click', function () { performScopeAction('resume', { id: rule.id }); }); row.appendChild(button); rules.appendChild(row);
+    });
+    (policy.schedules || []).forEach(function (rule) {
+      rules.appendChild(create('p', 'muted', rule.id + ': ' + (!rule.enabled ? 'disabled' : rule.active ? 'ACTIVE' : 'scheduled')
+        + ' · ' + rule.sources.join(', ') + ' / ' + rule.traffic + ' · ' + rule.start + '–' + rule.end + ' · ' + rule.days.join(', ')
+        + ' · ' + titleCase(rule.mode) + (rule.next_transition ? ' · Next change: ' + formatDate(rule.next_transition) : '')));
+    });
+  }
+
+  async function performScopeAction(action, body) {
+    if (!getMaintenanceToken() || maintenanceActionPending) return;
+    maintenanceActionPending = true;
+    try {
+      var response = await fetch('/_intermediary/v1/maintenance/scopes/' + action, { method: 'POST', headers: maintenanceHeaders(), body: JSON.stringify(body) });
+      var result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Source pause change failed.');
+      setText('scope-action-status', 'Manual scope updated. Other pauses and schedules still apply.');
+      await refreshSnapshot();
+    } catch (error) { setText('scope-action-status', error.message); }
+    finally { maintenanceActionPending = false; syncMaintenanceControls(); if (snapshot) renderWorkPolicy(snapshot); }
   }
 
   function detailSummary(details) {
@@ -645,6 +692,7 @@
 
   function eventSeverity(event) {
     var type = String(event.type || '').toLowerCase();
+    if (type === 'request_deferred') return 'event-warning';
     var status = String(event.status || '').toLowerCase();
     if (event.outcome === 'failed' || Number(event.status) >= 400 || status === 'error' || status === 'failed' || type.includes('failed') || type.includes('recovery') || type.includes('circuit_open')) return 'event-danger';
     if (status === 'completed' || status === 'success' || type.includes('completed') || type.includes('healthy') || type.includes('resum')) return 'event-good';
@@ -687,6 +735,7 @@
   }
 
   function render(data) {
+    renderWorkPolicy(data);
     snapshot = data;
     renderHealth(data);
     renderMaintenance(data);
@@ -831,6 +880,7 @@
         if (job.needs_attention) details += ' · Needs attention (automatic retries continue)';
         item.appendChild(create('p', 'muted', details));
         var attempts = [];
+        if (job.deferred) attempts.push('Deferred before inference; no additional failure or enlarged attempt consumed');
         if (job.attempts != null) attempts.push('Attempts: ' + formatInteger(job.attempts));
         if (job.failures) attempts.push('Unsuccessful / unconfirmed: ' + formatInteger(job.failures));
         if (job.last_attempt_at) attempts.push('Last attempt: ' + new Date(job.last_attempt_at).toLocaleString());
@@ -883,6 +933,8 @@
     });
     setText('catchup-pending-heading', CATCHUP_VIEWS[catchupView][0]);
     setText('catchup-view-help', CATCHUP_VIEWS[catchupView][1]);
+    if (catchupData && catchupData.catchup_order) setText('catchup-view-help', CATCHUP_VIEWS[catchupView][1]
+      + ' Dispatch order: ' + (catchupData.catchup_order === 'oldest_first' ? 'oldest' : 'newest') + ' eligible event first. List display is newest first.');
     var renderKey = JSON.stringify([catchupView, page.items, Boolean(catchupAdminToken), catchupActionPending]);
     if (renderKey !== catchupRenderedPage) {
       renderCatchupJobs('catchup-pending-jobs', 'catchup-pending-empty', page.items);
@@ -1166,6 +1218,10 @@
   });
 
   byId('pause-button').addEventListener('click', function () { performMaintenanceAction('pause'); });
+  byId('scope-pause').addEventListener('click', function () { performScopeAction('pause', {
+    sources: byId('scope-sources').value.split(/[\s,]+/).filter(Boolean), traffic: byId('scope-traffic').value,
+    duration: byId('scope-duration').value.trim() || null
+  }); });
   byId('recovery-check').addEventListener('click', function () { performRecoveryAction('check'); });
   byId('recovery-acknowledge').addEventListener('click', function () { performRecoveryAction('acknowledge'); });
   byId('recovery-confirm').addEventListener('change', syncRecoveryControls);

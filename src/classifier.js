@@ -28,9 +28,7 @@ export class Classifier {
     if (forcedClient && Object.hasOwn(this.config.clients, forcedClient)) return { client: forcedClient, method: 'listener' };
     const header = request.headers['x-ollama-client'];
     const named = Array.isArray(header) ? header[0] : header;
-    if (named && Object.hasOwn(this.config.clients, named)) return { client: named, method: 'header' };
-    const model = parsedBody?.model;
-    if (model && this.modelClients.has(model)) return { client: this.modelClients.get(model), method: 'model' };
+    if (named && Object.hasOwn(this.config.clients, named) && this.config.clients[named].header_enabled !== false) return { client: named, method: 'header' };
     const address = clientIp(request, this.config.server.trusted_proxy);
     const family = isIP(address);
     if (family) {
@@ -38,6 +36,10 @@ export class Classifier {
       const source = this.sources.find((entry) => entry.family === type && entry.block.check(address, type));
       if (source) return { client: source.client, method: 'source_ip' };
     }
+    // Keep explicitly configured legacy model mappings as a last-resort migration
+    // fallback; a source address is a stronger identity than a shared model name.
+    const model = parsedBody?.model;
+    if (model && this.modelClients.has(model)) return { client: this.modelClients.get(model), method: 'model' };
     return { client: this.config.scheduler.default_client, method: 'fallback' };
   }
 

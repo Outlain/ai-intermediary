@@ -248,7 +248,7 @@ test('client-wide model policy applies to an arbitrary requested model', () => {
 
 test('strict priority never promotes old Frigate work ahead of waiting Odysseus', () => {
   const { scheduler, add, setNow } = harness({
-    clients: { frigate: { priority: 1000, request_ttl: '2h', max_wait: '1ms' } },
+    clients: { frigate: { priority: 10, request_ttl: '2h', max_wait: '1ms' } },
     scheduler: { priority_aging: true, aging_interval: '1ms', aging_bonus: 100 },
     models: { 'od-model': { max_batch_requests: 1, max_batch_time: '1ms' } },
   });

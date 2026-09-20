@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { FrigateClient, FrigateError } from './frigate-client.js';
-import { RESCUE_REASONS, rescueTarget, validContextRequest, validRescue } from './context-rescue.js';
+import { DEFERRAL_REASONS, RESCUE_REASONS, rescueTarget, validContextRequest, validRescue } from './context-rescue.js';
 
 const SCHEMA = 2;
 const ATTEMPT_PHASES = new Set(['handed_off', 'queued', 'running', 'verifying_saved', 'uncertain', 'retired']);
@@ -31,6 +31,7 @@ const JOB_REASONS = new Set([
   'invalid_media_response', 'invalid_camera_configuration', 'generation_not_accepted', 'frigate_operation_failed',
   'generation_failed', 'generation_finished', 'generation_uncertain', 'bridge_result_timeout', 'recovery_verified', 'native_error',
   ...RESCUE_REASONS,
+  ...DEFERRAL_REASONS,
 ]);
 const text = (value, limit = 120) => String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, limit);
 const seconds = (value) => Number.isFinite(Number(value)) && value !== null ? Number(value) : null;
@@ -60,6 +61,7 @@ const restoredRescue = (value) => ({ ...restoredContext(value), prompt_tokens: v
 const restoredAttempt = (attempt) => ({
   ticket_hash: attempt.ticket_hash, phase: attempt.phase,
   requests: attempt.requests.map((request) => ({ id: request.id, state: request.state, status: request.status ?? null,
+    ...(DEFERRAL_REASONS.has(request.deferred) ? { deferred: request.deferred } : {}),
     ...(request.context_request ? { context_request: restoredContext(request.context_request) } : {}),
     ...(request.rescue_context ? { rescue_context: request.rescue_context } : {}) })),
   native_outcome: attempt.native_outcome ?? null, native_reason: safeReason(attempt.native_reason),
@@ -68,6 +70,7 @@ const restoredAttempt = (attempt) => ({
 const publicJob = (job, now, attentionAfterMs) => ({
   kind: job.kind, id: text(job.id, 256), camera: text(job.camera), event_time: job.event_time,
   state: job.state, reason: safeReason(job.reason), attempts: job.attempts,
+  deferred: DEFERRAL_REASONS.has(job.reason),
   phase: job.state === 'waiting_result' ? job.attempt?.phase ?? 'legacy_confirmation' : null,
   failures: counter(job.failures), first_failed_at: job.first_failed_at ?? null,
   last_attempt_at: job.last_attempt_at ?? null,
@@ -419,6 +422,7 @@ export class FrigateCatchup {
     };
     return {
       enabled: Boolean(this.settings.enabled),
+      catchup_order: this.settings.catchup_order ?? 'newest_first',
       state: !this.settings.enabled ? 'disabled' : this.storeError ? 'error' : !this.running ? 'stopped'
         : this.lastError ? 'degraded' : 'running',
       enabled_at: this.state?.enabled_at ?? null,
@@ -533,12 +537,13 @@ export class FrigateCatchup {
     if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
   }
 
-  inferenceFinished(reference, requestId, { certain, status, contextOverflow } = {}) {
+  inferenceFinished(reference, requestId, { certain, status, contextOverflow, deferred } = {}) {
     const job = this.findAttempt(reference);
     const request = job?.attempt.requests.find((entry) => entry.id === requestId);
     if (!request || request.state === 'finished' || request.state === 'uncertain') return;
     request.state = certain === true ? 'finished' : 'uncertain';
     request.status = Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+    if (certain === true && !request.rescue_context && DEFERRAL_REASONS.has(deferred)) request.deferred = deferred;
     if (request.rescue_context && job.context_rescue) {
       job.context_rescue.reason = certain !== true ? 'rescue_outcome_uncertain'
         : status >= 200 && status < 300 ? 'rescue_request_succeeded' : 'rescue_request_failed';
@@ -589,6 +594,11 @@ export class FrigateCatchup {
     attempt.revoked = true;
     if (attempt.native_outcome === 'failed') {
       const failedRequest = attempt.requests.findLast((request) => request.status >= 400);
+      const failures = attempt.requests.filter((request) => request.status >= 400);
+      if (failures.length && failures.every((request) => DEFERRAL_REASONS.has(request.deferred))) {
+        this.defer(job, failedRequest.deferred);
+        return;
+      }
       this.retry(job, failedRequest && job.context_rescue && job.context_rescue.signature === failedRequest.context_request?.signature
         ? job.context_rescue.reason : failedRequest ? `http_${failedRequest.status}` : attempt.native_reason || 'generation_failed');
     } else {
@@ -904,6 +914,17 @@ export class FrigateCatchup {
     this.persist();
   }
 
+  defer(job, reason) {
+    if (outstanding(job.attempt)) return;
+    if (job.attempt) { job.attempt.revoked = true; job.attempt.phase = 'retired'; }
+    job.state = 'retrying';
+    job.reason = reason;
+    job.next_attempt_at = this.clock() + (this.settings.safetyRetryIntervalMs ?? 30_000);
+    // No failure count, exponential backoff, attention timer or enlarged attempt
+    // is consumed by a known pre-dispatch safety refusal.
+    this.persist();
+  }
+
   processJobs() {
     if (this.processBusy) return this.processBusy;
     if (!this.running || this.storeError || this.clock() < this.confirmationBackoffUntil) return Promise.resolve();
@@ -934,7 +955,8 @@ export class FrigateCatchup {
     if (!this.runtimeConfig || !this.capabilities.checked) return;
     if (!this.readiness()) return;
     const jobs = this.state.jobs.filter((job) => job.state !== 'waiting_result' && job.next_attempt_at <= this.clock())
-      .sort((a, b) => b.event_time - a.event_time || a.id.localeCompare(b.id));
+      .sort(this.settings.catchup_order === 'oldest_first'
+        ? (a, b) => a.event_time - b.event_time || a.id.localeCompare(b.id) : newestFirst);
     // Bound metadata checks in one poll, including expired/disabled jobs.
     for (const job of jobs.slice(0, 10)) {
       if (!this.readiness()) return;
@@ -943,9 +965,10 @@ export class FrigateCatchup {
       const frontier = Math.max(0, ...['automatic', 'manual'].flatMap((mode) => KINDS
         .filter((kind) => this.capabilities[kind] && this.state.scans[mode][kind])
         .map((kind) => this.state.scans[mode][kind].before)));
-      if (job.event_time < frontier) {
+      if ((this.settings.catchup_order === 'oldest_first' && frontier > 0)
+        || (this.settings.catchup_order !== 'oldest_first' && job.event_time < frontier)) {
         if (this.state.jobs.length < (this.settings.max_jobs ?? 10_000)) {
-          this.blockedReason = 'discovering_newer_events';
+          this.blockedReason = this.settings.catchup_order === 'oldest_first' ? 'discovering_older_events' : 'discovering_newer_events';
           return;
         }
         // A full bounded queue must be allowed to drain or scanning deadlocks.

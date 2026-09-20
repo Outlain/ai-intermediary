@@ -228,6 +228,40 @@ test('GPU allocation failures never qualify for enlargement', async (t) => {
   assert.equal(f.service.backend.recoveryRequired, true);
 });
 
+test('busy rescue defers without failure escalation and later automatically qualifies for enlargement', async (t) => {
+  const f = await setup(t);
+  await f.send();
+  const failures = f.job.failures, firstFailure = f.job.first_failed_at;
+  await f.retry();
+  f.state.host.gpus[0].utilization_percent = 2;
+  assert.equal(await f.send(), 422);
+  assert.equal(f.job.failures, failures);
+  assert.equal(f.job.first_failed_at, firstFailure);
+  assert.equal(f.job.context_rescue.attempted, false);
+  assert.equal(f.job.reason, 'rescue_gpu_busy');
+  assert.ok(f.job.next_attempt_at <= Date.now() + 30000);
+  assert.equal(f.service.observability.recent().at(-1).type, 'request_deferred');
+  f.state.host.gpus[0].utilization_percent = 0;
+  // Simulate the ordinary eligibility clock, not a manual retry operation.
+  f.job.next_attempt_at = 0;
+  await f.worker.processJobs();
+  assert.equal(await f.send(), 200);
+  assert.equal(f.job.context_rescue.attempted, true);
+  assert.equal(f.mock.maxActive, 1);
+});
+
+test('pause after native handoff defers without sending inference or spending a rescue', async (t) => {
+  const f = await setup(t);
+  await f.send(); await f.retry();
+  const failures = f.job.failures;
+  f.service.workPolicy.pause({ sources: ['frigate'], traffic: 'catchup' });
+  assert.equal(await f.send(), 503);
+  assert.equal(f.job.failures, failures);
+  assert.equal(f.job.reason, 'manual_source_pause');
+  assert.equal(f.job.context_rescue.attempted, false);
+  assert.equal(f.calls.length, 1);
+});
+
 test('failed rescue intent persistence prevents the enlarged HTTP request and fails closed', async (t) => {
   const f = await setup(t);
   await f.send(); await f.retry();

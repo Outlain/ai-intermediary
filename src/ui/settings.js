@@ -90,7 +90,7 @@
     setHidden('settings-workspace', false);
   }
 
-  function pathParts(path) { return String(path || '').split('.').filter(Boolean); }
+  function pathParts(path) { return String(path || '').split('.').filter(Boolean).map(decodeURIComponent); }
   function getPath(source, path) {
     return pathParts(path).reduce(function (current, key) {
       return current == null ? undefined : current[key];
@@ -119,12 +119,14 @@
     });
   }
   function inputValue(input) {
+    if (input.dataset.list === 'true') return input.value.split(/[\s,]+/).filter(Boolean);
     if (input.type === 'checkbox') return input.checked;
     if (input.type === 'number') return input.value === '' ? null : Number(input.value);
     if (input.dataset.nullable === 'true' && input.value.trim() === '') return null;
     return input.value.trim();
   }
   function setInputValue(input, value) {
+    if (input.dataset.list === 'true') { input.value = Array.isArray(value) ? value.join(', ') : ''; return; }
     if (input.type === 'checkbox') input.checked = Boolean(value);
     else input.value = value == null ? '' : String(value);
   }
@@ -133,6 +135,7 @@
     return {};
   }
   function populateForm(settings) {
+    renderPolicyEditors(settings);
     var defaultClient = byId('default-client');
     all('#default-client option[data-dynamic-client]').forEach(function (option) { option.remove(); });
     var availableClients = Object.keys(asObject(settings.clients));
@@ -150,6 +153,97 @@
       setInputValue(input, getPath(settings, input.dataset.path));
     });
     setText('fallback-client-readout', getPath(settings, 'scheduler.default_client') || 'Odysseus');
+    renderCompose(settings);
+  }
+
+  function policyField(parent, path, label, type, value, choices) {
+    var wrap = document.createElement('div'); wrap.className = 'field'; wrap.dataset.fieldWrap = path;
+    if (type === 'checkbox') wrap.className += ' policy-checkbox';
+    var element = document.createElement('label'); element.textContent = label;
+    var input = document.createElement(choices ? 'select' : 'input');
+    if (choices) choices.forEach(function (choice) {
+      var option = document.createElement('option'); option.value = choice; option.textContent = choice; input.appendChild(option);
+    });
+    else input.type = type === 'list' ? 'text' : type;
+    if (type === 'list') input.dataset.list = 'true';
+    if (path.endsWith('.keep_alive')) input.dataset.nullable = 'true';
+    input.dataset.path = path; setInputValue(input, value);
+    element.appendChild(input); wrap.appendChild(element); parent.appendChild(wrap);
+  }
+  function sourceEditor(name, policy) {
+    var card = document.createElement('fieldset'); card.className = 'settings-card';
+    var legend = document.createElement('legend'); legend.textContent = name; card.appendChild(legend);
+    var grid = document.createElement('div'); grid.className = 'field-grid field-grid-2'; card.appendChild(grid);
+    var root = 'clients.' + encodeURIComponent(name).replace(/\./g, '%2E') + '.';
+    [['enabled', 'Enabled', 'checkbox'], ['header_enabled', 'Accept X-Ollama-Client: ' + name, 'checkbox'],
+      ['listener_port', 'Dedicated container port (0 = off)', 'number'], ['source_ips', 'IP/subnets (comma separated; empty = off)', 'list'],
+      ['priority', 'Priority (larger runs first)', 'number'], ['queue_limit', 'Maximum queued requests', 'number'],
+      ['request_ttl', 'Queue lifetime (e.g. 10m)', 'text'], ['queue_while_paused', 'Hold connected live requests during pauses (off = reject)', 'checkbox'],
+      ['deduplication.enabled', 'Deduplicate using configured stable identifiers (advanced)', 'checkbox'],
+      ['overflow_policy', 'When queue fills', 'text', ['reject', 'drop_oldest', 'drop_newest']],
+      ['model_policy.idle_hold', 'Follow-up hold before lower priority (e.g. 20s)', 'text'],
+      ['max_wait', 'Balanced mode: forced switch wait', 'text'],
+      ['model_policy.max_batch_requests', 'Balanced mode: maximum batch requests', 'number'],
+      ['model_policy.max_batch_time', 'Balanced mode: maximum batch time', 'text'],
+      ['model_policy.keep_alive', 'Ollama model keep-alive (blank = client choice)', 'text']].forEach(function (field) {
+        policyField(grid, root + field[0], field[1], field[2], getPath(policy, field[0]), field[3]);
+      });
+    var help = document.createElement('p'); help.className = 'field-help';
+    help.textContent = 'Hold during pause is bounded by this queue lifetime, queue limit and the shared memory limit. Disconnected or expired requests are never replayed. Frigate catch-up uses retained IDs separately. Legacy per-model overrides, if configured, take precedence over model hold/keep-alive.';
+    card.appendChild(help); byId('source-editors').appendChild(card);
+    return card;
+  }
+  function scheduleEditor(name, policy) {
+    var card = document.createElement('fieldset'); card.className = 'settings-card';
+    var legend = document.createElement('legend'); legend.textContent = name; card.appendChild(legend);
+    var grid = document.createElement('div'); grid.className = 'field-grid field-grid-2'; card.appendChild(grid);
+    var root = 'work_policy.schedules.' + name + '.';
+    [['enabled', 'Enabled', 'checkbox'], ['days', 'Start days (sun, mon, tue, wed, thu, fri, sat)', 'list'],
+      ['start', 'Start local time', 'time'], ['end', 'End local time', 'time'],
+      ['sources', 'Source names (comma separated, or * for all)', 'list'],
+      ['traffic', 'Work to pause', 'text', ['all', 'live', 'catchup']],
+      ['mode', 'Pause or reserve GPU', 'text', ['pause', 'release_gpu']]].forEach(function (field) {
+        policyField(grid, root + field[0], field[1], field[2], policy[field[0]], field[3]);
+      });
+    byId('schedule-editors').appendChild(card); return card;
+  }
+  function renderPolicyEditors(settings) {
+    // Replace legacy two-client editors with the same editor for every source.
+    ['odysseus', 'frigate', 'frigate-source'].forEach(function (id) {
+      var old = byId(id); old.hidden = true;
+      old.querySelectorAll('[data-path]').forEach(function (input) { input.removeAttribute('data-path'); });
+      all('a[href="#' + id + '"]').forEach(function (link) { link.hidden = true; });
+    });
+    var legacyIp = all('[data-path="clients.frigate.source_ips.0"]')[0];
+    if (legacyIp) { legacyIp.removeAttribute('data-path'); legacyIp.disabled = true; legacyIp.placeholder = 'Configure under Sources & ports'; }
+    byId('source-editors').replaceChildren(); byId('schedule-editors').replaceChildren();
+    Object.entries(asObject(settings.clients)).forEach(function (entry) { sourceEditor(entry[0], entry[1]); });
+    Object.entries(asObject(settings.work_policy && settings.work_policy.schedules)).forEach(function (entry) { scheduleEditor(entry[0], entry[1]); });
+  }
+  function addPolicy(kind) {
+    if (busy || !loadedSettings) return;
+    var nameInput = byId('new-' + kind + '-name'), name = nameInput.value.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name) || ['__proto__', 'constructor', 'prototype'].includes(name)) { showPageError('Use 1–64 letters, numbers, underscores or dashes, starting with a letter or number.'); return; }
+    var draft = collectSettings(), card;
+    if (kind === 'source') {
+      if (Object.prototype.hasOwnProperty.call(draft.clients, name)) { showPageError('That source already exists.'); return; }
+      card = sourceEditor(name, { enabled: true, header_enabled: true, listener_port: 0, source_ips: [], priority: 10,
+        queue_limit: 20, request_ttl: '10m', max_wait: '5m', queue_while_paused: false, overflow_policy: 'reject',
+        model_policy: { idle_hold: '0s', keep_alive: null, max_batch_requests: 1, max_batch_time: '60s' } });
+      var option = document.createElement('option'); option.value = name; option.textContent = name; option.dataset.dynamicClient = 'true'; byId('default-client').appendChild(option);
+    } else {
+      if (Object.prototype.hasOwnProperty.call(draft.work_policy.schedules, name)) { showPageError('That schedule already exists.'); return; }
+      card = scheduleEditor(name, { enabled: false, days: ['sun','mon','tue','wed','thu','fri','sat'], start: '01:00', end: '03:00', sources: ['*'], traffic: 'all', mode: 'pause' });
+    }
+    card.querySelectorAll('[data-path]').forEach(function (input) { touchedPaths.add(input.dataset.path); });
+    nameInput.value = ''; lastValidatedSignature = ''; showPageError(''); updateDirtyState();
+  }
+  function renderCompose(settings) {
+    var ports = Object.entries(asObject(settings.clients)).filter(function (entry) { return entry[1].listener_port > 0; });
+    setText('source-compose', ports.length ? 'ports:\n' + ports.map(function (entry) {
+      return '  - "' + entry[1].listener_port + ':' + entry[1].listener_port + '" # ' + entry[0];
+    }).join('\n') + '\n\n# After updating Compose:\n# docker compose up -d --no-deps ollama-scheduler'
+      : 'No additional source ports configured. Keep your existing main port mapping.');
   }
   function collectSettings() {
     var result = clone(loadedSettings || {});
@@ -444,6 +538,7 @@
     }
   }
   function updateDirtyState() {
+    renderCompose(collectSettings());
     dirty = calculateDirty();
     var validForCurrentDraft = dirty && lastValidatedSignature === signature();
     var restartPending = Boolean(loadedEnvelope && loadedEnvelope.restart_pending);
@@ -832,6 +927,8 @@
   }
 
   bindEvents();
+  byId('add-source').addEventListener('click', function () { addPolicy('source'); });
+  byId('add-schedule').addEventListener('click', function () { addPolicy('schedule'); });
   if (getToken()) loadSettings();
   else showAuth('Enter the separate settings admin token to view or change configuration.');
 })();

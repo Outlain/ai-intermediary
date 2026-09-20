@@ -29,6 +29,10 @@ ollama:
 
 clients:
   default:
+    enabled: true
+    header_enabled: true
+    listener_port: 0
+    queue_while_paused: false
     priority: 50
     queue_limit: 20
     request_ttl: 10m
@@ -42,6 +46,8 @@ clients:
       keep_alive: null
 
   odysseus:
+    # Optional dedicated source port; also publish 11436:11436 in Compose.
+    # listener_port: 11436
     priority: 100
     queue_limit: 10
     request_ttl: 30m

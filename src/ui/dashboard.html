@@ -126,7 +126,7 @@
 
         <div id="maintenance-warning" class="notice notice-warning maintenance-warning" role="note">
           <strong>What happens when pause mode starts</strong>
-          <span>The active inference request is allowed to drain. Queued and newly submitted inference requests receive HTTP 503 until inference is resumed.</span>
+          <span>The active inference request drains, then Ollama models unload. Queued and new requests receive HTTP 503 by default. Sources explicitly configured to hold paused requests retain only bounded, still-connected requests; expiry and disconnect still cancel them.</span>
         </div>
       </section>
 
@@ -157,6 +157,22 @@
         <p id="recovery-control-state" class="form-help">Use the maintenance control token above. Recovery never resumes a manual pause.</p>
         <p id="recovery-action-status" class="action-status" role="status" aria-live="polite"></p>
         <p class="muted">Automatic recovery may restart only Ollama when configured. It never resets the GPU or reboots the host. Live priority and one-at-a-time inference still apply.</p>
+      </section>
+
+      <section class="card work-policy-card" aria-labelledby="source-pauses-heading">
+        <h2 id="source-pauses-heading">Source pauses &amp; schedules</h2>
+        <p class="muted">Pause selected work without reserving the whole GPU. Existing inference finishes. Sources reject paused requests unless their bounded connected-request queue is enabled. Frigate catch-up rediscovers missing descriptions separately.</p>
+        <div class="maintenance-action-row">
+          <label>Sources (comma separated, or *)<input id="scope-sources" type="text" value="frigate"></label>
+          <label>Work<select id="scope-traffic"><option value="all">Live + catch-up</option><option value="live">Live requests only</option><option value="catchup">Catch-up only</option></select></label>
+          <label>Duration (blank = manual)<input id="scope-duration" type="text" placeholder="2h"></label>
+          <button id="scope-pause" type="button" class="control-button control-button-warning" disabled>Pause selected work</button>
+        </div>
+        <p id="scope-action-status" class="action-status" role="status"></p>
+        <p id="policy-timezone" class="muted"></p>
+        <div id="policy-sources"></div>
+        <div id="policy-rules"></div>
+        <p class="muted">Resume removes only that manual pause. Schedules are edited in Settings; their end never overrides another pause. For exclusive GPU use, use Pause inference above. Listener status confirms the container listener, not Docker port publication.</p>
       </section>
 
       <section class="card catchup-card" aria-labelledby="catchup-heading">
@@ -207,7 +223,7 @@
         </details>
         <p id="catchup-action-status" class="action-status" role="status"></p>
         <p><a class="quiet-button" href="/settings#catchup">Open catch-up settings</a> <span class="muted">Use “Fill missing descriptions” there to start a historical scan.</span></p>
-        <small class="muted">Newest event first. Frigate stores the images; this queue stores identifiers only. Work already handed to Frigate is not preempted.</small>
+        <small class="muted">Event dispatch order is configurable in Settings. Frigate stores the images; this queue stores identifiers only. Work already handed to Frigate is not preempted.</small>
       </section>
 
       <section class="card current-card" aria-labelledby="current-heading">

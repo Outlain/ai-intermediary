@@ -77,6 +77,8 @@
           <a href="#backend">Backend</a>
           <a href="#frigate-source">Frigate source</a>
           <a href="#scheduler">Scheduler</a>
+          <a href="#sources">Sources &amp; ports</a>
+          <a href="#schedules">Pause schedules</a>
           <a href="#odysseus">Odysseus</a>
           <a href="#frigate">Frigate</a>
           <a href="#catchup">Catch-up</a>
@@ -86,6 +88,27 @@
           <a href="#infrastructure">Diagnostics</a>
         </nav>
 
+        <section id="sources" class="settings-card" aria-labelledby="sources-heading">
+          <div class="card-heading"><h2 id="sources-heading">Sources &amp; dedicated ports</h2></div>
+          <p class="section-intro">One Ollama backend, one inference at a time. Larger priority numbers run first; equal priorities use arrival order. Identification: dedicated port → enabled client header → IP/subnet → legacy model mapping → default source. Headers and ports are routing hints, not authentication.</p>
+          <div id="source-editors"></div>
+          <div class="field"><label>New source name <input id="new-source-name" type="text" placeholder="misc" pattern="[a-zA-Z0-9_-]+"></label></div>
+          <button id="add-source" type="button" class="secondary-button">Add source</button>
+          <p class="field-help">Adding misc does not change your current default source. Map Odysseus first, then select misc under Scheduler if desired. Disable a source to stop inference without removing its identity.</p>
+          <h3>Docker port publication</h3>
+          <p class="field-help">Applying a listener port starts it inside the container after a safe restart. Docker must also publish it. Add the lines below under the existing ollama-scheduler service in your Compose file, preserving your current ports, then recreate that service. Host port reachability is not automatically verified. Do not forward clients directly to Ollama.</p>
+          <pre id="source-compose"></pre>
+          <p class="field-help">Example: with port 11436 assigned to odysseus and published as 11436:11436, use http://ubuntu-ai:11436 in Odysseus. Responses stream back on that same connection. No second proxy is needed.</p>
+        </section>
+        <section id="schedules" class="settings-card" aria-labelledby="schedules-heading">
+          <div class="card-heading"><h2 id="schedules-heading">Pause schedules</h2></div>
+          <div class="field"><label>Timezone <input data-path="work_policy.timezone" type="text" placeholder="America/New_York"></label></div>
+          <p class="field-help">Schedules use local time and a fixed end time. Days refer to the starting day for overnight windows. Repeated daylight-saving hours follow the same rule twice; missing local minutes are skipped. Active requests finish. Overlapping pauses combine; ending a schedule never clears a manual pause or recovery lock.</p>
+          <div id="schedule-editors"></div>
+          <div class="field"><label>New schedule name <input id="new-schedule-name" type="text" placeholder="night"></label></div>
+          <button id="add-schedule" type="button" class="secondary-button">Add schedule</button>
+          <p class="field-help">Disable a schedule to retire it. Pause stops selected inference only. Release GPU requires all sources/all traffic and drains then unloads Ollama. Frigate discovery and saved-description checks continue. Next transitions appear on the dashboard after applying.</p>
+        </section>
         <section id="backend" class="settings-card" aria-labelledby="backend-heading">
           <div class="card-heading">
             <div><p class="eyebrow">Upstream service</p><h2 id="backend-heading">Ollama backend</h2></div>
@@ -149,10 +172,10 @@
             <div class="field field-wide" data-field-wrap="scheduler.mode">
               <label for="scheduler-mode">Scheduling behavior</label>
               <select id="scheduler-mode" data-path="scheduler.mode">
-                <option value="strict_priority">Odysseus first, Frigate when idle</option>
+                <option value="strict_priority">Strict numeric source priority</option>
                 <option value="balanced">Legacy balanced / fair sharing</option>
               </select>
-              <p class="field-help">Strict priority never forces Frigate ahead because it has waited a long time. Existing work finishes first. Aging, forced-switch waits, and batch limits only apply in balanced mode.</p>
+              <p class="field-help">Higher numbers run first, equal numbers use arrival order. Lower-priority sources can wait indefinitely. Existing work finishes first. Aging, forced-switch waits and batch limits apply only in balanced mode.</p>
               <p class="field-error" data-error-for="scheduler.mode"></p>
             </div>
             <div class="field" data-field-wrap="scheduler.max_queue_bytes">
@@ -253,8 +276,10 @@
             <div><p class="eyebrow">Persistent, metadata-only waiting list</p><h2 id="catchup-heading">Frigate description catch-up</h2></div>
             <span id="catchup-state" class="status-pill status-neutral">Not loaded</span>
           </div>
-          <p class="section-intro">Missing object and review descriptions are rediscovered from Frigate, newest first. Automatic discovery starts when first enabled. Images stay in Frigate. Odysseus and live Frigate requests take priority. The pinned Frigate bridge lets finished attempts await saving while the next generation runs; GPU inference stays one at a time.</p>
+          <p class="section-intro">Missing descriptions are rediscovered from Frigate, newest first by default or oldest first if selected below. Automatic discovery starts when first enabled. Images stay in Frigate. Eligible live requests take priority. The pinned bridge separates generation from saved-result verification; GPU inference stays one at a time.</p>
           <div class="field-grid field-grid-2">
+            <div class="field"><label>Catch-up event order<select data-path="frigate.catchup_order"><option value="newest_first">Newest first (default)</option><option value="oldest_first">Oldest first</option></select></label></div>
+            <div class="field"><label>Safety deferral recheck<input data-path="frigate.safety_retry_interval" type="text" placeholder="30s"></label><p class="field-help">Temporary pre-dispatch safety checks retry after this delay (5s–5m), without adding a failed generation.</p></div>
             <label class="check-field" data-field-wrap="frigate.enabled"><input data-path="frigate.enabled" type="checkbox"><span><strong>Enable catch-up</strong><small>Requires a reachable Frigate API and retained media.</small></span><span class="field-error" data-error-for="frigate.enabled"></span></label>
             <div class="field" data-field-wrap="frigate.url"><label for="frigate-url">Frigate API origin</label><input id="frigate-url" data-path="frigate.url" type="url" placeholder="https://frigate.example:8971" spellcheck="false"><p class="field-help">Not the Ollama address. No /api suffix. Credentials belong in secrets.env.</p><p class="field-error" data-error-for="frigate.url"></p></div>
             <div class="field" data-field-wrap="frigate.auth_mode"><label for="frigate-auth-mode">Frigate authentication</label><select id="frigate-auth-mode" data-path="frigate.auth_mode"><option value="auto">Automatic (existing behavior)</option><option value="none">No login required — trusted local API</option><option value="password">Username and password from secrets.env</option><option value="token">Bearer token from secrets.env</option></select><p class="field-help">No login sends no credentials, even if old secrets remain configured. Keep an open API restricted to your trusted network.</p><p class="field-error" data-error-for="frigate.auth_mode"></p></div>

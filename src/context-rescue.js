@@ -3,6 +3,10 @@ import { createHash } from 'node:crypto';
 const record = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const integer = (v) => Number.isSafeInteger(v) && v > 0 && v <= 16_777_216;
 const HASH = /^[a-f0-9]{64}$/;
+export const DEFERRAL_REASONS = new Set(['maintenance_paused', 'manual_source_pause', 'scheduled_pause',
+  'source_disabled', 'pause_state_error', 'context_rescue_interrupted', 'rescue_telemetry_unavailable',
+  'rescue_gpu_busy', 'rescue_vram_headroom', 'rescue_host_memory_unavailable', 'rescue_host_memory_low',
+  'rescue_host_memory_pressure', 'host_memory_unavailable', 'host_memory_low', 'host_memory_pressure']);
 export const RESCUE_REASONS = new Set(['context_overflow', 'rescue_above_cap', 'rescue_model_limit',
   'rescue_model_unknown', 'rescue_telemetry_unavailable', 'rescue_gpu_busy', 'rescue_vram_headroom',
   'rescue_used', 'rescue_request_succeeded', 'rescue_request_failed', 'rescue_outcome_uncertain',

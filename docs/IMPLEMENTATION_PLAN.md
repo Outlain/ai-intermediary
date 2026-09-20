@@ -1,5 +1,10 @@
 # Intermediary reliability and Frigate catch-up
 
+The source/schedule redesign is documented in [Sources and schedules](SOURCES_AND_SCHEDULES.md).
+It generalizes the original defaults below to numeric priorities, configurable
+catch-up order, per-source identification/pauses and recurring windows. The
+single-inference gate, durable attempt correlation and recovery boundaries remain.
+
 Implementation target: Frigate `0.19.0-bb6c2e9`, with an optional version-pinned
 completion bridge and capability checks rather than assuming a version number
 guarantees an API. Existing operator config,

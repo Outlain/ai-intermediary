@@ -420,6 +420,17 @@ test('scan frontiers defer old jobs until newer unseen review pages are discover
   assert.equal(context.client.calls[0].id, 'missing-newer');
 });
 
+test('oldest-first waits for discovery frontier then selects oldest eligible event', async (t) => {
+  const context = setup(t, { page_size: 2, catchup_order: 'oldest_first' });
+  context.client.rows.object = [object('new', 400), object('middle', 300), object('old', 50)];
+  context.manual();
+  await context.worker.tick();
+  assert.equal(context.client.calls.length, 0);
+  assert.equal(context.worker.status().scan.blocked_reason, 'discovering_older_events');
+  for (let index = 0; index < 8 && !context.client.calls.length; index++) await context.worker.tick();
+  assert.equal(context.client.calls[0].id, 'old');
+});
+
 test('unsupported eligibility is visible as bounded exclusion counts and camera warnings', async (t) => {
   const context = setup(t);
   context.client.config.cameras.yard.objects.genai.send_triggers = { tracked_object_end: false };
