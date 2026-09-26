@@ -128,6 +128,7 @@ export class HostHelperClient {
       processes: (Array.isArray(gpu.processes) ? gpu.processes : []).filter(record).slice(0, 256).map((process) => ({
         pid: Number.isSafeInteger(process.pid) && process.pid > 0 ? process.pid : null,
         name: text(process.name), vram_bytes: number(process.vram_bytes), is_ollama: process.is_ollama === true,
+        is_comfyui: value?.capabilities?.comfyui_ownership === true && process.is_comfyui === true && process.is_ollama !== true,
       })),
     }));
     const available = this.settings.enabled && !stale && !this.lastError && raw?.available === true
@@ -147,7 +148,8 @@ export class HostHelperClient {
         : !available ? safeCode(raw?.error, 'host_telemetry_unavailable') : null),
       gpus, memory,
       capabilities: { restart_reconciliation: value?.capabilities?.restart_reconciliation === true,
-        external_replacement: value?.capabilities?.external_replacement === true },
+        external_replacement: value?.capabilities?.external_replacement === true,
+        comfyui_ownership: value?.capabilities?.comfyui_ownership === true },
       last_service_failure: value?.last_service_failure?.code === 'ollama_host_oom'
         && Number.isFinite(Date.parse(value.last_service_failure.observed_at))
         ? { code: 'ollama_host_oom', observed_at: value.last_service_failure.observed_at } : null,

@@ -5,12 +5,15 @@ import { ProxyService } from './proxy.js';
 import { RecoveryService } from './recovery.js';
 import { SettingsController } from './settings-controller.js';
 import { SettingsStore } from './settings.js';
+import { configuredAdminToken } from './auth.js';
 
 const logger = new Logger();
 const configPath = process.env.CONFIG_PATH ?? '/app/config.yml';
 const requestedSettingsPath = process.env.SETTINGS_PATH ?? '/app/state/settings.json';
 const recoveryListen = process.env.SETTINGS_RECOVERY_LISTEN ?? '0.0.0.0:11434';
-const settingsToken = process.env.SETTINGS_TOKEN ?? '';
+const adminToken = configuredAdminToken(process.env);
+if (!adminToken) throw new Error('ADMIN_TOKEN is required. Set one administrator credential in secrets.env and recreate the container.');
+const settingsToken = adminToken;
 
 let service;
 let settingsController;
@@ -131,6 +134,7 @@ try {
 }
 
 for (const missing of missingEnvironment) {
+  if (adminToken && ['OBSERVABILITY_TOKEN', 'SETTINGS_TOKEN', 'MAINTENANCE_TOKEN', 'MEDIA_TOKEN'].includes(missing.variable)) continue;
   // ollama.url is editable and full normalization already reports it as an
   // error when blank. Keeping the environment hint as a warning lets the UI
   // repair it with a persistent override. Credentials remain host-only.
@@ -149,6 +153,7 @@ for (const missing of missingEnvironment) {
 settingsController = new SettingsController({
   store: settingsStore,
   token: settingsToken,
+  authentication: { mode: 'single_admin' },
   mode: 'starting',
   configPath,
   additionalDiagnostics: diagnostics,

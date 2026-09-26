@@ -71,7 +71,7 @@ export class Scheduler {
   enqueue(job) {
     if (!this.accepting) return { accepted: false, status: 503, code: 'shutting_down', message: 'proxy is shutting down' };
     const blocked = this.pauseReason(job);
-    if (blocked && !this.mayQueuePaused(job, blocked)) return { accepted: false, status: 503, code: blocked.reason, message: 'This source is paused; retry after it resumes.' };
+    if (blocked && !job.restoredDurable && !this.mayQueuePaused(job, blocked)) return { accepted: false, status: 503, code: blocked.reason, message: 'This source is paused; retry after it resumes.' };
     this.expire();
     const clientPolicy = this.config.clients[job.client];
     let sameClient = this.jobs.filter((item) => item.client === job.client && item.state === 'queued');
@@ -87,8 +87,8 @@ export class Scheduler {
     }
 
     if (sameClient.length >= clientPolicy.queue_limit) {
-      const victim = sameClient.find((item) => item.trafficClass === 'catchup')
-        ?? (job.trafficClass === 'catchup' ? null : sameClient[0]);
+      const victim = sameClient.find((item) => !item.durable && item.trafficClass === 'catchup')
+        ?? (job.trafficClass === 'catchup' || job.durable ? null : sameClient.find((item) => !item.durable));
       if (clientPolicy.overflow_policy === 'drop_oldest' && victim) {
         replacements.push({ job: victim, code: 'queue_overflow_drop_oldest', message: 'request was dropped to admit newer work' });
       } else {
@@ -107,7 +107,9 @@ export class Scheduler {
     for (const replacement of replacements) this.drop(replacement.job, 429, replacement.code, replacement.message);
 
     job.state = 'queued';
-    job.deadline = job.enqueuedAt + clientPolicy.requestTtlMs;
+    // Accepted media is a durable task, not a waiting HTTP connection. Its
+    // execution timeout starts at dispatch; pauses do not discard it.
+    job.deadline = job.durable ? Infinity : job.enqueuedAt + clientPolicy.requestTtlMs;
     job.maxWaitAt = clientPolicy.maxWaitMs > 0 ? job.enqueuedAt + clientPolicy.maxWaitMs : Infinity;
     this.jobs.push(job);
     this.metrics.increment('proxy_requests_total', { client: job.client, endpoint: job.pathname });
@@ -174,7 +176,7 @@ export class Scheduler {
   }
 
   failQueued(status, code, message) {
-    for (const job of [...this.jobs]) this.drop(job, status, code, message);
+    for (const job of [...this.jobs]) if (!job.durable) this.drop(job, status, code, message);
   }
 
   effectivePriority(job, now) {
@@ -197,7 +199,7 @@ export class Scheduler {
   enforcePauses() {
     for (const job of [...this.jobs]) {
       const blocked = this.pauseReason(job);
-      if (blocked && !this.mayQueuePaused(job, blocked)) this.drop(job, 503, blocked.reason, 'This source is paused; retry after it resumes.');
+      if (blocked && !job.durable && !this.mayQueuePaused(job, blocked)) this.drop(job, 503, blocked.reason, 'This source is paused; retry after it resumes.');
     }
     this.expire();
     this.wake();
@@ -208,7 +210,7 @@ export class Scheduler {
     const result = [];
     for (const job of this.jobs) {
       if (job.state !== 'queued' || job.signal?.aborted || this.pauseReason(job)) continue;
-      const key = `${job.client}\u0000${job.model}\u0000${job.trafficClass === 'catchup' ? 'catchup' : 'live'}`;
+      const key = `${job.client}\u0000${job.backend ?? ''}\u0000${job.model}\u0000${job.trafficClass === 'catchup' ? 'catchup' : 'live'}`;
       if (seen.has(key)) continue;
       seen.add(key);
       result.push(job);
@@ -357,7 +359,7 @@ export class Scheduler {
   }
 
   reconcile(model) {
-    if (this.active) return;
+    if (this.active || this.currentBackendType === 'comfyui') return;
     const normalized = model || null;
     if (normalized === this.currentModel) return;
     this.logger.info('scheduler model state reconciled', { previous_model: this.currentModel, backend_model: normalized });
@@ -446,6 +448,8 @@ export class Scheduler {
       id: `r-${job.sequence}`,
       client: job.client,
       classification_method: job.identificationMethod,
+      backend: job.backend ?? null,
+      durable: Boolean(job.durable),
       blocked_by: active ? null : this.pauseReason(job),
       wait_reason: waitReason,
       model: safeDisplay(job.model),

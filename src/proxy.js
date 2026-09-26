@@ -23,6 +23,9 @@ import { FrigateController } from './frigate-controller.js';
 import { BUILD_INFO } from './build-info.js';
 import { DEFERRAL_REASONS, contextOverflow, contextRequest, rescueHardwareBlock } from './context-rescue.js';
 import { memoryBlock } from './memory-guard.js';
+import { BackendRegistry } from './backend-registry.js';
+import { MediaBroker } from './media-broker.js';
+import { MediaGateway } from './media-gateway.js';
 
 function contentHeaders(headers, body) {
   const result = { ...headers };
@@ -75,6 +78,7 @@ export class ProxyService {
     this.metrics = options.metrics ?? new Metrics();
     this.observability = options.observability ?? new Observability(config, { clock: this.clock });
     this.classifier = new Classifier(config);
+    this.registry = new BackendRegistry(config);
     this.workPolicy = new WorkPolicy(config, { clock: this.clock });
     this.scheduler = new Scheduler(config, {
       logger: this.logger,
@@ -133,7 +137,7 @@ export class ProxyService {
     this.frigateController = new FrigateController({
       catchup: this.catchup,
       readToken: config.observability.auth_token,
-      controlToken: options.settingsToken ?? this.settingsController?.token ?? '',
+      controlToken: config.security?.admin_token || options.settingsToken || this.settingsController?.token || '',
     });
     this.hostHelper = options.hostHelper ?? new HostHelperClient(config, {
       clock: this.clock, onChange: () => this.scheduler.wake(),
@@ -141,15 +145,18 @@ export class ProxyService {
     this.automaticRecovery = new AutomaticRecovery(config, {
       clock: this.clock, helper: this.hostHelper, backend: this.backend, backendClient: this.backendClient,
       gate: this.gate, scheduler: this.scheduler, catchup: this.catchup, maintenance: recoveryPause,
-      isStopping: () => !this.running || this.settingsRestartPending,
+      isStopping: () => !this.running || this.settingsRestartPending || this.media?.blocked,
       onChange: () => this.scheduler.wake(),
       onEvent: (event, fields) => this.observability.record(event, fields),
     });
+    this.media = new MediaBroker(this, options.media || {});
+    this.mediaGateway = new MediaGateway(this);
   }
 
   async start({ listen = true } = {}) {
     if (this.running) return this.addresses();
     this.running = true;
+    await this.media.init();
     await this.syncWorkPolicy();
     this.backend.start();
     this.catchup.start();
@@ -201,6 +208,7 @@ export class ProxyService {
     server.requestTimeout = 0;
     server.headersTimeout = Math.max(60_000, this.config.ollama.requestTimeoutMs + 10_000);
     server.keepAliveTimeout = 65_000;
+    server.on('upgrade', (request, socket, head) => this.mediaGateway.upgrade(request, socket, head, forcedClient));
     server.listen(port, host);
     await once(server, 'listening');
     this.servers.push({ server, forcedClient });
@@ -245,6 +253,10 @@ export class ProxyService {
     const id = requestId(request.headers);
     response.setHeader('x-request-id', id);
     const url = new URL(request.url, 'http://proxy.local');
+    if (this.mediaGateway.handles(url, forcedClient)) {
+      return this.withBodyBudget(request, response, id,
+        () => this.mediaGateway.handle(request, response, url, id, forcedClient));
+    }
     if (this.settingsController?.handles(url.pathname)) {
       return this.settingsController.handle(request, response, url, id);
     }
@@ -287,7 +299,7 @@ export class ProxyService {
     }
     if (request.method === 'GET' && url.pathname === '/healthz') return sendJson(response, 200, { status: 'ok' }, id);
     if (request.method === 'GET' && url.pathname === '/readyz') {
-      const ready = !this.settingsRestartPending && !this.releasePaused && !this.workPolicy.error && this.backend.canDispatch()
+      const ready = !this.settingsRestartPending && !this.releasePaused && !this.workPolicy.error && !this.media.blocked && this.backend.canDispatch()
         && Object.keys(this.config.clients).some((client) => !this.scheduler.pauseReason({ client, trafficClass: 'live' }));
       const permitted = authorized(request, this.config.observability.auth_token);
       const snapshot = permitted ? this.observabilitySnapshot() : null;
@@ -340,6 +352,7 @@ export class ProxyService {
     if (!this.running || this.settingsRestartPending) return { allowed: false, reason: 'service_stopping' };
     if (this.incomingRequests) return { allowed: false, reason: 'live_requests_pending' };
     if (this.releasePaused) return { allowed: false, reason: 'maintenance_paused' };
+    if (this.media.blocked) return { allowed: false, reason: 'media_recovery_required' };
     if (!this.backend.canDispatch()) return { allowed: false, reason: this.backend.recoveryRequired ? 'recovery_required' : 'backend_unavailable' };
     if (this.gate.active || this.gate.managementPending || this.gate.maintenancePending) return { allowed: false, reason: 'backend_operation' };
     const memoryReason = this.config.host_helper.enabled
@@ -351,8 +364,8 @@ export class ProxyService {
   async handleRecoveryCheck(request, response, id) {
     response.setHeader('cache-control', 'no-store');
     const token = this.config.maintenance.auth_token;
-    if (!token) return sendJson(response, 503, { error: 'Configure MAINTENANCE_TOKEN to use recovery controls.' }, id);
-    if (!authorized(request, token)) return sendJson(response, 401, { error: 'Maintenance token required.' }, id);
+    if (!token) return sendJson(response, 503, { error: 'Configure ADMIN_TOKEN to use recovery controls.' }, id);
+    if (!authorized(request, token)) return sendJson(response, 401, { error: 'Administrator password required.' }, id);
     if (request.method !== 'POST') {
       response.setHeader('allow', 'POST');
       return sendJson(response, 405, { error: 'Use POST.' }, id);
@@ -380,8 +393,8 @@ export class ProxyService {
   async handleRecoveryAcknowledgment(request, response, id) {
     response.setHeader('cache-control', 'no-store');
     const token = this.config.maintenance.auth_token;
-    if (!token) return sendJson(response, 503, { error: 'Configure MAINTENANCE_TOKEN before acknowledging recovery.' }, id);
-    if (!authorized(request, token)) return sendJson(response, 401, { error: 'Maintenance token required.' }, id);
+    if (!token) return sendJson(response, 503, { error: 'Configure ADMIN_TOKEN before acknowledging recovery.' }, id);
+    if (!authorized(request, token)) return sendJson(response, 401, { error: 'Administrator password required.' }, id);
     if (request.method !== 'POST') {
       response.setHeader('allow', 'POST');
       return sendJson(response, 405, { error: 'Use POST.' }, id);
@@ -400,6 +413,7 @@ export class ProxyService {
     const release = await this.gate.acquire('maintenance', this.workerController.signal);
     try {
       const models = await this.backendClient.loadedModels(this.workerController.signal, this.config.ollama.healthTimeoutMs);
+      if (this.media.blocked) return sendJson(response, 409, { error: 'Resolve media recovery separately; an Ollama acknowledgment cannot clear ComfyUI work.', code: 'media_recovery_required' }, id);
       if (models.length) return sendJson(response, 409, { error: 'Ollama still reports loaded models. Recovery was not cleared.', code: 'models_loaded' }, id);
       if (!this.maintenance.paused || this.maintenance.revision !== pauseRevision || this.settingsRestartPending) {
         return sendJson(response, 409, { error: 'Pause or settings state changed during verification. Recovery was not cleared; pause and verify again.', code: 'recovery_state_changed' }, id);
@@ -423,8 +437,8 @@ export class ProxyService {
   authorizeDiagnostics(request, response, id) {
     response.setHeader('cache-control', 'no-store');
     if (authorized(request, this.config.observability.auth_token)) return true;
-    response.setHeader('www-authenticate', 'Bearer realm="ollama-intermediary"');
-    sendJson(response, 401, { error: 'observability token is required', code: 'unauthorized' }, id);
+    response.setHeader('www-authenticate', 'Bearer realm="ai-intermediary"');
+    sendJson(response, 401, { error: 'Administrator password required.', code: 'unauthorized' }, id);
     return false;
   }
 
@@ -483,11 +497,12 @@ export class ProxyService {
     const { service: hostService, bound: hostBound, restart_policy: hostPolicy, ...hostGpu } = this.hostHelper.snapshot();
     const maintenance = this.maintenance.status(now);
     const allSourcesPaused = Object.keys(this.config.clients).every((client) => this.scheduler.pauseReason({ client, trafficClass: 'live' }));
-    const ready = !this.releasePaused && !this.workPolicy.error && !allSourcesPaused && scheduler.accepting && this.backend.canDispatch(now);
+    const ready = !this.releasePaused && !this.workPolicy.error && !allSourcesPaused && scheduler.accepting && !this.media.blocked && this.backend.canDispatch(now);
     let schedulerState = 'idle';
     if (!scheduler.accepting) schedulerState = 'shutting_down';
     if (maintenance.paused) schedulerState = `maintenance_${maintenance.state}`;
     else if (backend.recovery_required) schedulerState = 'recovery_required';
+    else if (this.media.blocked) schedulerState = 'media_recovery_required';
     else if (!backend.reachable || backend.circuit_open) schedulerState = 'unavailable';
     else if (scheduler.upstream_draining) schedulerState = 'draining';
     else if (scheduler.active_request) schedulerState = 'busy';
@@ -506,6 +521,9 @@ export class ProxyService {
         event_clients: this.observability.listeners.size,
       },
       backend,
+      authentication: { mode: this.config.security?.auth_mode || 'legacy' },
+      backends: this.registry.snapshot(),
+      media: this.media.snapshot(),
       host_gpu: hostGpu,
       recovery: this.automaticRecovery.status(),
       maintenance,
@@ -571,8 +589,8 @@ export class ProxyService {
     response.setHeader('cache-control', 'no-store');
     response.setHeader('x-content-type-options', 'nosniff');
     if (!authorized(request, this.config.observability.auth_token)) {
-      response.setHeader('www-authenticate', 'Bearer realm="ollama-intermediary"');
-      return sendJson(response, 401, { error: 'observability token is required', code: 'unauthorized' }, id);
+      response.setHeader('www-authenticate', 'Bearer realm="ai-intermediary"');
+      return sendJson(response, 401, { error: 'Administrator password required.', code: 'unauthorized' }, id);
     }
     if (request.method !== 'GET') {
       response.setHeader('allow', 'GET');
@@ -606,13 +624,13 @@ export class ProxyService {
     }
     if (!this.config.maintenance.auth_token) {
       return sendJson(response, 503, {
-        error: 'set MAINTENANCE_TOKEN before using state-changing maintenance controls',
+        error: 'Configure ADMIN_TOKEN before using state-changing maintenance controls.',
         code: 'maintenance_auth_not_configured',
       }, id);
     }
     if (!authorized(request, this.config.maintenance.auth_token)) {
-      response.setHeader('www-authenticate', 'Bearer realm="ollama-intermediary-maintenance"');
-      return sendJson(response, 401, { error: 'maintenance token is required', code: 'unauthorized' }, id);
+      response.setHeader('www-authenticate', 'Bearer realm="ai-intermediary-maintenance"');
+      return sendJson(response, 401, { error: 'Administrator password required.', code: 'unauthorized' }, id);
     }
     if (request.method !== 'POST') {
       response.setHeader('allow', 'POST');
@@ -770,6 +788,7 @@ export class ProxyService {
       release = await this.gate.acquire('maintenance', signal);
       if (signal?.aborted || !state.paused || revision !== state.currentRevision) return;
       this.observability.record('maintenance_gpu_release_started', {});
+      if (this.media.enabled || this.media.blocked) await this.media.quiesce(signal);
       const models = [...new Set(await this.backendClient.loadedModels(
         signal,
         this.config.gpu_safety.unloadTimeoutMs,
@@ -918,6 +937,7 @@ export class ProxyService {
 
   async handleGeneration(request, response, url, id, forcedClient) {
     if (!this.scheduler.accepting) return sendJson(response, 503, { error: 'proxy is shutting down', code: 'shutting_down' }, id);
+    if (this.media.blocked) return sendJson(response, 503, { error: 'Media recovery must be verified before GPU work resumes.', code: 'media_recovery_required' }, id);
     if (this.backend.recoveryRequired) {
       return sendJson(response, 503, {
         error: 'GPU recovery is required before inference can resume',
@@ -947,6 +967,11 @@ export class ProxyService {
       ? { client: 'frigate', method: 'catchup_attempt' }
       : this.classifier.identify(request, parsed, forcedClient);
     const client = identification.client;
+    if (ticket !== undefined && !Object.hasOwn(this.config.clients, 'frigate')) {
+      return sendJson(response, 503, { error: 'Configure a Frigate client scheduling policy before using correlated catch-up.', code: 'catchup_policy_missing' }, id);
+    }
+    try { this.registry.resolve(client, null, 'ollama'); }
+    catch (error) { return sendJson(response, error.statusCode || 422, { error: error.message, code: error.code }, id); }
     const streaming = isStreaming(url.pathname, parsed);
     const originalBodyBytes = body.length;
     let normalized = applyKeepAlive(url.pathname, parsed, this.scheduler.modelPolicy(parsed.model, client));
@@ -984,6 +1009,8 @@ export class ProxyService {
       id,
       sequence: ++this.sequence,
       client,
+      backend: this.config.primaryBackend,
+      backendType: 'ollama',
       trafficClass: attemptRef ? 'catchup' : 'live',
       attemptRef,
       attemptRequestId,
@@ -1114,7 +1141,7 @@ export class ProxyService {
     }
   }
 
-  async handlePassthrough(request, response, url, id, release = null) {
+  async handlePassthrough(request, response, url, id, release = null, beforeDispatch = null) {
     let body;
     try {
       body = await readBody(request, this.config.server.body_limit_bytes);
@@ -1127,6 +1154,8 @@ export class ProxyService {
     request.once('aborted', abort);
     response.once('close', abort);
     try {
+      if (beforeDispatch && !beforeDispatch()) return;
+      if (request.aborted || response.destroyed) return;
       const headers = contentHeaders(copyRequestHeaders(request.headers, this.config.ollama.url, id), body);
       const { response: upstream, cleanup } = await this.backendClient.request({
         method: request.method, path: `${url.pathname}${url.search}`, headers, body, signal: controller.signal,
@@ -1148,6 +1177,7 @@ export class ProxyService {
   }
 
   async handleManagement(request, response, url, id) {
+    if (this.media.blocked) return sendJson(response, 503, { error: 'Media recovery is required.', code: 'media_recovery_required' }, id);
     if (this.releasePaused) return this.sendMaintenancePaused(response, id);
     if (this.backend.recoveryRequired) {
       return sendJson(response, 503, { error: 'GPU recovery verification is required before model operations can resume', code: 'gpu_recovery_required' }, id);
@@ -1177,7 +1207,29 @@ export class ProxyService {
       release();
       return sendJson(response, 503, { error: 'Intermediary is stopping or restarting; model operation was not started.', code: 'shutting_down' }, id);
     }
-    return this.handlePassthrough(request, response, url, id, release);
+    try { await this.media.prepareOllama(controller.signal); }
+    catch (error) {
+      this.media.fault = error.code || 'media_release_unconfirmed';
+      release();
+      return sendJson(response, 503, { error: 'Media GPU release could not be verified.', code: 'media_recovery_required' }, id);
+    }
+    // The media release checks and request body read are asynchronous. Policy
+    // can change while either is pending; check again immediately before the
+    // backend mutation, with the same exclusive gate still held.
+    const beforeDispatch = () => {
+      if (this.media.blocked) {
+        sendJson(response, 503, { error: 'Media recovery is required.', code: 'media_recovery_required' }, id);
+      } else if (this.releasePaused) {
+        this.sendMaintenancePaused(response, id);
+      } else if (this.backend.recoveryRequired) {
+        sendJson(response, 503, { error: 'GPU recovery verification is required before model operations can resume', code: 'gpu_recovery_required' }, id);
+      } else if (this.settingsRestartPending || !this.running || !this.scheduler.accepting) {
+        sendJson(response, 503, { error: 'Intermediary is stopping or restarting; model operation was not started.', code: 'shutting_down' }, id);
+      } else return true;
+      return false;
+    };
+    if (!beforeDispatch()) { release(); return; }
+    return this.handlePassthrough(request, response, url, id, release, beforeDispatch);
   }
 
   finishCatchupInference(job, outcome) {
@@ -1279,6 +1331,16 @@ export class ProxyService {
   async dispatchLoop() {
     const signal = this.workerController.signal;
     while (!signal.aborted) {
+      this.media.restoreQueued();
+      if (this.media.blocked) {
+        if (!this.scheduler.active && !this.gate.active) {
+          const release = await this.gate.acquire('maintenance', signal);
+          try { await this.media.reconcile(signal); } catch { /* uncertainty remains fenced */ }
+          finally { release(); }
+        }
+        await this.scheduler.waitForChange(Math.max(1000, this.config.media.pollIntervalMs), signal);
+        continue;
+      }
       if (!this.backend.canDispatch()) {
         await this.scheduler.waitForChange(Math.min(1_000, this.config.ollama.healthIntervalMs), signal);
         continue;
@@ -1305,6 +1367,18 @@ export class ProxyService {
           await this.scheduler.waitForChange(Math.min(1_000, this.config.ollama.healthIntervalMs), job.signal);
         }
         if (job.signal.aborted) throw job.signal.reason;
+        if (job.mediaId) {
+          await this.media.run(job);
+          continue;
+        }
+        try { await this.media.prepareOllama(job.signal); }
+        catch (error) {
+          this.media.fault = error.code || 'media_release_unconfirmed';
+          throw Object.assign(error, { code: 'media_recovery_required' });
+        }
+        // A synthetic media model is never an Ollama model to unload.
+        if (job.previousModel?.startsWith('comfyui:')) job.previousModel = null;
+        this.scheduler.currentBackendType = 'ollama';
         this.assertRescueDispatchAllowed(job);
         if (job.attemptRef) this.catchup.inferenceStarted?.(job.attemptRef, job.attemptRequestId);
         if (job.switching && job.previousModel && this.config.gpu_safety.unload_on_model_switch) {
@@ -1437,7 +1511,7 @@ export class ProxyService {
             reason: 'active_client_disconnect',
             duration_seconds: (Date.now() - job.dispatchedAt) / 1000,
           })];
-        } else if (['context_rescue_blocked', 'context_rescue_interrupted', 'host_memory_blocked'].includes(error.code)) {
+        } else if (['context_rescue_blocked', 'context_rescue_interrupted', 'host_memory_blocked', 'media_recovery_required'].includes(error.code)) {
           // A local safety refusal is not an Ollama failure and must not open
           // the circuit breaker or trigger a host-service restart.
           const status = error.code === 'context_rescue_blocked' ? 422 : 503;
@@ -1489,10 +1563,11 @@ export class ProxyService {
   async stop(graceMs = this.config.server.shutdownGraceMs) {
     if (!this.running) return;
     this.running = false;
-    this.hostHelper.stop();
+    this.scheduler.stop();
+    this.mediaGateway.close();
+    this.media.close();
     await this.automaticRecovery.stop();
     await this.catchup.stop();
-    this.scheduler.stop();
     this.backend.stop();
     this.maintenance.stop();
     this.scheduledMaintenance.stop();
@@ -1509,6 +1584,10 @@ export class ProxyService {
     for (const { server } of this.servers) server.closeAllConnections?.();
     await Promise.allSettled(closes);
     await waitWithTimeout(this.workerPromise, 1_000);
+    // Active media must still verify physical GPU release while it drains.
+    // Stop telemetry only after completion or the bounded worker-abort wait;
+    // aborting its client earlier turns a successful generation into uncertainty.
+    this.hostHelper.stop();
     this.backendClient.close();
     this.logger.info('proxy stopped');
   }

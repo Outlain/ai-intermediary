@@ -30,6 +30,20 @@ test('physical telemetry stays distinct, nullable and freshness bounded', async 
   assert.equal(f.client.snapshot().stale, true);
 });
 
+test('ComfyUI process ownership requires new helper capability and an explicit verified boolean', async () => {
+  const f = fixture();
+  f.value.telemetry.gpus[0].processes = [{ pid: 12, name: 'comfyui', is_comfyui: true }];
+  assert.equal((await f.client.refresh()).gpus[0].processes[0].is_comfyui, false);
+  f.value.capabilities = { comfyui_ownership: true };
+  assert.equal((await f.client.refresh()).gpus[0].processes[0].is_comfyui, true);
+  f.value.telemetry.gpus[0].processes[0].is_comfyui = 'true';
+  assert.equal((await f.client.refresh()).gpus[0].processes[0].is_comfyui, false);
+  f.value.telemetry.gpus[0].processes[0].is_comfyui = true;
+  f.value.telemetry.gpus[0].processes[0].is_ollama = true;
+  assert.equal((await f.client.refresh()).gpus[0].processes[0].is_comfyui, false);
+  assert.equal((await f.client.refresh()).gpus[0].processes[0].is_ollama, true);
+});
+
 test('missing and malformed GPU rows never become idle proof or throw', async () => {
   for (const gpus of [undefined, null, [], [null], [1], ['text'], [{ id: '0' }, null],
     Array.from({ length: 17 }, (_, i) => ({ id: String(i) })), [{ id: '0' }, { id: '0' }]]) {

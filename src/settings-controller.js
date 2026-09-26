@@ -2,6 +2,7 @@ import { readBody, sendJson } from './http-utils.js';
 import { authorized } from './observability.js';
 import { SETTINGS_SCHEMA, SettingsValidationError } from './settings.js';
 import { BUILD_INFO } from './build-info.js';
+import { configuredAdminToken } from './auth.js';
 import {
   SETTINGS_DASHBOARD_CSS,
   SETTINGS_DASHBOARD_HTML,
@@ -42,6 +43,7 @@ export class SettingsController {
   constructor({
     store,
     token = '',
+    authentication = { mode: 'legacy' },
     mode = 'running',
     configPath = '/app/config.yml',
     additionalDiagnostics = [],
@@ -51,7 +53,14 @@ export class SettingsController {
     onRestart = async () => {},
   } = {}) {
     this.store = store;
-    this.token = token;
+    // Authentication must remain canonical even when an unrelated backend
+    // setting prevents normalization and opens the configuration recovery UI.
+    // Invalid host-admin values fail closed, never revive a legacy token.
+    const rawAdmin = store?.getEffectiveRaw?.()?.security?.admin_token;
+    const configuredAdmin = configuredAdminToken({ ADMIN_TOKEN: rawAdmin === undefined
+      ? store?.getEffectiveConfig?.()?.security?.admin_token : rawAdmin });
+    this.token = configuredAdmin || token;
+    this.authentication = { mode: configuredAdmin || authentication.mode === 'single_admin' ? 'single_admin' : 'legacy' };
     this.mode = mode;
     this.configPath = configPath;
     this.additionalDiagnostics = additionalDiagnostics;
@@ -104,13 +113,13 @@ export class SettingsController {
     response.setHeader('x-content-type-options', 'nosniff');
     if (!this.token) {
       return sendJson(response, 503, {
-        error: 'Set SETTINGS_TOKEN in secrets.env and recreate the container before using settings.',
+        error: 'Set ADMIN_TOKEN in secrets.env and recreate the container before using settings.',
         code: 'settings_auth_not_configured',
       }, id);
     }
     if (!authorized(request, this.token)) {
-      response.setHeader('www-authenticate', 'Bearer realm="ollama-intermediary-settings"');
-      return sendJson(response, 401, { error: 'settings token is required', code: 'unauthorized' }, id);
+      response.setHeader('www-authenticate', 'Bearer realm="ai-intermediary-settings"');
+      return sendJson(response, 401, { error: 'Admin login is required', code: 'unauthorized', authentication: this.authentication }, id);
     }
 
     if (request.method === 'GET' && url.pathname === SETTINGS_API) {
@@ -151,6 +160,7 @@ export class SettingsController {
     return {
       ...snapshot,
       build: BUILD_INFO,
+      authentication: this.authentication,
       valid,
       mode: this.mode,
       restart_pending: this.restartPending,

@@ -4,18 +4,16 @@
   var STATUS_URL = '/_intermediary/v1/status';
   var MAINTENANCE_PAUSE_URL = '/_intermediary/v1/maintenance/pause';
   var MAINTENANCE_RESUME_URL = '/_intermediary/v1/maintenance/resume';
-  var TOKEN_KEY = 'ollama-intermediary-observability-token';
-  var MAINTENANCE_TOKEN_KEY = 'ollama-intermediary-maintenance-token';
-  var SETTINGS_TOKEN_KEY = 'ollama-intermediary-settings-admin-token';
+  var ADMIN_TOKEN_KEY = 'ai-intermediary-admin-token';
   var POLL_INTERVAL_MS = 2000;
 
   var snapshot = null;
   var activeClock = null;
   var maintenanceClock = null;
   var memoryToken = '';
-  var memoryMaintenanceToken = '';
   var maintenanceActionPending = false;
   var recoveryActionPending = false;
+  var mediaRecoveryActionPending = false;
   var refreshPromise = null;
   var pollTimer = null;
   var authBlocked = false;
@@ -109,33 +107,23 @@
     return element;
   }
   function getToken() {
-    try { return sessionStorage.getItem(TOKEN_KEY) || memoryToken; }
-    catch (_) { return memoryToken; }
+    return readSession(ADMIN_TOKEN_KEY) || memoryToken;
+  }
+  function readSession(key) {
+    try { return sessionStorage.getItem(key) || ''; } catch (_) { return ''; }
+  }
+  function writeSession(key, value) {
+    try { if (value) sessionStorage.setItem(key, value); else sessionStorage.removeItem(key); } catch (_) { /* Tab memory fallback. */ }
   }
   function setToken(value) {
     memoryToken = value || '';
-    try {
-      if (memoryToken) sessionStorage.setItem(TOKEN_KEY, memoryToken);
-      else sessionStorage.removeItem(TOKEN_KEY);
-    } catch (_) { /* Session storage may be disabled; memory is still tab-scoped. */ }
+    writeSession(ADMIN_TOKEN_KEY, memoryToken);
     setHidden('forget-token', !memoryToken);
-  }
-  function getMaintenanceToken() {
-    try { return sessionStorage.getItem(MAINTENANCE_TOKEN_KEY) || memoryMaintenanceToken; }
-    catch (_) { return memoryMaintenanceToken; }
-  }
-  function setMaintenanceToken(value) {
-    memoryMaintenanceToken = value || '';
-    try {
-      if (memoryMaintenanceToken) sessionStorage.setItem(MAINTENANCE_TOKEN_KEY, memoryMaintenanceToken);
-      else sessionStorage.removeItem(MAINTENANCE_TOKEN_KEY);
-    } catch (_) { /* Session storage may be disabled; memory is still tab-scoped. */ }
-    setHidden('forget-maintenance-token', !memoryMaintenanceToken);
-    setText('maintenance-token-state', memoryMaintenanceToken
-      ? 'Control token saved for this browser tab.'
-      : 'Enter the separate maintenance token to enable controls.');
     syncMaintenanceControls();
+    syncCatchupControls();
   }
+  function getMaintenanceToken() { return getToken(); }
+  function setMaintenanceToken(value) { setToken(value); }
   function requestHeaders() {
     var headers = { accept: 'application/json' };
     var token = getToken();
@@ -149,10 +137,13 @@
     return headers;
   }
 
-  function recoveryIsActive(data) {
+  function ollamaRecoveryIsActive(data) {
     var state = data && data.recovery && data.recovery.state;
     return Boolean(data && data.backend && data.backend.recovery_required)
       || ['restarting', 'verifying'].includes(state);
+  }
+  function recoveryIsActive(data) {
+    return ollamaRecoveryIsActive(data) || Boolean(data && data.media && data.media.blocked);
   }
 
   function setConnection(kind, label) {
@@ -169,7 +160,7 @@
   function showAuth(message) {
     authBlocked = true;
     setHidden('auth-panel', false);
-    setText('auth-message', message || 'A valid observability token is required.');
+    setText('auth-message', message || 'Enter your administrator password.');
     setConnection('offline', 'Authentication required');
     stopConnections();
     window.setTimeout(function () { byId('token-input').focus(); }, 0);
@@ -177,7 +168,7 @@
   function hideAuth() {
     authBlocked = false;
     setHidden('auth-panel', true);
-    setText('auth-message', 'This dashboard needs a token to read operational metadata.');
+    setText('auth-message', 'Use your administrator password to open this dashboard.');
   }
 
   function healthState(data) {
@@ -187,6 +178,10 @@
     var maintenance = data.maintenance || {};
     var maintenanceState = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
     var ready = typeof service.ready === 'boolean' ? service.ready : service.state === 'ready';
+    if (data.media && data.media.blocked) {
+      return { css: 'health-danger', title: 'Shared GPU blocked · media recovery required',
+        detail: 'A ComfyUI operation or its GPU release is unverified. New GPU work is blocked; check Media recovery below. An idle Ollama API does not clear this lock.' };
+    }
     if (recoveryIsActive(data)) {
       return { css: 'health-danger', title: data.recovery && ['restarting', 'verifying'].includes(data.recovery.state) ? 'Inference recovery in progress' : 'Inference recovery required', detail: backend.recovery_reason || 'The previous operation could not be verified safe. New inference is blocked during recovery.' };
     }
@@ -216,8 +211,9 @@
     }
     return {
       css: 'health-good',
-      title: 'Everything is operational',
-      detail: 'Ollama is reachable · Scheduler is ' + titleCase(scheduler.state || 'idle').toLowerCase() + '.'
+      title: data.media && data.media.enabled ? 'Shared GPU scheduler operational' : 'Everything is operational',
+      detail: 'Ollama is reachable · Scheduler is ' + titleCase(scheduler.state || 'idle').toLowerCase()
+        + (data.media && data.media.enabled ? ' · Media jobs use the same exclusive GPU queue. Backend configuration alone is not a health test.' : '.')
     };
   }
 
@@ -247,15 +243,11 @@
     var state = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
     var controlAvailable = maintenance.control_available === true;
     var hasToken = Boolean(getMaintenanceToken());
-    var canAct = controlAvailable && hasToken && !maintenanceActionPending && !recoveryActionPending;
-    var tokenInput = byId('maintenance-token-input');
-    var tokenSubmit = byId('maintenance-token-submit');
+    var canAct = controlAvailable && hasToken && !maintenanceActionPending && !recoveryActionPending && !mediaRecoveryActionPending;
     var duration = byId('pause-duration');
     var pause = byId('pause-button');
     var resume = byId('resume-button');
 
-    if (tokenInput) tokenInput.disabled = !controlAvailable;
-    if (tokenSubmit) tokenSubmit.disabled = !controlAvailable;
     if (duration) duration.disabled = !canAct || state !== 'running';
     if (pause) pause.disabled = !canAct || state !== 'running';
     if (resume) resume.disabled = !canAct || recoveryIsActive(snapshot) || (state !== 'paused' && state !== 'pausing' && state !== 'error');
@@ -263,17 +255,18 @@
     if (!snapshot) {
       setText('maintenance-control-availability', 'Waiting for maintenance status…');
     } else if (!controlAvailable) {
-      setText('maintenance-control-availability', 'Maintenance controls are unavailable because no server-side maintenance token is configured.');
+      setText('maintenance-control-availability', 'Maintenance controls are unavailable; enable them in Settings.');
     } else if (!hasToken) {
-      setText('maintenance-control-availability', 'Control API is available. Enter its separate token above to pause or resume inference.');
+      setText('maintenance-control-availability', 'Log in with the administrator password to use maintenance controls.');
     } else if (maintenanceActionPending) {
       setText('maintenance-control-availability', 'A maintenance request is in progress…');
     } else {
       setText('maintenance-control-availability', recoveryIsActive(snapshot)
         ? 'Recovery is required. You may pause inference; resume is blocked until recovery completes.'
-        : 'Maintenance controls are ready. This token authorizes pause, resume, and protected recovery actions.');
+        : 'Maintenance controls are ready. Your administrator login authorizes pause, resume, and protected recovery actions.');
     }
     syncRecoveryControls();
+    syncMediaRecoveryControls();
     if (snapshot) renderWorkPolicy(snapshot);
   }
 
@@ -308,7 +301,7 @@
       var scheduled = data.scheduled_maintenance || {};
       var scoped = data.work_policy && data.work_policy.sources && data.work_policy.sources.some(function (source) { return source.live || source.catchup; });
       setText('maintenance-title', scheduled.paused ? 'Scheduled GPU reservation' : scoped ? 'Source pause rules are active' : 'Inference is running normally');
-      setText('maintenance-detail', scheduled.paused ? 'A schedule blocks all inference and drains Ollama. Ending it does not cancel a manual pause. See schedules below.' : scoped ? 'Only eligible sources may generate. See source pauses and schedules below.' : 'Ollama requests are being accepted and scheduled. Pause mode is ready when you need the GPU elsewhere.');
+      setText('maintenance-detail', scheduled.paused ? 'A schedule blocks new work and waits for managed engines to release the GPU. Ending it does not cancel a manual pause. See schedules below.' : scoped ? 'Only eligible sources may generate. See source pauses and schedules below.' : 'Eligible AI work shares one GPU scheduler. Pause mode is ready when you need the GPU elsewhere.');
       if (scheduled.paused) setText('maintenance-state', 'Scheduled pause');
     }
 
@@ -331,7 +324,7 @@
     else if (maintenance.gpu_released === true) setText('maintenance-gpu-released', 'Yes');
     else if (state === 'pausing') setText('maintenance-gpu-released', 'Waiting for drain');
     else if (state === 'paused' || state === 'error') setText('maintenance-gpu-released', 'No');
-    else setText('maintenance-gpu-released', 'Available to Ollama');
+    else setText('maintenance-gpu-released', 'Managed by shared scheduler');
     setText('maintenance-paused-at', formatDate(maintenance.paused_at));
     updateLiveClocks();
     syncMaintenanceControls();
@@ -339,6 +332,7 @@
 
   function renderActive(data) {
     var active = data.active_request;
+    var mediaRunning = (data.media && Array.isArray(data.media.jobs) ? data.media.jobs : []).filter(function (job) { return ['dispatching', 'running'].includes(job.state); });
     var scheduler = data.scheduler || {};
     var workloadState = recoveryIsActive(data) ? 'recovery_required' : String(scheduler.state || (active ? 'busy' : 'idle')).toLowerCase();
     var stateTag = byId('active-state');
@@ -350,10 +344,11 @@
     setHidden('active-content', !active);
     if (!active) {
       activeClock = null;
-      setText('active-empty-title', recoveryIsActive(data) ? 'New inference is blocked' : 'No request is running');
+      setText('active-empty-title', recoveryIsActive(data) ? 'New inference is blocked' : mediaRunning.length ? 'Media work holds the GPU' : 'No request is running');
       setText('active-empty-detail', recoveryIsActive(data)
         ? 'Recovery must finish before another request can start. An empty scheduler does not prove upstream work stopped.'
-        : data.maintenance && data.maintenance.paused ? 'Inference remains paused. Resume it only when you are ready.'
+        : mediaRunning.length ? 'ComfyUI media work is tracked in the media panel. An empty Ollama request display does not make the shared GPU idle.'
+          : data.maintenance && data.maintenance.paused ? 'Inference remains paused. Resume it only when you are ready.'
           : workloadState === 'idle' ? 'The scheduler is idle. New requests remain subject to backend and safety checks.' : 'The scheduler is not currently dispatching a request.');
       return;
     }
@@ -515,14 +510,14 @@
     var data = snapshot || {};
     var maintenance = data.maintenance || {};
     var recovery = data.recovery || {};
-    var busy = recoveryActionPending || maintenanceActionPending || ['restarting', 'verifying'].includes(recovery.state);
+    var busy = recoveryActionPending || maintenanceActionPending || mediaRecoveryActionPending || ['restarting', 'verifying'].includes(recovery.state);
     var authorized = maintenance.control_available === true && Boolean(getMaintenanceToken());
     var paused = maintenance.state === 'paused' || maintenance.paused === true;
-    var locked = recoveryIsActive(data);
+    var locked = ollamaRecoveryIsActive(data);
     byId('recovery-check').disabled = !authorized || busy || !recovery.enabled || !locked;
     byId('recovery-acknowledge').disabled = !authorized || busy || !paused || !locked || !byId('recovery-confirm').checked || Boolean(data.active_request);
     setText('recovery-control-state', !authorized
-      ? 'Enter the maintenance control token above to use recovery controls. Dashboard and Settings tokens do not authorize recovery.'
+      ? 'Log in with your administrator password to use recovery controls.'
       : busy ? 'A recovery or maintenance action is in progress. Manual pause will be preserved.'
         : !recovery.enabled ? 'Automatic recovery is disabled. Configure the host helper and automatic recovery in Settings, or verify the host and acknowledge manually while paused.'
           : 'Check / recover now may restart only Ollama within the configured limits. Manual acknowledgment requires paused inference and explicit host verification. Neither action resumes a manual pause.');
@@ -647,7 +642,7 @@
         processes.slice(0, 12).forEach(function (process) {
           processList.appendChild(create('li', '', 'PID ' + String(process.pid == null ? 'unknown' : process.pid).slice(0, 24) + ' · '
             + String(process.name || (process.is_ollama ? 'Ollama' : 'Unnamed process')).slice(0, 100) + ' · '
-            + hardwareBytes(process.vram_bytes, fresh) + ' VRAM' + (process.is_ollama ? ' · Ollama' : '')));
+            + hardwareBytes(process.vram_bytes, fresh) + ' VRAM' + (process.is_ollama ? ' · Ollama' : process.is_comfyui ? ' · Verified ComfyUI service' : ' · Ownership unverified')));
         });
         item.appendChild(processList);
         if (processes.length > 12) item.appendChild(create('p', 'form-help', formatInteger(processes.length - 12) + ' additional processes are not shown.'));
@@ -660,7 +655,7 @@
     if (!['check', 'acknowledge'].includes(action) || recoveryActionPending || maintenanceActionPending) return;
     var maintenance = snapshot && snapshot.maintenance || {};
     var recovery = snapshot && snapshot.recovery || {};
-    if (!getMaintenanceToken() || maintenance.control_available !== true || !recoveryIsActive(snapshot)) return;
+    if (!getMaintenanceToken() || maintenance.control_available !== true || !ollamaRecoveryIsActive(snapshot) || mediaRecoveryActionPending) return;
     if (['restarting', 'verifying'].includes(recovery.state)) return;
     if (action === 'check' && !recovery.enabled) return;
     if (action === 'acknowledge' && (!(maintenance.state === 'paused' || maintenance.paused === true) || !byId('recovery-confirm').checked || snapshot.active_request)) return;
@@ -676,7 +671,7 @@
         body: JSON.stringify(action === 'check' ? { confirm: true } : { confirm_gpu_recovered: true })
       });
       var payload = await response.json();
-      if (response.status === 401 || response.status === 403) { setMaintenanceToken(''); throw new Error('The maintenance token was rejected. Enter it again.'); }
+      if (response.status === 401 || response.status === 403) { setMaintenanceToken(''); throw new Error('The administrator password was rejected. Log in again.'); }
       if (!response.ok) throw new Error(typeof payload.error === 'string' ? payload.error : payload.error && payload.error.message || payload.message || 'HTTP ' + response.status);
       byId('recovery-confirm').checked = false;
       setText('recovery-action-status', action === 'check' ? 'Recovery check accepted. Watch the checks and cooldown above; a manual pause remains in effect.' : 'Recovery acknowledgment accepted. A manual pause remains in effect; resume separately when ready.');
@@ -734,9 +729,119 @@
     events.slice().reverse().forEach(function (event) { list.appendChild(eventItem(event)); });
   }
 
+  function renderAIBackends(data) {
+    var backends = Array.isArray(data.backends) ? data.backends : [];
+    var list = byId('backend-registry-list'); list.replaceChildren();
+    backends.forEach(function (backend) {
+      var row = create('li', 'queue-item');
+      row.appendChild(create('strong', '', backend.id + ' · ' + titleCase(backend.type)));
+      row.appendChild(create('p', 'muted', (backend.enabled ? 'Enabled in configuration' : 'Disabled')
+        + ' · Shared resource: ' + (backend.resource_group || 'Not reported')));
+      list.appendChild(row);
+    });
+    setHidden('backend-registry-empty', backends.length > 0);
+    var media = data.media || {}, jobs = Array.isArray(media.jobs) ? media.jobs : [];
+    var executing = jobs.filter(function (job) { return ['dispatching', 'running'].includes(job.state); });
+    var active = data.active_request, badge = byId('gpu-owner-state');
+    badge.className = 'tag tag-neutral';
+    if (recoveryIsActive(data)) {
+      badge.className = 'tag tag-danger'; setText('gpu-owner-state', 'Ownership blocked');
+      setText('gpu-owner-detail', 'Previous GPU work or its release has not been verified. The scheduler must not hand the GPU to another engine yet.');
+    } else if (executing.length) {
+      badge.className = 'tag tag-good'; setText('gpu-owner-state', 'Media owns GPU');
+      setText('gpu-owner-detail', executing.map(function (job) { return job.source + ' → ' + job.backend + ' · ' + titleCase(job.state) + ' · ' + compactId(job.id); }).join('; '));
+    } else if (active) {
+      badge.className = 'tag tag-good'; setText('gpu-owner-state', 'Work in progress');
+      setText('gpu-owner-detail', (active.client || active.source || 'Source not reported') + ' → '
+        + (active.backend || (backends.filter(function (backend) { return backend.type === 'ollama'; })[0] || {}).id || 'Backend not reported')
+        + ' · ' + titleCase(active.type || 'inference'));
+    } else {
+      setText('gpu-owner-state', 'No active job reported');
+      setText('gpu-owner-detail', 'No active workload is reported. This is not proof that GPU memory is free; model unloading, maintenance and safety checks still apply.');
+    }
+  }
+
+  function renderMedia(data) {
+    var media = data.media || {}, jobs = Array.isArray(media.jobs) ? media.jobs : [];
+    var uncertainIds = new Set(jobs.filter(function (job) { return job.state === 'uncertain'; }).map(function (job) { return job.id; }));
+    if (media.blocked) (Array.isArray(media.unresolved) ? media.unresolved : []).forEach(function (id) { uncertainIds.add(id); });
+    var queued = jobs.filter(function (job) { return job.state === 'queued'; });
+    var running = jobs.filter(function (job) { return ['dispatching', 'running'].includes(job.state) && !uncertainIds.has(job.id); });
+    var badge = byId('media-state');
+    badge.className = media.blocked ? 'tag tag-danger' : media.enabled ? 'tag tag-good' : 'tag tag-neutral';
+    setText('media-state', media.blocked ? 'Recovery required' : media.enabled ? 'Enabled' : data.media ? 'Disabled' : 'Not reported');
+    setText('media-detail', media.blocked ? 'Media completion or GPU release is uncertain. No new shared GPU workload may start until recovery is verified.'
+      : media.enabled ? 'Durable media jobs share the same source priorities and single GPU as Ollama.'
+        : 'Media execution is disabled. Existing Ollama and Frigate behavior remains available unless a previous media operation still needs recovery.');
+    setText('media-queued', formatInteger(queued.length)); setText('media-running', formatInteger(running.length));
+    setText('media-uncertain', formatInteger(uncertainIds.size));
+    setHidden('media-error', !media.error); setText('media-error', media.error ? titleCase(media.error) : '');
+    var list = byId('media-jobs'); list.replaceChildren();
+    setHidden('media-jobs-empty', jobs.length > 0);
+    jobs.slice(0, 20).forEach(function (job) {
+      var uncertain = uncertainIds.has(job.id), state = uncertain ? 'Uncertain · recovery required' : titleCase(job.state);
+      var row = create('li', 'queue-item');
+      row.appendChild(create('strong', '', compactId(job.id) + ' · ' + state));
+      row.appendChild(create('p', 'muted', 'Source: ' + (job.source || 'Unknown') + ' → Backend: ' + (job.backend || 'Unknown')));
+      if (job.reason || job.error) row.appendChild(create('p', 'muted', titleCase(job.reason || job.error)));
+      var artifacts = Array.isArray(job.artifacts) ? job.artifacts : [];
+      if (artifacts.length) {
+        var available = artifacts.filter(function (artifact) { return artifact.status === 'available'; }).length;
+        row.appendChild(create('p', 'form-help', formatInteger(available) + ' retained output(s) · Open results through the media gateway with your admin login. Expired files are not downloadable.'));
+      }
+      list.appendChild(row);
+    });
+    setHidden('media-jobs-limit', jobs.length <= 20);
+    setText('media-jobs-limit', 'Showing the first 20 of ' + formatInteger(jobs.length) + ' retained media jobs. Use the media gateway for the full job list.');
+    setHidden('media-recovery-panel', !media.blocked);
+    setText('media-recovery-detail', 'Pause inference, stop the old ComfyUI service and verify all of its previous workers have stopped. '
+      + (media.recovery || 'An idle GPU reading or closed browser alone is not proof.'));
+    syncMediaRecoveryControls();
+  }
+
+  function syncMediaRecoveryControls() {
+    var data = snapshot || {}, media = data.media || {}, maintenance = data.maintenance || {};
+    var authorized = maintenance.control_available === true && Boolean(getMaintenanceToken());
+    var paused = maintenance.state === 'paused' || maintenance.paused === true;
+    var busy = maintenanceActionPending || recoveryActionPending || mediaRecoveryActionPending || Boolean(data.active_request);
+    byId('media-recovery-acknowledge').disabled = !media.blocked || !media.enabled || !authorized || !paused || busy || !byId('media-recovery-confirm').checked;
+    setText('media-recovery-control-state', !media.enabled ? 'Media must be enabled to verify its backend release. Re-enable it in Settings without hiding or deleting its saved state.'
+      : !authorized ? 'Log in with your administrator password to acknowledge recovery.'
+        : !paused ? 'Pause inference first and wait for any active GPU workload to finish.'
+          : busy ? 'Another workload or control action is active. Wait before acknowledging.'
+            : 'Verify the old service and workers on the host, then check the confirmation. Acknowledgment never resumes a manual pause.');
+  }
+
+  async function performMediaRecoveryAction() {
+    syncMediaRecoveryControls();
+    if (byId('media-recovery-acknowledge').disabled) return;
+    mediaRecoveryActionPending = true; syncMaintenanceControls();
+    setText('media-recovery-action-status', 'Checking your media recovery acknowledgment and safe GPU release…');
+    var controller = new AbortController();
+    var timeout = window.setTimeout(function () { controller.abort(); }, 30000);
+    try {
+      var response = await fetch('/_intermediary/v1/media/acknowledge', {
+        method: 'POST', headers: maintenanceHeaders(), cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
+        body: JSON.stringify({ confirm_service_stopped: true })
+      });
+      var payload = await response.json();
+      if (response.status === 401 || response.status === 403) { setMaintenanceToken(''); throw new Error('The administrator password was rejected. Log in again.'); }
+      if (!response.ok) throw new Error(typeof payload.error === 'string' ? payload.error : 'Media acknowledgment failed with HTTP ' + response.status);
+      byId('media-recovery-confirm').checked = false;
+      setText('media-recovery-action-status', 'Media acknowledgment accepted. Inference remains paused; inspect results and resume separately when ready.');
+      await refreshSnapshot();
+    } catch (error) {
+      setText('media-recovery-action-status', controller.signal.aborted ? 'The verification response timed out. Check the status before retrying; acknowledgment may already have completed.' : 'Media recovery not acknowledged: ' + error.message);
+    } finally {
+      window.clearTimeout(timeout); mediaRecoveryActionPending = false; syncMaintenanceControls();
+    }
+  }
+
   function render(data) {
     renderWorkPolicy(data);
     snapshot = data;
+    renderAIBackends(data);
+    renderMedia(data);
     renderHealth(data);
     renderMaintenance(data);
     renderActive(data);
@@ -997,22 +1102,16 @@
     await refreshCatchupPage();
   }
 
-  function savedCatchupToken() {
-    try { return sessionStorage.getItem(SETTINGS_TOKEN_KEY) || ''; } catch (_) { return ''; }
-  }
-
   function syncCatchupControls() {
-    setHidden('catchup-use-saved-token', !savedCatchupToken() || Boolean(catchupAdminToken));
-    setHidden('catchup-lock', !catchupAdminToken);
+    catchupAdminToken = getToken();
     byId('catchup-refresh').disabled = !catchupAdminToken || catchupActionPending;
     setText('catchup-control-state', catchupAdminToken
-      ? 'Settings token selected for this tab. The server checks it for every action. Retrying respects live priority, pause mode, and the active handoff.'
-      : 'Controls are locked. Enter the separate Settings admin token, or explicitly use its saved token. Dashboard and maintenance tokens are never used for these actions.');
+      ? 'Admin login unlocks these controls. The server checks every action. Retrying respects live priority, pause mode, and the active handoff.'
+      : 'Controls are locked. Log in with your administrator password. Retrying never bypasses live priority, pause mode, or the active handoff.');
   }
 
   function unlockCatchup(token) {
-    catchupAdminToken = String(token || '').trim();
-    syncCatchupControls();
+    setToken(String(token || '').trim());
     renderCatchupPage();
   }
 
@@ -1082,7 +1181,7 @@
           signal: controller.signal
         });
         if (response.status === 401) {
-          showAuth(getToken() ? 'That token was rejected. Enter a valid observability token.' : 'A token is required to open this dashboard.');
+          showAuth(getToken() ? 'That password was rejected. Enter your administrator password.' : 'Log in to open this dashboard.');
           return false;
         }
         if (!response.ok) throw new Error('Status request failed with HTTP ' + response.status);
@@ -1111,11 +1210,10 @@
   }
 
   async function performMaintenanceAction(action) {
-    if (maintenanceActionPending || recoveryActionPending || (action === 'resume' && recoveryIsActive(snapshot))) return;
+    if (maintenanceActionPending || recoveryActionPending || mediaRecoveryActionPending || (action === 'resume' && recoveryIsActive(snapshot))) return;
     var token = getMaintenanceToken();
     if (!token) {
-      setMaintenanceActionStatus('Enter the separate maintenance control token first.', 'error');
-      byId('maintenance-token-input').focus();
+      showAuth('Log in with your administrator password to use maintenance controls.');
       return;
     }
     var maintenance = snapshot && snapshot.maintenance ? snapshot.maintenance : {};
@@ -1202,21 +1300,6 @@
     reconnect();
   });
 
-  byId('maintenance-token-form').addEventListener('submit', function (event) {
-    event.preventDefault();
-    var value = byId('maintenance-token-input').value.trim();
-    if (!value) return;
-    setMaintenanceToken(value);
-    byId('maintenance-token-input').value = '';
-    setMaintenanceActionStatus('Maintenance control token saved for this browser tab.', 'success');
-  });
-
-  byId('forget-maintenance-token').addEventListener('click', function () {
-    setMaintenanceToken('');
-    byId('maintenance-token-input').value = '';
-    setMaintenanceActionStatus('Maintenance control token forgotten.', '');
-  });
-
   byId('pause-button').addEventListener('click', function () { performMaintenanceAction('pause'); });
   byId('scope-pause').addEventListener('click', function () { performScopeAction('pause', {
     sources: byId('scope-sources').value.split(/[\s,]+/).filter(Boolean), traffic: byId('scope-traffic').value,
@@ -1225,25 +1308,19 @@
   byId('recovery-check').addEventListener('click', function () { performRecoveryAction('check'); });
   byId('recovery-acknowledge').addEventListener('click', function () { performRecoveryAction('acknowledge'); });
   byId('recovery-confirm').addEventListener('change', syncRecoveryControls);
+  byId('media-recovery-acknowledge').addEventListener('click', performMediaRecoveryAction);
+  byId('media-recovery-confirm').addEventListener('change', syncMediaRecoveryControls);
   byId('catchup-refresh').addEventListener('click', function () { performCatchupAction('refresh'); });
   byId('catchup-previous').addEventListener('click', function () { changeCatchupPage(-1); });
   byId('catchup-next').addEventListener('click', function () { changeCatchupPage(1); });
   Object.keys(CATCHUP_VIEWS).forEach(function (view) {
     byId('catchup-view-' + view).addEventListener('click', function () { changeCatchupView(view); });
   });
-  byId('catchup-token-form').addEventListener('submit', function (event) {
-    event.preventDefault();
-    unlockCatchup(byId('catchup-token-input').value);
-    byId('catchup-token-input').value = '';
-  });
-  byId('catchup-use-saved-token').addEventListener('click', function () { unlockCatchup(savedCatchupToken()); });
-  byId('catchup-lock').addEventListener('click', function () { unlockCatchup(''); });
   byId('resume-button').addEventListener('click', function () { performMaintenanceAction('resume'); });
 
   window.addEventListener('pagehide', stopConnections);
   window.addEventListener('pageshow', function (event) { if (event.persisted) reconnect(); });
   window.setInterval(updateLiveClocks, 1000);
   setToken(getToken());
-  setMaintenanceToken(getMaintenanceToken());
   reconnect();
 })();

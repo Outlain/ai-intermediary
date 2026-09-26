@@ -98,7 +98,7 @@ scheduler:
   mode: strict_priority
   # Raw active + pending body budget, not a process RSS limit. Leave container headroom.
   max_queue_bytes: 67108864
-  # Version 1 intentionally enforces exactly one GPU inference at a time.
+  # Exactly one GPU workload executes at a time across all backends.
   max_parallel_generations: 1
   priority_aging: false
   aging_interval: 10s
@@ -137,11 +137,11 @@ host_helper:
   # Optional Linux host service. Install integrations/host first and mount only
   # its group-restricted Unix socket directory; do not mount the Docker socket.
   enabled: false
-  socket_path: /run/ollama-intermediary-host/control.sock
+  socket_path: /run/ai-intermediary-host/control.sock
   poll_interval: 5s
   request_timeout: 15s
   stale_after: 30s
-  # Used only with enabled host monitoring. Requires the 1.6+ host helper.
+  # Used only with enabled host monitoring.
   # Admission floors, not predictions of peak memory use. Live work is unchanged.
   memory_guard:
     enabled: true
@@ -166,10 +166,10 @@ auto_recovery:
   max_idle_vram_mb: 512
 
 maintenance:
-  # Administrative pause control is enabled by default, but every mutation requires
-  # its own non-empty bearer token. Do not reuse the read-only observability token.
+  # Administrative pause control is enabled by default; mutations require authentication.
+  # One host-managed administrator credential protects all human controls.
   enabled: true
-  auth_token: "${MAINTENANCE_TOKEN:?Set MAINTENANCE_TOKEN in secrets.env}"
+  auth_token: "${ADMIN_TOKEN:?Set ADMIN_TOKEN in secrets.env}"
   # Timed pauses longer than this are rejected; manual pauses have no expiry.
   max_pause: 168h
   # Persist pause state across intermediary container restarts.
@@ -179,8 +179,8 @@ observability:
   # The dashboard and API use the existing intermediary listener and port.
   enabled: true
   ui_enabled: true
-  # Optional bearer token supplied by secrets.env. Leave blank only on a trusted LAN.
-  auth_token: "${OBSERVABILITY_TOKEN:-}"
+  # The same administrator credential is required for protected status reads.
+  auth_token: "${ADMIN_TOKEN:?Set ADMIN_TOKEN in secrets.env}"
   # History is held only in memory and is erased when the container restarts.
   history_limit: 100
   recent_events: 20
@@ -189,7 +189,6 @@ observability:
 
 frigate:
   # Enable via /settings after providing the API address and host-managed credentials.
-  # Old operator config.yml files need no replacement: these defaults are automatic.
   enabled: false
   url: "${FRIGATE_URL:-}"
   # Use none for an intentionally open trusted API; auto preserves existing setups.
@@ -227,3 +226,9 @@ frigate:
     max_context: 0 # Set a tested maximum before enabling; 0 is deliberately unset.
     output_reserve: 2048
     safety_margin: 1024
+# Optional AI backends and ComfyUI media are configured in Settings or YAML.
+# See docs/AI_INTERMEDIARY.md before enabling. Omitting `backends` uses the
+# Ollama URL above. Media stays disabled until host telemetry, the
+# authenticated ComfyUI bridge, a media source/port and trusted nodes are ready.
+media:
+  enabled: false

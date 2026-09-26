@@ -1,7 +1,9 @@
+# AI Intermediary release deployment. Preserve state mounts during updates.
+name: ai-intermediary
 services:
-  ollama-scheduler:
+  ai-intermediary:
     image: __IMAGE__
-    container_name: ollama-scheduler
+    container_name: ai-intermediary
     restart: unless-stopped
     init: true
     logging:
@@ -22,7 +24,7 @@ services:
       - ./secrets.env
     volumes:
       - ./config.yml:/app/config.yml:ro
-      - ollama-scheduler-state:/app/state
+      - ai-intermediary-state:/app/state
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -36,4 +38,4 @@ services:
           memory: 256M
 
 volumes:
-  ollama-scheduler-state:
+  ai-intermediary-state:

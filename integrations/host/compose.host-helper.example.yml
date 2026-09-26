@@ -1,14 +1,16 @@
 # Merge ONLY this fragment into your existing intermediary Compose deployment.
-# Set HOST_HELPER_GID to `getent group ollama-intermediary-host | cut -d: -f3`.
+# Set HOST_HELPER_GID to `getent group ai-intermediary-host | cut -d: -f3`.
 # Leave every existing port, state volume, config mount, environment and limit.
+# Merge into the existing ai-intermediary service, never a second scheduler.
+# Do not rename the state volume when adding this helper.
 services:
-  ollama-scheduler:
+  ai-intermediary:
     group_add:
       - "${HOST_HELPER_GID:?Set HOST_HELPER_GID to the host helper group ID}"
     volumes:
-      - /run/ollama-intermediary-host:/run/ollama-intermediary-host:ro
+      - /run/ai-intermediary-host:/run/ai-intermediary-host:ro
     environment:
       HOST_HELPER_ENABLED: "true"
-      HOST_HELPER_SOCKET_PATH: /run/ollama-intermediary-host/control.sock
+      HOST_HELPER_SOCKET_PATH: /run/ai-intermediary-host/control.sock
       # Enable in Settings only after fresh host telemetry is verified.
       AUTO_RECOVERY_ENABLED: "false"

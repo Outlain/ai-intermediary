@@ -37,7 +37,7 @@ class Element {
   querySelectorAll() { return this.children; }
 }
 
-function harness(kind) {
+function harness(kind, storage = new Map()) {
   const html = kind === 'dashboard' ? DASHBOARD_HTML : SETTINGS_DASHBOARD_HTML;
   const source = kind === 'dashboard' ? DASHBOARD_JS : SETTINGS_DASHBOARD_JS;
   const nodes = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Element()]));
@@ -68,14 +68,14 @@ function harness(kind) {
       clearTimeout: (id) => timeouts.delete(id),
       addEventListener() {},
     },
-    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    sessionStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
     performance, AbortController,
     fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
   });
   const marker = kind === 'dashboard' ? "  byId('token-form').addEventListener" : '  bindEvents();';
   const names = kind === 'dashboard'
-    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage, changeCatchupView, refreshCatchupPage, unlockCatchup, performCatchupAction, render, renderHostGpu, setMaintenanceToken, syncRecoveryControls, performRecoveryAction, performMaintenanceAction'
-    : 'restartInfo, applyEnvelope, updateDirtyState, useWarmModel, collectPatch, refreshCatchup, showAuth, startCatchupRefresh, stopCatchupRefresh';
+    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage, changeCatchupView, refreshCatchupPage, unlockCatchup, performCatchupAction, render, renderHostGpu, setMaintenanceToken, syncRecoveryControls, performRecoveryAction, performMaintenanceAction, renderAIBackends, renderMedia, syncMediaRecoveryControls, performMediaRecoveryAction, getToken, setToken, getMaintenanceToken, syncCatchupControls'
+    : 'restartInfo, applyEnvelope, updateDirtyState, useWarmModel, collectPatch, refreshCatchup, showAuth, startCatchupRefresh, stopCatchupRefresh, getToken, setToken';
   const boundary = source.indexOf(marker);
   assert.ok(boundary > 0, 'UI bootstrap marker must remain identifiable');
   vm.runInContext(`${source.slice(0, boundary)}\n globalThis.ui = { ${names} };\n})();`, context);
@@ -97,12 +97,126 @@ test('UI wrappers load their independent assets and all literal element referenc
   }
 });
 
+test('single admin login is shared across dashboard, settings and maintenance without extra credential forms', () => {
+  const storage = new Map();
+  const dashboard = harness('dashboard', storage);
+  dashboard.ui.setToken('single-secret');
+  dashboard.ui.render({ authentication: { mode: 'single_admin' }, maintenance: { state: 'running', control_available: true } });
+  assert.equal(storage.get('ai-intermediary-admin-token'), 'single-secret');
+  assert.equal(dashboard.ui.getMaintenanceToken(), 'single-secret');
+  assert.equal(dashboard.nodes.has('maintenance-token-form'), false);
+  assert.equal(dashboard.nodes.has('catchup-token-form'), false);
+  assert.equal(dashboard.nodes.get('pause-button').disabled, false);
+  assert.equal(dashboard.nodes.get('catchup-refresh').disabled, false);
+  assert.match(DASHBOARD_HTML, /same admin credential/);
+  const settings = harness('settings', storage);
+  assert.equal(settings.ui.getToken(), 'single-secret');
+  settings.ui.applyEnvelope({ settings: maskSettings(testConfig()), valid: true, authentication: { mode: 'single_admin' }, infrastructure: { ui_can_apply: true } });
+  assert.equal(settings.nodes.has('legacy-maintenance-secret'), false);
+  assert.equal(settings.nodes.has('legacy-observability-secret'), false);
+  assert.match(SETTINGS_DASHBOARD_HTML, /id="admin-secret-variable">ADMIN_TOKEN/);
+  settings.ui.setToken('');
+  assert.equal(harness('dashboard', storage).ui.getToken(), '', 'sign-out leaves no persistent fallback credentials');
+  assert.equal(storage.has('ai-intermediary-admin-token'), false);
+});
+
+test('settings-first admin login unlocks dashboard and stale role credentials are never reused', () => {
+  const storage = new Map();
+  const settings = harness('settings', storage);
+  settings.ui.setToken('single-secret');
+  settings.ui.applyEnvelope({ settings: maskSettings(testConfig()), valid: true, authentication: { mode: 'single_admin' }, infrastructure: { ui_can_apply: true } });
+  assert.equal(harness('dashboard', storage).ui.getMaintenanceToken(), 'single-secret');
+  const stale = new Map([
+    ['ollama-intermediary-observability-token', 'old-read'],
+    ['ollama-intermediary-settings-admin-token', 'old-settings'],
+    ['ollama-intermediary-maintenance-token', 'old-maintenance'],
+  ]);
+  const dashboard = harness('dashboard', stale);
+  dashboard.ui.render({ maintenance: { state: 'running', control_available: true } });
+  assert.equal(dashboard.ui.getToken(), '');
+  assert.equal(dashboard.ui.getMaintenanceToken(), '');
+  assert.equal(harness('settings', stale).ui.getToken(), '');
+  assert.equal(dashboard.nodes.get('pause-button').disabled, true);
+});
+
 test('failed request outcomes never render as successful activity', () => {
   const { ui } = harness('dashboard');
   assert.equal(ui.eventSeverity({ type: 'request_failed', status: 502 }), 'event-danger');
   assert.equal(ui.eventSeverity({ type: 'request_completed', status: 500 }), 'event-danger');
   assert.equal(ui.eventSeverity({ type: 'request_completed', status: 200, outcome: 'failed' }), 'event-danger');
   assert.equal(ui.eventSeverity({ type: 'request_completed', status: 200 }), 'event-good');
+});
+
+test('AI dashboard distinguishes source/backend ownership and durable media states without guessing gateway links', () => {
+  const { ui, nodes } = harness('dashboard');
+  ui.render({ backend: { reachable: true, state: 'healthy' }, service: { ready: true },
+    backends: [{ id: 'ollama', type: 'ollama', enabled: true, resource_group: 'gpu0' }, { id: 'comfy', type: 'comfyui', enabled: true, resource_group: 'gpu0' }],
+    media: { enabled: true, blocked: false, jobs: [
+      { id: 'queued-id', source: 'media', backend: 'comfy', state: 'queued', artifacts: [] },
+      { id: 'running-id', source: 'artist', backend: 'comfy', state: 'running', artifacts: [] },
+      { id: 'done-id', source: 'media', backend: 'comfy', state: 'completed', artifacts: [{ status: 'available', filename: '<img src=evil>' }] },
+    ] }, scheduler: { state: 'busy' } });
+  assert.equal(nodes.get('media-queued').textContent, '1');
+  assert.equal(nodes.get('media-running').textContent, '1');
+  assert.equal(nodes.get('media-uncertain').textContent, '0');
+  assert.match(nodes.get('gpu-owner-detail').textContent, /artist → comfy/);
+  assert.match(nodes.get('gpu-owner-state').textContent, /Media owns GPU/);
+  assert.match(nodes.get('active-empty-title').textContent, /Media work holds/);
+  assert.match(nodes.get('backend-registry-list').textContent, /Enabled in configuration.*Shared resource: gpu0/);
+  assert.doesNotMatch(nodes.get('backend-registry-list').textContent, /Healthy/);
+  assert.match(nodes.get('media-jobs').textContent, /admin login/);
+  assert.doesNotMatch(nodes.get('media-jobs').textContent, /<img|http:/);
+  assert.equal(nodes.get('media-recovery-panel').hidden, true);
+  assert.match(DASHBOARD_HTML, /<h1>AI Intermediary<\/h1>/);
+});
+
+test('media uncertainty overrides idle Ollama, blocks resume and cannot invoke Ollama recovery', async () => {
+  const { ui, nodes, context } = harness('dashboard');
+  const calls = [];
+  context.fetch = async (url) => { calls.push(url); return { ok: true, json: async () => ({}) }; };
+  const data = { backend: { reachable: true, state: 'healthy', recovery_required: false }, recovery: { enabled: true, state: 'idle' },
+    maintenance: { state: 'paused', paused: true, control_available: true }, scheduler: { state: 'idle' },
+    media: { enabled: true, blocked: true, unresolved: ['job'], jobs: [{ id: 'job', source: 'media', backend: 'comfy', state: 'uncertain' }] } };
+  ui.render(data); ui.setMaintenanceToken('control');
+  nodes.get('recovery-confirm').checked = true;
+  assert.match(nodes.get('overall-state').textContent, /Shared GPU blocked/);
+  assert.equal(nodes.get('media-uncertain').textContent, '1');
+  assert.equal(nodes.get('media-running').textContent, '0');
+  assert.equal(nodes.get('media-recovery-panel').hidden, false);
+  assert.equal(nodes.get('resume-button').disabled, true);
+  assert.equal(nodes.get('recovery-check').disabled, true);
+  await ui.performMaintenanceAction('resume');
+  await ui.performRecoveryAction('acknowledge');
+  assert.equal(calls.length, 0);
+  data.media.enabled = false; ui.render(data);
+  assert.match(nodes.get('overall-state').textContent, /Shared GPU blocked/);
+  assert.equal(nodes.get('media-recovery-acknowledge').disabled, true, 'turning media off cannot clear an existing lock');
+});
+
+test('media acknowledgment needs a maintenance token, pause and explicit stopped-service confirmation', async () => {
+  const { ui, nodes, context } = harness('dashboard');
+  const data = { media: { enabled: true, blocked: true, unresolved: ['job'], jobs: [] },
+    maintenance: { state: 'running', control_available: true } };
+  const calls = [];
+  context.fetch = async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, json: async () => options.method === 'GET' ? data : { acknowledged: true } }; };
+  ui.render(data);
+  nodes.get('media-recovery-confirm').checked = true;
+  await ui.performMediaRecoveryAction(); assert.equal(calls.length, 0);
+  ui.setMaintenanceToken('maintenance-only');
+  await ui.performMediaRecoveryAction(); assert.equal(calls.length, 0, 'must be paused');
+  data.maintenance = { ...data.maintenance, state: 'paused', paused: true }; ui.render(data);
+  nodes.get('media-recovery-confirm').checked = false;
+  await ui.performMediaRecoveryAction(); assert.equal(calls.length, 0, 'requires explicit host verification');
+  nodes.get('media-recovery-confirm').checked = true;
+  await ui.performMediaRecoveryAction();
+  const posts = calls.filter((call) => call.options.method === 'POST');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, '/_intermediary/v1/media/acknowledge');
+  assert.equal(posts[0].options.headers.authorization, 'Bearer maintenance-only');
+  assert.deepEqual(JSON.parse(posts[0].options.body), { confirm_service_stopped: true });
+  assert.equal(nodes.get('media-recovery-confirm').checked, false);
+  assert.match(nodes.get('media-recovery-action-status').textContent, /remains paused/);
+  assert.equal(calls.some((call) => call.url.includes('/resume')), false);
 });
 
 test('future model expiration is displayed in the future rather than just now', () => {
@@ -269,7 +383,7 @@ test('recovery actions require maintenance authorization and explicit paused hos
   assert.equal(nodes.get('recovery-confirm').checked, false);
 });
 
-test('recovery checks respect disabled automation and rejected maintenance tokens', async () => {
+test('recovery checks respect disabled automation and rejected administrator passwords', async () => {
   const { ui, context, nodes } = harness('dashboard');
   const data = { backend: { recovery_required: true }, recovery: { enabled: false, state: 'disabled' }, maintenance: { state: 'paused', paused: true, control_available: true } };
   ui.render(data);
@@ -284,13 +398,13 @@ test('recovery checks respect disabled automation and rejected maintenance token
   ui.render(data);
   await ui.performRecoveryAction('check');
   assert.equal(calls.length, 1);
-  assert.match(nodes.get('recovery-action-status').textContent, /maintenance token was rejected/);
+  assert.match(nodes.get('recovery-action-status').textContent, /administrator password was rejected/);
   assert.equal(nodes.get('recovery-check').disabled, true);
   await ui.performRecoveryAction('check');
   assert.equal(calls.length, 1);
 });
 
-test('Frigate connection refresh uses Settings token without scheduling job mutations', async () => {
+test('Frigate connection refresh uses the admin login without scheduling job mutations', async () => {
   const { ui, context, nodes } = harness('dashboard');
   ui.setMaintenanceToken('maintenance-is-not-settings');
   ui.unlockCatchup('');
@@ -424,9 +538,8 @@ test('retry rows show attention, attempts and eligibility without promising a st
   assert.match(nodes.get('catchup-pending-jobs').children[0].className, /catchup-attention/);
 });
 
-test('manual retry requires explicit Settings-token unlock and never uses dashboard tokens', async () => {
+test('manual retry shares the admin login and still checks job eligibility', async () => {
   const { context, ui, nodes } = harness('dashboard');
-  context.sessionStorage.getItem = () => 'unrelated-saved-token';
   context.window.confirm = () => true;
   const calls = [];
   context.fetch = async (url, options) => {
@@ -436,27 +549,27 @@ test('manual retry requires explicit Settings-token unlock and never uses dashbo
   const job = { kind: 'review', id: 'one', state: 'retrying' };
   await ui.performCatchupAction('retry', job);
   assert.equal(calls.length, 0);
-  ui.unlockCatchup('settings-only-token');
+  ui.setToken('single-admin-password');
   await ui.performCatchupAction('retry', { ...job, state: 'waiting_result' });
   assert.equal(calls.length, 0);
   await ui.performCatchupAction('retry', job);
   const action = calls.find((call) => call.options.method === 'POST');
-  assert.equal(action.options.headers.authorization, 'Bearer settings-only-token');
+  assert.equal(action.options.headers.authorization, 'Bearer single-admin-password');
   assert.deepEqual(JSON.parse(action.options.body), { confirm: true, kind: 'review', id: 'one' });
   assert.match(nodes.get('catchup-action-status').textContent, /Request accepted/);
 });
 
-test('a rejected Settings token locks catch-up actions without altering saved jobs', async () => {
+test('a rejected admin password locks catch-up actions without altering saved jobs', async () => {
   const { context, ui, nodes } = harness('dashboard');
   context.window.confirm = () => true;
   let posts = 0;
-  context.fetch = async () => { posts++; return { ok: false, status: 401, json: async () => ({ error: 'Settings token required.' }) }; };
-  ui.unlockCatchup('bad-settings-token');
+  context.fetch = async () => { posts++; return { ok: false, status: 401, json: async () => ({ error: 'Administrator password required.' }) }; };
+  ui.setToken('bad-admin-password');
   const job = { kind: 'object', id: 'media-missing', state: 'skipped' };
   await ui.performCatchupAction('recheck', job);
   assert.equal(posts, 1);
   assert.match(nodes.get('catchup-control-state').textContent, /Controls are locked/);
-  assert.match(nodes.get('catchup-action-status').textContent, /Settings token required/);
+  assert.match(nodes.get('catchup-action-status').textContent, /Administrator password required/);
   await ui.performCatchupAction('recheck', job);
   assert.equal(posts, 1);
 });

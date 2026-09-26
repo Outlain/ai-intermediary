@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { BlockList, isIP } from 'node:net';
 import YAML from 'yaml';
 import { validateWorkPolicy } from './work-policy.js';
+import { applyAuthentication, configuredAdminToken } from './auth.js';
 
 const DURATION_RE = /^([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)$/;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -35,6 +36,23 @@ const DEFAULTS = {
     health_timeout: '3s',
     request_timeout: '30m',
   },
+  media: {
+    enabled: false,
+    state_path: '/app/state/media-jobs.json',
+    storage_path: '/app/state/media',
+    auth_token: '',
+    poll_interval: '2s',
+    job_timeout: '6h',
+    retention: '168h',
+    max_storage_bytes: 10 * 1024 ** 3,
+    max_jobs: 100,
+    max_workflow_bytes: 2 * 1024 ** 2,
+    max_output_bytes: 1024 ** 3,
+    max_idle_vram_mb: 512,
+    max_idle_utilization_percent: 5,
+    stable_samples: 3,
+    allowed_node_types: [],
+  },
   scheduler: {
     mode: 'strict_priority',
     max_queue_bytes: 64 * 1024 * 1024,
@@ -65,7 +83,7 @@ const DEFAULTS = {
   },
   host_helper: {
     enabled: false,
-    socket_path: '/run/ollama-intermediary-host/control.sock',
+    socket_path: '/run/ai-intermediary-host/control.sock',
     poll_interval: '5s',
     request_timeout: '15s',
     stale_after: '30s',
@@ -182,6 +200,7 @@ function durationFields(config) {
   config.gpu_safety.unloadTimeoutMs = parseDuration(config.gpu_safety.unload_timeout, 'gpu_safety.unload_timeout');
   config.maintenance.maxPauseMs = parseDuration(config.maintenance.max_pause, 'maintenance.max_pause');
   for (const [section, fields] of Object.entries({
+    media: { poll_interval: 'pollIntervalMs', job_timeout: 'jobTimeoutMs', retention: 'retentionMs' },
     host_helper: { poll_interval: 'pollIntervalMs', request_timeout: 'requestTimeoutMs', stale_after: 'staleAfterMs' },
     auto_recovery: {
       check_interval: 'checkIntervalMs', restart_timeout: 'restartTimeoutMs', verification_timeout: 'verificationTimeoutMs',
@@ -214,6 +233,35 @@ function durationFields(config) {
   }
 }
 
+function normalizeBackends(config, raw) {
+  const registry = raw.backends === undefined
+    ? { ollama: { type: 'ollama', url: config.ollama.url } }
+    : raw.backends;
+  if (!registry || typeof registry !== 'object' || Array.isArray(registry)) {
+    throw new Error('backends must be a named registry of backend objects');
+  }
+  config.backends = {};
+  for (const [name, backend] of Object.entries(registry)) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name) || ['__proto__', 'constructor', 'prototype'].includes(name)) {
+      throw new Error('backends names must contain 1–64 letters, numbers, dots, dashes, or underscores');
+    }
+    if (backend === null) continue; // Explicit settings tombstone removes an instance, never its files.
+    if (!backend || typeof backend !== 'object' || Array.isArray(backend)) throw new Error(`backends.${name} must be an object`);
+    const normalized = { enabled: true, resource_group: 'gpu0', ...backend };
+    if (!['ollama', 'comfyui'].includes(normalized.type)) throw new Error(`backends.${name}.type must be ollama or comfyui; other software requires an adapter`);
+    if (typeof normalized.enabled !== 'boolean') throw new Error(`backends.${name}.enabled must be true or false`);
+    if (normalized.resource_group !== 'gpu0') throw new Error(`backends.${name}.resource_group must be gpu0; this release supports one shared GPU`);
+    config.backends[name] = normalized;
+  }
+  if (Object.keys(config.backends).length > 20) throw new Error('backends must contain at most 20 instances');
+  const ollama = Object.entries(config.backends).filter(([, backend]) => backend.type === 'ollama');
+  if (ollama.length !== 1) throw new Error('backends must contain exactly one Ollama instance; multiple Ollama recovery owners are not supported');
+  const [name, primary] = ollama[0];
+  if (!primary.enabled) throw new Error(`backends.${name}.enabled must remain true; disabling the primary Ollama instance is not supported`);
+  config.primaryBackend = name;
+  config.ollama.url = primary.url;
+}
+
 function normalizeModelPolicy(policy, field, fallbackGroup) {
   const normalized = { ...policy };
   normalized.idleHoldMs = parseDuration(normalized.idle_hold ?? '0s', `${field}.idle_hold`);
@@ -228,6 +276,7 @@ function normalizeModelPolicy(policy, field, fallbackGroup) {
 }
 
 function validate(config) {
+  validateMedia(config);
   for (const [section, fields] of Object.entries({
     ollama: { health_interval: 'healthIntervalMs', health_timeout: 'healthTimeoutMs', request_timeout: 'requestTimeoutMs' },
     scheduler: { aging_interval: 'agingIntervalMs' },
@@ -304,7 +353,7 @@ function validate(config) {
     throw new Error('auto_recovery.enabled requires host_helper.enabled');
   }
   if (config.auto_recovery.enabled && (!config.maintenance.enabled || typeof config.maintenance.auth_token !== 'string' || !config.maintenance.auth_token.trim())) {
-    throw new Error('auto_recovery.enabled requires maintenance.enabled and a host-managed maintenance.auth_token');
+    throw new Error('auto_recovery.enabled requires maintenance.enabled and ADMIN_TOKEN');
   }
   for (const field of ['enabled', 'verify_tls']) {
     if (typeof config.frigate[field] !== 'boolean') throw new Error(`frigate.${field} must be true or false`);
@@ -396,6 +445,17 @@ function validate(config) {
   if (Object.keys(config.clients).length > 100) throw new Error('clients must contain at most 100 sources');
   const ipRules = [];
   for (const [name, client] of Object.entries(config.clients)) {
+    if (typeof client.backend !== 'string' || !config.backends[client.backend]) throw new Error(`clients.${name}.backend must name a configured backend`);
+    if (!Array.isArray(client.allowed_backends) || !client.allowed_backends.length
+      || client.allowed_backends.some((backend) => typeof backend !== 'string' || !config.backends[backend])
+      || new Set(client.allowed_backends).size !== client.allowed_backends.length
+      || !client.allowed_backends.includes(client.backend)) {
+      throw new Error(`clients.${name}.allowed_backends must name distinct configured backends and include the default backend`);
+    }
+    if (name === 'frigate' && (config.backends[client.backend].type !== 'ollama'
+      || client.allowed_backends.some((backend) => config.backends[backend].type !== 'ollama'))) {
+      throw new Error('clients.frigate.backend and allowed_backends must use Ollama; Frigate requests are not ComfyUI workflows');
+    }
     for (const field of ['enabled', 'header_enabled', 'queue_while_paused']) {
       if (typeof client[field] !== 'boolean') throw new Error(`clients.${name}.${field} must be true or false`);
     }
@@ -506,14 +566,68 @@ function validate(config) {
   if (localBackend && listenerAddresses.some((listener) => listener.port === backendPort)) {
     throw new Error('ollama.url points back to the intermediary listener; use the real Ollama address');
   }
+  const origins = new Set();
+  for (const [name, backend] of Object.entries(config.backends)) {
+    let address;
+    try { address = new URL(backend.url); } catch { throw new Error(`backends.${name}.url must be a valid absolute HTTP(S) URL`); }
+    if (!['http:', 'https:'].includes(address.protocol) || address.username || address.password || address.search || address.hash || address.pathname !== '/') {
+      throw new Error(`backends.${name}.url must be an HTTP(S) origin without credentials, a path, query string, or fragment`);
+    }
+    const host = address.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+    const port = Number(address.port || (address.protocol === 'https:' ? 443 : 80));
+    const local = ['localhost', '0.0.0.0', '::', '::1'].includes(host) || host.endsWith('.localhost') || (isIP(host) === 4 && host.startsWith('127.'));
+    if (local && listenerAddresses.some((listener) => listener.port === port)) throw new Error(`backends.${name}.url points back to an intermediary listener`);
+    const identity = `${address.protocol}//${local ? 'loopback' : host}:${port}`;
+    if (origins.has(identity)) throw new Error(`backends.${name}.url duplicates another backend origin; each managed instance must be unique`);
+    origins.add(identity);
+  }
+}
+
+function validateMedia(config) {
+  const media = config.media;
+  if (typeof media.enabled !== 'boolean') throw new Error('media.enabled must be true or false');
+  if (typeof media.auth_token !== 'string') throw new Error('media.auth_token must be a host-managed string');
+  for (const key of ['state_path', 'storage_path']) {
+    if (typeof media[key] !== 'string' || !media[key].startsWith('/') || media[key] === '/' || /[\x00-\x1f\x7f]/.test(media[key])) {
+      throw new Error(`media.${key} must be a non-root absolute path without control characters`);
+    }
+  }
+  for (const [field, derived, min, max] of [
+    ['poll_interval', 'pollIntervalMs', 1000, 60000],
+    ['job_timeout', 'jobTimeoutMs', 60000, 604800000],
+    ['retention', 'retentionMs', 3600000, MAX_TIMER_DELAY_MS],
+  ]) {
+    if (media[derived] < min || media[derived] > max) throw new Error(`media.${field} must be between ${min / 1000}s and ${max / 1000}s`);
+  }
+  for (const [field, min, max] of [
+    ['max_storage_bytes', 1024 ** 2, Number.MAX_SAFE_INTEGER], ['max_jobs', 1, 10000],
+    ['max_workflow_bytes', 1024, 2 * 1024 ** 2], ['max_output_bytes', 1024, 16 * 1024 ** 3],
+    ['max_idle_vram_mb', 64, 4096], ['max_idle_utilization_percent', 0, 10], ['stable_samples', 2, 10],
+  ]) {
+    if (!Number.isSafeInteger(media[field]) || media[field] < min || media[field] > max) throw new Error(`media.${field} must be an integer between ${min} and ${max}`);
+  }
+  if (media.max_output_bytes > media.max_storage_bytes) throw new Error('media.max_output_bytes must not exceed max_storage_bytes');
+  if (!Array.isArray(media.allowed_node_types) || media.allowed_node_types.length > 1000
+    || media.allowed_node_types.some((type) => typeof type !== 'string' || !type.trim() || type.length > 256 || /[\x00-\x1f\x7f]/.test(type))) {
+    throw new Error('media.allowed_node_types must be an explicit list of at most 1000 trusted local node type names');
+  }
+  if (media.enabled) {
+    if (!config.host_helper.enabled) throw new Error('media.enabled requires host_helper.enabled for verified GPU ownership');
+    if (!media.auth_token.trim()) throw new Error('media.enabled requires ADMIN_TOKEN to derive ComfyUI machine authentication');
+    if (!media.allowed_node_types.length) throw new Error('media.enabled requires explicit media.allowed_node_types; arbitrary workflows are not trusted');
+    if (!Object.values(config.backends).some((backend) => backend.enabled && backend.type === 'comfyui')) throw new Error('media.enabled requires an enabled ComfyUI backend');
+  }
 }
 
 export function normalizeConfig(raw = {}) {
-  const config = deepMerge(clone(DEFAULTS), raw);
+  const config = applyAuthentication(deepMerge(clone(DEFAULTS), raw));
+  normalizeBackends(config, raw);
   // Every named client inherits operational defaults, while retaining its own identity fields.
   for (const [name, client] of Object.entries(config.clients)) {
     if (name !== 'default') config.clients[name] = deepMerge({ ...clone(config.clients.default), enabled: true,
       header_enabled: true, queue_while_paused: false, listener_port: 0, source_ips: [], models: [] }, client);
+    config.clients[name].backend = raw.clients?.[name]?.backend ?? config.primaryBackend;
+    config.clients[name].allowed_backends = raw.clients?.[name]?.allowed_backends ?? [config.clients[name].backend];
   }
   durationFields(config);
   validate(config);
@@ -532,7 +646,10 @@ export function applyHostEnvironment(raw = {}, environment = process.env) {
   if (environment.HOST_HELPER_SOCKET_PATH) {
     result.host_helper = { ...result.host_helper, socket_path: environment.HOST_HELPER_SOCKET_PATH };
   }
-  return result;
+  if (environment.MEDIA_TOKEN !== undefined) result.media = { ...result.media, auth_token: environment.MEDIA_TOKEN };
+  const adminToken = configuredAdminToken(environment);
+  if (adminToken) result.security = { admin_token: adminToken };
+  return adminToken || result.security?.admin_token ? applyAuthentication(result) : result;
 }
 
 export function expandEnvironment(text, environment = process.env) {

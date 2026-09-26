@@ -6,7 +6,7 @@
   var APPLY_URL = '/_intermediary/v1/settings/apply';
   var ROLLBACK_URL = '/_intermediary/v1/settings/rollback';
   var RESET_URL = '/_intermediary/v1/settings/reset';
-  var TOKEN_KEY = 'ollama-intermediary-settings-admin-token';
+  var ADMIN_TOKEN_KEY = 'ai-intermediary-admin-token';
   var memoryToken = '';
   var loadedSettings = null;
   var loadedEnvelope = null;
@@ -16,6 +16,7 @@
   var lastValidatedSignature = '';
   var lastApplyFeedback = null;
   var touchedPaths = new Set();
+  var removedBackends = new Set();
   var catchupRefreshPromise = null;
   var catchupRefreshController = null;
   var catchupRefreshTimer = null;
@@ -34,15 +35,17 @@
   function clone(value) { return value == null ? value : JSON.parse(JSON.stringify(value)); }
   function asObject(value) { return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
   function getToken() {
-    try { return sessionStorage.getItem(TOKEN_KEY) || memoryToken; }
-    catch (_) { return memoryToken; }
+    return readSession(ADMIN_TOKEN_KEY) || memoryToken;
+  }
+  function readSession(key) {
+    try { return sessionStorage.getItem(key) || ''; } catch (_) { return ''; }
+  }
+  function writeSession(key, value) {
+    try { if (value) sessionStorage.setItem(key, value); else sessionStorage.removeItem(key); } catch (_) { /* Tab memory fallback. */ }
   }
   function setToken(value) {
     memoryToken = String(value || '');
-    try {
-      if (memoryToken) sessionStorage.setItem(TOKEN_KEY, memoryToken);
-      else sessionStorage.removeItem(TOKEN_KEY);
-    } catch (_) { /* Memory remains scoped to this tab if sessionStorage is unavailable. */ }
+    writeSession(ADMIN_TOKEN_KEY, memoryToken);
     setHidden('forget-token', !memoryToken);
   }
   function headers(withBody) {
@@ -81,7 +84,7 @@
     stopCatchupRefresh();
     setHidden('settings-workspace', true);
     setHidden('auth-panel', false);
-    setText('auth-message', message || 'A valid settings admin token is required.');
+    setText('auth-message', message || 'Enter your administrator password.');
     window.setTimeout(function () { byId('admin-token').focus(); }, 0);
   }
   function showWorkspace() {
@@ -135,6 +138,7 @@
     return {};
   }
   function populateForm(settings) {
+    removedBackends.clear();
     renderPolicyEditors(settings);
     var defaultClient = byId('default-client');
     all('#default-client option[data-dynamic-client]').forEach(function (option) { option.remove(); });
@@ -175,7 +179,11 @@
     var legend = document.createElement('legend'); legend.textContent = name; card.appendChild(legend);
     var grid = document.createElement('div'); grid.className = 'field-grid field-grid-2'; card.appendChild(grid);
     var root = 'clients.' + encodeURIComponent(name).replace(/\./g, '%2E') + '.';
+    var backendNames = Object.keys(asObject(collectSettings().backends));
+    if (policy.backend && !backendNames.includes(policy.backend)) backendNames.push(policy.backend);
     [['enabled', 'Enabled', 'checkbox'], ['header_enabled', 'Accept X-Ollama-Client: ' + name, 'checkbox'],
+      ['backend', 'Default backend (engine for compatible requests)', 'text', backendNames],
+      ['allowed_backends', 'Allowed backend names (comma separated)', 'list'],
       ['listener_port', 'Dedicated container port (0 = off)', 'number'], ['source_ips', 'IP/subnets (comma separated; empty = off)', 'list'],
       ['priority', 'Priority (larger runs first)', 'number'], ['queue_limit', 'Maximum queued requests', 'number'],
       ['request_ttl', 'Queue lifetime (e.g. 10m)', 'text'], ['queue_while_paused', 'Hold connected live requests during pauses (off = reject)', 'checkbox'],
@@ -189,9 +197,41 @@
         policyField(grid, root + field[0], field[1], field[2], getPath(policy, field[0]), field[3]);
       });
     var help = document.createElement('p'); help.className = 'field-help';
-    help.textContent = 'Hold during pause is bounded by this queue lifetime, queue limit and the shared memory limit. Disconnected or expired requests are never replayed. Frigate catch-up uses retained IDs separately. Legacy per-model overrides, if configured, take precedence over model hold/keep-alive.';
+    help.textContent = 'Source priority decides who runs next; backend decides which engine runs it. Only compatible request formats may use an allowed backend. Hold during pause applies to connected HTTP requests only; disconnected or expired requests are never replayed. Accepted media jobs are durable and use the separate media lifetime. Frigate catch-up uses retained IDs separately. Model hold/keep-alive applies to Ollama; another engine must first receive verified GPU ownership.';
     card.appendChild(help); byId('source-editors').appendChild(card);
     return card;
+  }
+  function backendEditor(name, backend) {
+    var card = document.createElement('fieldset'); card.className = 'settings-card';
+    var legend = document.createElement('legend'); legend.textContent = name; card.appendChild(legend);
+    var grid = document.createElement('div'); grid.className = 'field-grid field-grid-2'; card.appendChild(grid);
+    var root = 'backends.' + encodeURIComponent(name).replace(/\./g, '%2E') + '.';
+    [['type', 'Backend software / adapter', 'text', ['ollama', 'comfyui']], ['enabled', 'Enabled', 'checkbox'],
+      ['url', 'Raw backend origin (not the intermediary)', 'url'], ['resource_group', 'Shared GPU resource', 'text', ['gpu0']]].forEach(function (field) {
+        policyField(grid, root + field[0], field[1], field[2], backend[field[0]], field[3]);
+      });
+    if (backend.type !== 'ollama') {
+      var remove = document.createElement('button'); remove.type = 'button'; remove.className = 'secondary-button'; remove.textContent = 'Remove backend from draft';
+      remove.addEventListener('click', function () {
+        if (busy) return;
+        removedBackends.add(name); card.remove(); lastValidatedSignature = ''; updateDirtyState();
+      });
+      card.appendChild(remove);
+    }
+    byId('backend-editors').appendChild(card); return card;
+  }
+  function addBackend() {
+    if (busy || !loadedSettings) return;
+    var nameInput = byId('new-backend-name'), name = nameInput.value.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name) || ['__proto__', 'constructor', 'prototype'].includes(name)) { showPageError('Use a backend name with 1–64 letters, numbers, underscores or dashes.'); return; }
+    if (Object.prototype.hasOwnProperty.call(collectSettings().backends, name)) { showPageError('That backend already exists.'); return; }
+    removedBackends.delete(name);
+    var card = backendEditor(name, { type: 'comfyui', enabled: false, url: 'http://host.docker.internal:8188', resource_group: 'gpu0' });
+    card.querySelectorAll('[data-path]').forEach(function (input) { touchedPaths.add(input.dataset.path); });
+    all('[data-path$=".backend"]').forEach(function (select) {
+      var option = document.createElement('option'); option.value = name; option.textContent = name; select.appendChild(option);
+    });
+    nameInput.value = ''; lastValidatedSignature = ''; showPageError(''); updateDirtyState();
   }
   function scheduleEditor(name, policy) {
     var card = document.createElement('fieldset'); card.className = 'settings-card';
@@ -208,7 +248,7 @@
     byId('schedule-editors').appendChild(card); return card;
   }
   function renderPolicyEditors(settings) {
-    // Replace legacy two-client editors with the same editor for every source.
+    // Use the same source editor for every configured application.
     ['odysseus', 'frigate', 'frigate-source'].forEach(function (id) {
       var old = byId(id); old.hidden = true;
       old.querySelectorAll('[data-path]').forEach(function (input) { input.removeAttribute('data-path'); });
@@ -216,7 +256,14 @@
     });
     var legacyIp = all('[data-path="clients.frigate.source_ips.0"]')[0];
     if (legacyIp) { legacyIp.removeAttribute('data-path'); legacyIp.disabled = true; legacyIp.placeholder = 'Configure under Sources & ports'; }
-    byId('source-editors').replaceChildren(); byId('schedule-editors').replaceChildren();
+    byId('source-editors').replaceChildren(); byId('schedule-editors').replaceChildren(); byId('backend-editors').replaceChildren();
+    Object.entries(asObject(settings.backends)).forEach(function (entry) { backendEditor(entry[0], entry[1]); });
+    // The registry is authoritative; a base URL field remains for configuration recovery.
+    var legacyBackendUrl = byId('ollama-url');
+    var hasRegistry = Object.keys(asObject(settings.backends)).length > 0;
+    setHidden('base-ollama-url', hasRegistry);
+    if (hasRegistry) delete legacyBackendUrl.dataset.path;
+    else legacyBackendUrl.dataset.path = 'ollama.url';
     Object.entries(asObject(settings.clients)).forEach(function (entry) { sourceEditor(entry[0], entry[1]); });
     Object.entries(asObject(settings.work_policy && settings.work_policy.schedules)).forEach(function (entry) { scheduleEditor(entry[0], entry[1]); });
   }
@@ -228,6 +275,8 @@
     if (kind === 'source') {
       if (Object.prototype.hasOwnProperty.call(draft.clients, name)) { showPageError('That source already exists.'); return; }
       card = sourceEditor(name, { enabled: true, header_enabled: true, listener_port: 0, source_ips: [], priority: 10,
+        backend: Object.keys(asObject(draft.backends)).find(function (key) { return draft.backends[key].type === 'ollama'; }) || 'ollama',
+        allowed_backends: [Object.keys(asObject(draft.backends)).find(function (key) { return draft.backends[key].type === 'ollama'; }) || 'ollama'],
         queue_limit: 20, request_ttl: '10m', max_wait: '5m', queue_while_paused: false, overflow_policy: 'reject',
         model_policy: { idle_hold: '0s', keep_alive: null, max_batch_requests: 1, max_batch_time: '60s' } });
       var option = document.createElement('option'); option.value = name; option.textContent = name; option.dataset.dynamicClient = 'true'; byId('default-client').appendChild(option);
@@ -242,7 +291,7 @@
     var ports = Object.entries(asObject(settings.clients)).filter(function (entry) { return entry[1].listener_port > 0; });
     setText('source-compose', ports.length ? 'ports:\n' + ports.map(function (entry) {
       return '  - "' + entry[1].listener_port + ':' + entry[1].listener_port + '" # ' + entry[0];
-    }).join('\n') + '\n\n# After updating Compose:\n# docker compose up -d --no-deps ollama-scheduler'
+    }).join('\n') + '\n\n# Add ports to the ai-intermediary service, preserving its current ports.\n# Then recreate that service:\n# docker compose up -d --no-deps ai-intermediary'
       : 'No additional source ports configured. Keep your existing main port mapping.');
   }
   function collectSettings() {
@@ -260,6 +309,7 @@
       }
       setPath(result, path, value);
     });
+    removedBackends.forEach(function (name) { if (result.backends) delete result.backends[name]; });
     return result;
   }
   function collectPatch() {
@@ -279,6 +329,11 @@
       }
       setPath(result, path, value);
     });
+    if (Object.keys(result.backends || {}).length || removedBackends.size) {
+      // Legacy installs synthesize their primary backend; persist the full registry on first edit.
+      result.backends = clone(collectSettings().backends || {});
+      removedBackends.forEach(function (name) { result.backends[name] = null; });
+    }
     return result;
   }
   function requestPayload() {
@@ -312,8 +367,7 @@
   }
   function renderSecretStatus(payload) {
     [
-      ['maintenance_token', 'maintenance-secret-state'],
-      ['observability_token', 'observability-secret-state'],
+      ['media_token', 'media-secret-state'],
       ['admin_token', 'admin-secret-state']
     ].forEach(function (entry) {
       var configured = secretConfigured(payload, entry[0]);
@@ -929,6 +983,7 @@
   bindEvents();
   byId('add-source').addEventListener('click', function () { addPolicy('source'); });
   byId('add-schedule').addEventListener('click', function () { addPolicy('schedule'); });
+  byId('add-backend').addEventListener('click', addBackend);
   if (getToken()) loadSettings();
-  else showAuth('Enter the separate settings admin token to view or change configuration.');
+  else showAuth('Enter your administrator password to view or change configuration.');
 })();

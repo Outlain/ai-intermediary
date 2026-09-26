@@ -27,6 +27,8 @@ const MODEL_POLICY_FIELDS = Object.freeze({
 });
 
 const CLIENT_FIELDS = Object.freeze({
+  backend: string({ required: true, maxLength: 64 }),
+  allowed_backends: stringArray({ maxItems: 20, itemMaxLength: 64 }),
   enabled: boolean(),
   header_enabled: boolean(),
   listener_port: integer({ min: 0, max: 65535 }),
@@ -57,6 +59,26 @@ const EDITABLE_TREE = Object.freeze({
     health_interval: duration({ greaterThanZero: true }),
     health_timeout: duration({ greaterThanZero: true }),
     request_timeout: duration({ greaterThanZero: true }),
+  }),
+  backends: Object.freeze({ $dynamic: Object.freeze({
+    type: descriptor('enum', { values: ['ollama', 'comfyui'] }),
+    enabled: boolean(),
+    url: descriptor('url', { required: true, schemes: ['http:', 'https:'] }),
+    resource_group: descriptor('enum', { values: ['gpu0'] }),
+  }), $nullableEntries: true }),
+  media: Object.freeze({
+    enabled: boolean(),
+    poll_interval: duration({ minMs: 1000, maxMs: 60000 }),
+    job_timeout: duration({ minMs: 60000, maxMs: 604800000 }),
+    retention: duration({ minMs: 3600000 }),
+    max_storage_bytes: integer({ min: 1024 ** 2, max: Number.MAX_SAFE_INTEGER }),
+    max_jobs: integer({ min: 1, max: 10000 }),
+    max_workflow_bytes: integer({ min: 1024, max: 2 * 1024 ** 2 }),
+    max_output_bytes: integer({ min: 1024, max: 16 * 1024 ** 3 }),
+    max_idle_vram_mb: integer({ min: 64, max: 4096 }),
+    max_idle_utilization_percent: integer({ min: 0, max: 10 }),
+    stable_samples: integer({ min: 2, max: 10 }),
+    allowed_node_types: stringArray({ maxItems: 1000, itemMaxLength: 256 }),
   }),
   scheduler: Object.freeze({
     mode: descriptor('enum', { values: ['strict_priority', 'balanced'] }),
@@ -167,6 +189,8 @@ export const SETTINGS_SCHEMA = Object.freeze({
     'server.dedicated_listeners',
     'scheduler.max_parallel_generations',
     'model_management.serialize_with_inference',
+    'security.admin_token',
+    'security.auth_mode',
     'observability.auth_token',
     'maintenance.auth_token',
     'maintenance.state_path',
@@ -177,12 +201,16 @@ export const SETTINGS_SCHEMA = Object.freeze({
     'frigate.username',
     'frigate.password',
     'frigate.auth_token',
+    'media.auth_token',
+    'media.state_path',
+    'media.storage_path',
     'docker.compose',
     'docker.socket',
   ]),
   notes: Object.freeze({
     compose: 'Docker Compose is intentionally read-only and is never mounted or edited by the service.',
     restart: 'Source listeners start after a safe restart. Docker port publication, volumes and runtime changes remain host-admin tasks.',
+    backends: 'This release supports one enabled Ollama instance and ComfyUI instances sharing gpu0. Other software needs an adapter; a URL alone does not make protocols compatible.',
   }),
 });
 
@@ -216,15 +244,18 @@ function deepMerge(base, overlay) {
   return result;
 }
 
-function settingsDifference(value, base) {
+function settingsDifference(value, base, field = '') {
   if (Array.isArray(value)) {
     return Array.isArray(base) && JSON.stringify(value) === JSON.stringify(base) ? NO_CHANGE : clone(value);
   }
   if (plainObject(value)) {
     const output = {};
     for (const [key, child] of Object.entries(value)) {
-      const difference = settingsDifference(child, plainObject(base) ? base[key] : undefined);
+      const difference = settingsDifference(child, plainObject(base) ? base[key] : undefined, field ? `${field}.${key}` : key);
       if (difference !== NO_CHANGE) output[key] = difference;
+    }
+    if (field === 'backends' && plainObject(base)) {
+      for (const key of Object.keys(base)) if (!Object.hasOwn(value, key)) output[key] = null;
     }
     return Object.keys(output).length ? output : NO_CHANGE;
   }
@@ -356,7 +387,11 @@ function sanitizeNode(input, schemaNode, field, diagnostics, currentNode) {
       diagnostics.push(diagnostic(childField, 'read_only_or_unknown', 'This setting is unknown or read-only and cannot be changed here.'));
       continue;
     }
-    if (childSchema.type) {
+    if (schemaNode.$nullableEntries && value === null) {
+      output[key] = null;
+      continue;
+    }
+    if (typeof childSchema.type === 'string') {
       // A masked secret sent back by the UI means "leave the existing value alone".
       if (childSchema.secret && value === SECRET_MASK) continue;
       validateDescriptor(value, childField, childSchema, diagnostics);
@@ -378,7 +413,7 @@ function redact(message, secretValues = []) {
 }
 
 function inferPath(message) {
-  const match = String(message).match(/\b(server|ollama|scheduler|circuit_breaker|model_management|gpu_safety|observability|maintenance|work_policy|frigate|clients|models)(?:\.[A-Za-z0-9_.-]+)+/);
+  const match = String(message).match(/\b(server|ollama|backends|media|scheduler|circuit_breaker|model_management|gpu_safety|observability|maintenance|work_policy|frigate|clients|models)(?:\.[A-Za-z0-9_.-]+)+/);
   return match?.[0] ?? '$';
 }
 
@@ -399,7 +434,7 @@ function projectEditable(value, schemaNode = EDITABLE_TREE) {
     let childSchema = schemaNode[key];
     if (!childSchema && dynamicSchema && validDynamicName(key, schemaNode)) childSchema = dynamicSchema;
     if (!childSchema || key.startsWith('$')) continue;
-    if (childSchema.type) output[key] = clone(child);
+    if (typeof childSchema.type === 'string') output[key] = clone(child);
     else output[key] = projectEditable(child, childSchema);
   }
   return output;
@@ -412,7 +447,7 @@ function maskNode(value, schemaNode = EDITABLE_TREE) {
   for (const [key, child] of Object.entries(value)) {
     const childSchema = schemaNode[key] ?? dynamicSchema;
     if (!childSchema || key === '$dynamic') continue;
-    if (childSchema.type) output[key] = childSchema.secret && child ? SECRET_MASK : clone(child);
+    if (typeof childSchema.type === 'string') output[key] = childSchema.secret && child ? SECRET_MASK : clone(child);
     else output[key] = maskNode(child, childSchema);
   }
   return output;
@@ -420,19 +455,19 @@ function maskNode(value, schemaNode = EDITABLE_TREE) {
 
 export function maskSettings(raw) {
   const masked = maskNode(projectEditable(raw));
-  for (const section of ['ollama', 'frigate']) {
-    if (typeof masked?.[section]?.url === 'string') {
+  for (const section of [masked.ollama, masked.frigate, ...Object.values(masked.backends ?? {})]) {
+    if (typeof section?.url === 'string') {
       try {
-        const parsed = new URL(masked[section].url);
+        const parsed = new URL(section.url);
         if (parsed.username || parsed.password || parsed.search || parsed.hash) {
           parsed.username = '';
           parsed.password = '';
           parsed.search = '';
           parsed.hash = '';
-          masked[section].url = parsed.toString();
+          section.url = parsed.toString();
         }
       } catch {
-        masked[section].url = masked[section].url.replace(
+        section.url = section.url.replace(
           /^(https?:\/\/)[^\s/@]+(?::[^\s/@]*)?@/i,
           '$1',
         );
@@ -444,6 +479,12 @@ export function maskSettings(raw) {
 
 function operationalDiagnostics(raw, effectiveConfig) {
   const diagnostics = [];
+  if (Object.values(effectiveConfig?.backends ?? {}).some((backend) => backend.type === 'comfyui')) {
+    diagnostics.push(diagnostic('backends', 'shared_gpu_backend_scope',
+      'One Ollama instance and ComfyUI instances share gpu0. Restrict raw backend access to prevent bypassing the shared scheduler. New software requires a tested adapter, not just a URL.', 'warning'));
+    if (!effectiveConfig.media.enabled) diagnostics.push(diagnostic('media.enabled', 'media_disabled',
+      'ComfyUI is registered but media execution remains disabled. Install the host helper, provision machine authentication derived from ADMIN_TOKEN and explicitly allow trusted local workflow node types before enabling it.', 'warning'));
+  }
   if (raw?.frigate?.enabled && raw.frigate.verify_tls === false) {
     diagnostics.push(diagnostic('frigate.verify_tls', 'tls_verification_disabled',
       'Frigate TLS certificate verification is disabled. Use only on a trusted network; credentials can be intercepted.', 'warning'));
@@ -465,15 +506,15 @@ function operationalDiagnostics(raw, effectiveConfig) {
       }
     } catch { /* Invalid durations are reported by configuration validation. */ }
   }
-  if (raw?.maintenance?.enabled && !raw.maintenance.auth_token) {
+  if (raw?.maintenance?.enabled && !(effectiveConfig?.maintenance?.auth_token ?? raw.maintenance.auth_token ?? raw.security?.admin_token)) {
     diagnostics.push(diagnostic(
       'maintenance.auth_token',
       'missing_control_token',
-      'Pause controls are enabled but unavailable until a separate maintenance token is configured.',
+      'Pause controls are enabled but unavailable until ADMIN_TOKEN is configured.',
       'warning',
     ));
   }
-  if (raw?.observability?.enabled && raw.observability.ui_enabled && !raw.observability.auth_token) {
+  if (raw?.observability?.enabled && raw.observability.ui_enabled && !(effectiveConfig?.observability?.auth_token ?? raw.observability.auth_token ?? raw.security?.admin_token)) {
     diagnostics.push(diagnostic(
       'observability.auth_token',
       'unprotected_dashboard',
@@ -543,6 +584,13 @@ export function validateSettingsDraft({
     const baseSettings = maskSettings(normalize(expandedBase));
     const difference = settingsDifference(settings, baseSettings);
     overrides = difference === NO_CHANGE ? {} : difference;
+    if (expandedBase.backends === undefined && mergedOverrides.backends === undefined) {
+      // A legacy Ollama URL edit must not create a partial synthetic registry.
+      delete overrides.backends;
+    } else if (expandedBase.backends === undefined && overrides.backends) {
+      // The synthetic primary has no raw file entry to merge against on restart.
+      overrides.backends = clone(settings.backends);
+    }
   } catch {
     // A recovery draft may be the thing that repairs an invalid base. Until the
     // base itself normalizes, retain the sanitized patch rather than guessing
@@ -783,6 +831,7 @@ export class SettingsStore {
       secrets: {
         observability_token_configured: Boolean(effectiveRaw?.observability?.auth_token),
         maintenance_token_configured: Boolean(effectiveRaw?.maintenance?.auth_token),
+        media_token_configured: Boolean(effectiveRaw?.media?.auth_token),
       },
       diagnostics,
       has_previous: Boolean(this.state.previousOverrides),

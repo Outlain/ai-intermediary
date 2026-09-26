@@ -22,12 +22,12 @@ from urllib.parse import urlsplit
 
 from host_helper import SafeError, SystemHost
 
-ACCOUNT = 'ollama-intermediary-host'
+ACCOUNT = 'ai-intermediary-host'
 SERVICE = ACCOUNT + '.service'
 RUNTIME = '/run/' + ACCOUNT
-ENV_PATH = '/etc/ollama-intermediary-host.env'
+ENV_PATH = '/etc/ai-intermediary-host.env'
 ARTIFACTS = {
-    'host_helper.py': '/opt/ollama-intermediary-host/host_helper.py',
+    'host_helper.py': '/opt/ai-intermediary-host/host_helper.py',
     SERVICE: '/etc/systemd/system/' + SERVICE,
     ACCOUNT + '.sudoers': '/etc/sudoers.d/' + ACCOUNT,
 }
@@ -83,8 +83,22 @@ def validate_runtime(value):
     if value.get('timed_pause'):
         raise SetupError('Use Until manually resumed for the maintenance pause, not a timed pause, during setup.')
     if not value.get('maintenance_configured'):
-        raise SetupError('Configure MAINTENANCE_TOKEN before setup; the installer never creates or prints tokens.')
+        raise SetupError('Configure ADMIN_TOKEN before setup; the installer never creates or prints passwords.')
     return validate_origin(value.get('origin'))
+
+
+def validate_no_conflicting_helper():
+    # Two privileged helpers would have independent restart budgets. An older
+    # installation must be retired by its operator before this one is started.
+    previous = run(['systemctl', 'show', 'ollama-intermediary-host.service',
+                    '--property=LoadState,ActiveState,UnitFileState'], allowed_exit=(0, 1))
+    values = dict(line.split('=', 1) for line in previous.splitlines() if '=' in line)
+    if values.get('LoadState') == 'not-found':
+        return
+    if (values.get('ActiveState') not in ('inactive', 'failed')
+            or values.get('UnitFileState') not in ('disabled', 'masked', 'masked-runtime')):
+        raise SetupError('Another host-helper installation may still run. Stop and disable it, preserve its restart journal, '
+                         'and complete the deployment migration before installing this helper.')
 
 
 def validate_local_origin(origin, resolved, interfaces):
@@ -100,7 +114,7 @@ def validate_local_origin(origin, resolved, interfaces):
 def environment_text(origin, amd, previous=None):
     expected = {'MANAGED_OLLAMA_ORIGIN': origin, 'AMD_SMI_PATH': amd,
                 'HOST_HELPER_SOCKET': RUNTIME + '/control.sock',
-                'HOST_HELPER_STATE': '/var/lib/ollama-intermediary-host/state.json'}
+                'HOST_HELPER_STATE': '/var/lib/ai-intermediary-host/state.json'}
     if previous is not None:
         parsed = {}
         for line in previous.splitlines():
@@ -109,10 +123,16 @@ def environment_text(origin, amd, previous=None):
             if '=' not in line:
                 raise SetupError('Existing helper environment has unsupported syntax; preserve it and use the manual guide.')
             key, value = line.split('=', 1)
-            if key in parsed or key not in expected:
+            if key in parsed or (key not in expected and key != 'COMFYUI_SYSTEMD_UNITS'):
                 raise SetupError('Existing helper environment contains custom/duplicate settings; manual review required.')
             parsed[key] = value.strip().strip('"').strip("'")
         comparable = dict(parsed)
+        units = comparable.pop('COMFYUI_SYSTEMD_UNITS', '')
+        allowed_units = [unit.strip() for unit in units.split(',') if unit.strip()]
+        if (len(allowed_units) > 8 or len(set(allowed_units)) != len(allowed_units)
+                or any(len(unit) > 128 or not re.fullmatch(r'[a-zA-Z0-9_.@-]+\.service', unit)
+                       or unit == 'ollama.service' for unit in allowed_units)):
+            raise SetupError('Existing COMFYUI_SYSTEMD_UNITS is invalid; manual review required.')
         if 'AMD_SMI_PATH' in comparable:
             comparable['AMD_SMI_PATH'] = str(Path(comparable['AMD_SMI_PATH']).resolve())
         if 'MANAGED_OLLAMA_ORIGIN' in comparable:
@@ -129,8 +149,10 @@ def validate_compose_change(before, after, gid):
     original = json.loads(json.dumps(before))
     candidate = json.loads(json.dumps(after))
     try:
-        old = original['services']['ollama-scheduler']
-        new = candidate['services']['ollama-scheduler']
+        if 'ai-intermediary' not in original['services']:
+            raise ValueError()
+        old = original['services']['ai-intermediary']
+        new = candidate['services']['ai-intermediary']
         expected_env = {'HOST_HELPER_ENABLED': 'true', 'HOST_HELPER_SOCKET_PATH': RUNTIME + '/control.sock',
                         'AUTO_RECOVERY_ENABLED': 'false'}
         if any(new.get('environment', {}).get(k) != v for k, v in expected_env.items()):
@@ -190,6 +212,7 @@ class Installer:
         self.amd = amd
         self.override = self.project / 'docker-compose.override.yml'
         self.backup = None
+        self.service = 'ai-intermediary'
 
     def compose(self, *args, candidate=None, timeout=30):
         files = ['-f', str(self.project / 'docker-compose.yml')]
@@ -199,7 +222,7 @@ class Installer:
 
     def container(self, payload):
         code = (self.source / 'installer-compose.mjs').read_text()
-        raw = run(['docker', 'compose', 'exec', '-T', 'ollama-scheduler', 'node',
+        raw = run(['docker', 'compose', 'exec', '-T', self.service, 'node',
                    '--input-type=module', '-e', code, '--', '--host-install'], cwd=self.project,
                   data=json.dumps(payload), timeout=20)
         try:
@@ -236,9 +259,12 @@ class Installer:
             endpoint = context['Endpoints']['docker']['Host']
         if not endpoint.startswith('unix://'):
             raise SetupError('The Docker engine must be local to this VM, not an SSH/TCP context.')
-        container = run(['docker', 'compose', 'ps', '--quiet', 'ollama-scheduler'], cwd=self.project).strip()
+        self.before = json.loads(self.compose('config', '--format', 'json'))
+        if self.service not in self.before.get('services', {}):
+            raise SetupError('Expected the ai-intermediary Compose service; use the manual guide for a custom deployment.')
+        container = run(['docker', 'compose', 'ps', '--quiet', self.service], cwd=self.project).strip()
         if not container or '\n' in container:
-            raise SetupError('Start the updated ollama-scheduler container before running setup.')
+            raise SetupError('Start the updated intermediary container before running setup.')
         inspect = json.loads(run(['docker', 'inspect', container]))[0]
         labels = inspect['Config'].get('Labels', {})
         expected = [str(self.project / 'docker-compose.yml')]
@@ -259,18 +285,18 @@ class Installer:
         service = SystemHost(self.amd).service()
         if not service['active'] or service['kill_mode'] != 'control-group':
             raise SetupError('ollama.service must be active and use KillMode=control-group; the installer will not change or restart it.')
+        validate_no_conflicting_helper()
         self.gid = validate_account()
         for target in [*ARTIFACTS.values(), ENV_PATH]:
             validate_host_target(target)
         self.helper_state = run(['systemctl', 'show', SERVICE, '--property=LoadState,ActiveState'], allowed_exit=(0, 1)).strip()
         if not self.helper_state:
             self.helper_state = 'No helper unit state returned; setup will install the reviewed unit.'
-        self.before = json.loads(self.compose('config', '--format', 'json'))
         self.prepare_override(self.gid if self.gid is not None else 99999)
 
     def prepare_override(self, gid):
-        merged = self.container({'mode': 'merge', 'yaml': self.original or '', 'gid': gid})['yaml']
-        with tempfile.TemporaryDirectory(prefix='ollama-compose-check-') as directory:
+        merged = self.container({'mode': 'merge', 'yaml': self.original or '', 'gid': gid, 'service': self.service})['yaml']
+        with tempfile.TemporaryDirectory(prefix='ai-compose-check-') as directory:
             candidate = Path(directory) / 'override.yml'
             candidate.write_text(merged)
             after = json.loads(self.compose('config', '--format', 'json', candidate=candidate))
@@ -289,6 +315,7 @@ class Installer:
         except (subprocess.SubprocessError, OSError):
             raise SetupError('sudo authorization failed; no installation performed.') from None
         self.still_paused()
+        validate_no_conflicting_helper()
         for target in [*ARTIFACTS.values(), ENV_PATH]:
             validate_host_target(target)
         # Refuse customized persistent locations rather than resetting journals.
@@ -296,7 +323,7 @@ class Installer:
         if previous is not None:
             previous = run(['sudo', '/usr/bin/cat', ENV_PATH])
         env_text = environment_text(self.origin, self.amd, previous)
-        backup_root = Path.home() / '.local' / 'state' / 'ollama-intermediary-installer'
+        backup_root = Path.home() / '.local' / 'state' / 'ai-intermediary-installer'
         backup_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.backup = Path(tempfile.mkdtemp(prefix='backup-', dir=backup_root))
         for target in [*ARTIFACTS.values(), ENV_PATH]:
@@ -316,16 +343,17 @@ class Installer:
         for args in (['metric', '--mem-usage', '--usage', '--temperature', '--power', '--json'], ['process', '--json']):
             run(['sudo', '-u', ACCOUNT, self.amd, *args], timeout=20)
         run(['sudo', '/usr/sbin/visudo', '-cf', str(self.source / (ACCOUNT + '.sudoers'))])
-        run(['sudo', '/usr/bin/install', '-d', '-o', 'root', '-g', 'root', '-m', '0755', '/opt/ollama-intermediary-host'])
+        run(['sudo', '/usr/bin/install', '-d', '-o', 'root', '-g', 'root', '-m', '0755', '/opt/ai-intermediary-host'])
         for name, target in ARTIFACTS.items():
             mode = '0440' if name.endswith('.sudoers') else '0644'
             run(['sudo', '/usr/bin/install', '-o', 'root', '-g', 'root', '-m', mode, str(self.source / name), target])
-        with tempfile.TemporaryDirectory(prefix='ollama-host-environment-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ai-host-environment-') as directory:
             temporary = Path(directory) / 'host.env'
             temporary.write_text(env_text)
             run(['sudo', '/usr/bin/install', '-o', 'root', '-g', 'root', '-m', '0640', str(temporary), ENV_PATH])
         run(['sudo', '/usr/sbin/visudo', '-c'])
         self.still_paused()
+        validate_no_conflicting_helper()
         run(['sudo', '/usr/bin/systemctl', 'daemon-reload'])
         run(['sudo', '/usr/bin/systemctl', 'enable', SERVICE])
         run(['sudo', '/usr/bin/systemctl', 'restart', SERVICE], timeout=30)  # helper only, NOT Ollama
@@ -334,7 +362,7 @@ class Installer:
 for attempt in range(10):
  try:
   sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); sock.settimeout(20)
-  sock.connect('/run/ollama-intermediary-host/control.sock')
+  sock.connect('/run/ai-intermediary-host/control.sock')
   conn=http.client.HTTPConnection('localhost'); conn.sock=sock
   conn.request('GET','/v1/status'); reply=conn.getresponse()
   if reply.status!=200: raise RuntimeError()
@@ -361,7 +389,7 @@ for attempt in range(10):
             if os.path.exists(filename):
                 os.unlink(filename)
         self.compose('config', '--quiet')
-        self.compose('up', '-d', '--no-deps', '--force-recreate', 'ollama-scheduler', timeout=240)
+        self.compose('up', '-d', '--no-deps', '--force-recreate', self.service, timeout=240)
         deadline = time.monotonic() + 60
         while True:
             try:
@@ -386,7 +414,7 @@ def validate_helper_status(status, origin):
             or telemetry.get('available') is not True or not gpus
             or any(gpu.get('processes_known') is not True or gpu.get('vram_total_bytes') is None for gpu in gpus)):
         raise SetupError('Helper did not report usable AMD telemetry and the expected Ollama service. '
-                         'Inspect journalctl -u ollama-intermediary-host.service; recovery remains disabled.')
+                         'Inspect journalctl -u ai-intermediary-host.service; recovery remains disabled.')
 
 
 def main():

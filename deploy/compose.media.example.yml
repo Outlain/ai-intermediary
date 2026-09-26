@@ -1,0 +1,12 @@
+# Merge as an override only after completing docs/AI_INTERMEDIARY.md.
+# Existing state volume, host helper mount and group_add must remain unchanged.
+services:
+  ai-intermediary:
+    ports:
+      - "11438:11438"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+# Configure a media source with listener_port:11438 and backend:comfy in Settings.
+# This publishes the authenticated gateway, NOT ComfyUI's raw backend port.

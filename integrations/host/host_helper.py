@@ -33,6 +33,18 @@ WINDOW = 3600
 MAX_RESTARTS = 2
 
 
+def comfyui_units(value):
+    """Root-managed read-only unit allowlist; never a command supplied by HTTP."""
+    if not isinstance(value, str):
+        raise SafeError("invalid_comfyui_units")
+    units = [unit.strip() for unit in value.split(",") if unit.strip()]
+    if (len(units) > 8 or len(set(units)) != len(units)
+            or any(len(unit) > 128 or not re.fullmatch(r"[a-zA-Z0-9_.@-]+\.service", unit)
+                   or unit == "ollama.service" for unit in units)):
+        raise SafeError("invalid_comfyui_units")
+    return tuple(units)
+
+
 def read_small(path, limit=65536):
     with open(path, encoding="utf-8") as stream:
         value = stream.read(limit + 1)
@@ -196,7 +208,7 @@ def parse_processes(row, owner):
         known = known and ownership is not None
         memory = info.get("memory_usage", {})
         process = {"pid": pid, "name": None, "vram_bytes": None,
-                   "is_ollama": ownership is True}
+                   "is_ollama": ownership is True, "is_comfyui": False}
         if isinstance(info.get("name"), str) and info["name"] != "N/A":
             process["name"] = re.sub(r"[^\w .+:/-]", "", info["name"])[:80]
         if isinstance(memory, dict):
@@ -241,11 +253,12 @@ def parse_telemetry(metrics, process_payload, owner):
 
 class SystemHost:
     def __init__(self, amd_smi="/opt/rocm/bin/amd-smi", runner=run_command,
-                 proc_root="/proc", cgroup_root="/sys/fs/cgroup"):
+                 proc_root="/proc", cgroup_root="/sys/fs/cgroup", comfyui_systemd_units=""):
         if not os.path.isabs(amd_smi):
             raise SafeError("invalid_amd_smi_path")
         self.amd_smi, self.runner = amd_smi, runner
         self.proc_root, self.cgroup_root = Path(proc_root), Path(cgroup_root)
+        self.comfyui_systemd_units = comfyui_units(comfyui_systemd_units)
 
     def boot_id(self):
         try:
@@ -324,6 +337,49 @@ class SystemHost:
         except (OSError, UnicodeError):
             return None
 
+    def comfyui_service(self, unit):
+        if unit not in self.comfyui_systemd_units:
+            raise SafeError("comfyui_unit_not_allowed")
+        fields = "ActiveState,SubState,MainPID,InvocationID,ControlGroup,LoadState"
+        # '--' means even an allowlisted unit beginning with '-' is not an option.
+        raw = self.runner(["/usr/bin/systemctl", "show", "--no-pager", "--property=" + fields, "--", unit], timeout=2)
+        values = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+        invocation, cgroup = values.get("InvocationID", ""), values.get("ControlGroup", "")
+        if (values.get("LoadState") != "loaded" or values.get("ActiveState") != "active"
+                or values.get("SubState") != "running" or not re.fullmatch(r"[a-f0-9]{32}", invocation)):
+            raise SafeError("comfyui_service_identity_unknown")
+        if (not cgroup.startswith("/") or ".." in cgroup.split("/")
+                or not cgroup.endswith("/" + unit)):
+            raise SafeError("comfyui_service_cgroup_unknown")
+        try:
+            pid = int(values.get("MainPID", ""))
+            if pid <= 0:
+                raise ValueError()
+        except ValueError:
+            raise SafeError("comfyui_service_identity_unknown") from None
+        return {"invocation_id": invocation, "main_pid": pid, "control_group": cgroup}
+
+    def comfyui_observations(self):
+        observations = {}
+        for unit in self.comfyui_systemd_units:
+            try:
+                observations[unit] = self.comfyui_service(unit)
+            except SafeError:
+                # Inability to verify one service never grants any process trust.
+                observations[unit] = None
+        return observations
+
+    def comfyui_process(self, pid, services):
+        try:
+            identity = self.process_identity(pid)
+            if identity is None:
+                return None
+            owned = [unit for unit, service in services.items() if service is not None
+                     and self.owner(pid, service["control_group"]) is True]
+            return (identity, owned) if owned else None
+        except SafeError:
+            return None
+
     def process_identity(self, pid):
         try:
             text = (self.proc_root / str(pid) / "stat").read_text()
@@ -357,12 +413,27 @@ class SystemHost:
         return result
 
     def telemetry(self, service):
+        comfy_before = self.comfyui_observations()
         metrics = self.runner([self.amd_smi, "metric", "--mem-usage", "--usage", "--temperature", "--power", "--json"])
         # --general omits per-process VRAM; full JSON includes MEMORY_USAGE.
         processes = self.runner([self.amd_smi, "process", "--json"])
         try:
-            return parse_telemetry(json.loads(metrics), json.loads(processes),
-                                   lambda pid: self.owner(pid, service["control_group"]))
+            telemetry = parse_telemetry(json.loads(metrics), json.loads(processes),
+                                        lambda pid: self.owner(pid, service["control_group"]))
+            candidates = {process["pid"]: self.comfyui_process(process["pid"], comfy_before)
+                          for gpu in telemetry["gpus"] for process in gpu["processes"]}
+            comfy_after = self.comfyui_observations()
+            stable = {unit: before for unit, before in comfy_before.items()
+                      if before is not None and before == comfy_after.get(unit)}
+            for gpu in telemetry["gpus"]:
+                for process in gpu["processes"]:
+                    before = candidates.get(process["pid"])
+                    after = self.comfyui_process(process["pid"], stable)
+                    process["is_comfyui"] = bool(before is not None and after is not None
+                                                  and before[0] == after[0]
+                                                  and set(before[1]).intersection(after[1])
+                                                  and not process["is_ollama"])
+            return telemetry
         except (ValueError, TypeError, RecursionError):
             raise SafeError("telemetry_invalid") from None
 
@@ -499,7 +570,8 @@ class Controller:
                 "service": {key: value for key, value in service.items() if key != "control_group"},
                 "telemetry": telemetry, "memory": self.host.memory(),
                 "last_service_failure": self.journal.data.get("last_service_failure"),
-                "capabilities": {"restart_reconciliation": True, "external_replacement": True, "system_memory": True},
+                "capabilities": {"restart_reconciliation": True, "external_replacement": True, "system_memory": True,
+                                 "comfyui_ownership": True},
                 "restart_policy": self.policy()}
 
     def observe(self, service):
@@ -748,9 +820,10 @@ class UnixServer(socketserver.UnixStreamServer):
 
 def main():
     origin = os.environ.get("MANAGED_OLLAMA_ORIGIN", "")
-    journal = Journal(os.environ.get("HOST_HELPER_STATE", "/var/lib/ollama-intermediary-host/state.json"))
-    controller = Controller(SystemHost(os.environ.get("AMD_SMI_PATH", "/opt/rocm/bin/amd-smi")), journal, origin)
-    path = os.environ.get("HOST_HELPER_SOCKET", "/run/ollama-intermediary-host/control.sock")
+    journal = Journal(os.environ.get("HOST_HELPER_STATE", "/var/lib/ai-intermediary-host/state.json"))
+    controller = Controller(SystemHost(os.environ.get("AMD_SMI_PATH", "/opt/rocm/bin/amd-smi"),
+                                      comfyui_systemd_units=os.environ.get("COMFYUI_SYSTEMD_UNITS", "")), journal, origin)
+    path = os.environ.get("HOST_HELPER_SOCKET", "/run/ai-intermediary-host/control.sock")
     if not os.path.isabs(path):
         raise SafeError("invalid_socket_path")
     with UnixServer(path, controller) as server:

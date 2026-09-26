@@ -9,6 +9,9 @@ import { RecoveryService } from '../src/recovery.js';
 import { SettingsController } from '../src/settings-controller.js';
 import { SettingsStore } from '../src/settings.js';
 import { SilentLogger, waitFor } from './helpers.js';
+import { applyHostEnvironment } from '../src/config.js';
+import { ProxyService } from '../src/proxy.js';
+import { testConfig } from './helpers.js';
 
 const SETTINGS_API = '/_intermediary/v1/settings';
 const ADMIN_TOKEN = 'settings-admin-secret';
@@ -126,6 +129,72 @@ test('authenticated settings snapshot exposes safe values and secret presence, n
   assert.equal(body.infrastructure.compose_editable, false);
   for (const secret of [ADMIN_TOKEN, OBSERVABILITY_TOKEN, MAINTENANCE_TOKEN]) {
     assert.equal(bodyText.includes(secret), false);
+  }
+});
+
+test('single-admin settings snapshot exposes only authentication mode and rejects machine/legacy credentials', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-admin-http-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const store = new SettingsStore({ statePath: path.join(directory, 'settings.json'), environment: null,
+    baseRaw: applyHostEnvironment({ ollama: { url: 'http://192.0.2.10:11434' } }, { ADMIN_TOKEN: 'new-admin-private' }) });
+  await store.load();
+  const machine = store.getEffectiveConfig().media.auth_token;
+  const url = await startControllerServer(t, new SettingsController({ store, token: 'obsolete-explicit-token',
+    authentication: { mode: 'single_admin', admin_token: 'must-not-be-exposed' }, logger: new SilentLogger() }));
+  for (const token of [machine, OBSERVABILITY_TOKEN, MAINTENANCE_TOKEN, 'obsolete-explicit-token']) {
+    const denied = await fetch(`${url}${SETTINGS_API}`, { headers: bearer(token) });
+    assert.equal(denied.status, 401);
+    assert.deepEqual((await denied.json()).authentication, { mode: 'single_admin' });
+  }
+  const response = await fetch(`${url}${SETTINGS_API}`, { headers: bearer('new-admin-private') });
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  const body = JSON.parse(text);
+  assert.deepEqual(body.authentication, { mode: 'single_admin' });
+  assert.equal(body.settings.security, undefined);
+  assert.equal(store.validate({ security: { admin_token: 'browser-replacement' } }).valid, false);
+  for (const secret of ['new-admin-private', machine, 'must-not-be-exposed']) assert.equal(text.includes(secret), false);
+});
+
+test('direct ProxyService construction cannot retain legacy Frigate control access in single-admin mode', () => {
+  const config = testConfig({ security: { admin_token: 'canonical-admin-secret' } });
+  const service = new ProxyService(config, { logger: new SilentLogger(), settingsToken: 'obsolete-options-token',
+    settingsController: { token: 'obsolete-controller-token' } });
+  assert.equal(service.frigateController.controlToken, 'canonical-admin-secret');
+  assert.equal(service.frigateController.readToken, 'canonical-admin-secret');
+});
+
+test('configuration recovery keeps the raw host-admin identity when unrelated configuration is invalid', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-admin-recovery-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const admin = 'host-admin-during-recovery';
+  const store = new SettingsStore({ statePath: path.join(directory, 'settings.json'), environment: null,
+    baseRaw: { security: { admin_token: admin }, ollama: { url: 'not-a-valid-backend-url' } } });
+  await store.load();
+  assert.equal(store.getEffectiveConfig(), null);
+  assert.equal(store.getEffectiveRaw().security.admin_token, admin);
+  const url = await startControllerServer(t, new SettingsController({ store, token: 'obsolete-legacy-settings',
+    mode: 'configuration_error', logger: new SilentLogger() }));
+  for (const token of ['', 'obsolete-legacy-settings']) {
+    const response = await fetch(`${url}${SETTINGS_API}`, { headers: bearer(token) });
+    assert.equal(response.status, 401);
+  }
+  const response = await fetch(`${url}${SETTINGS_API}`, { headers: bearer(admin) });
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  const body = JSON.parse(text);
+  assert.equal(body.mode, 'configuration_error');
+  assert.equal(body.valid, false);
+  assert.deepEqual(body.authentication, { mode: 'single_admin' });
+  assert.equal(text.includes(admin), false);
+});
+
+test('invalid raw host-admin credentials fail closed instead of enabling legacy recovery access', () => {
+  for (const admin_token of [null, false, ' padded ', 'caf\u00e9', 'bad\nvalue']) {
+    assert.throws(() => new SettingsController({
+      store: { getEffectiveRaw: () => ({ security: { admin_token } }), getEffectiveConfig: () => null },
+      token: 'obsolete-legacy-settings',
+    }), /ADMIN_TOKEN/);
   }
 });
 

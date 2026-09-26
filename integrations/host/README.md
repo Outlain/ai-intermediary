@@ -3,6 +3,44 @@
 This helper runs **on the Ollama Ubuntu host**, outside Docker. It is optional;
 updating the intermediary image does not install it or grant host privileges.
 Telemetry and automatic recovery are separately opt-in in the intermediary.
+
+The restricted `ai-intermediary-host` account runs
+`ai-intermediary-host.service`. Its Unix socket is
+`/run/ai-intermediary-host/control.sock`, and its persistent recovery journal is
+`/var/lib/ai-intermediary-host/state.json`. The guided installer configures the
+`ai-intermediary` Compose service. Never run two host helpers or reset their
+recovery journals to bypass restart limits.
+
+## Optional ComfyUI process ownership (read-only)
+
+The AI intermediary can distinguish trusted ComfyUI workers from unrelated GPU
+processes when this helper is updated and the host administrator adds an explicit
+unit allowlist to the existing root-owned `/etc/ai-intermediary-host.env`:
+
+```dotenv
+COMFYUI_SYSTEMD_UNITS=comfyui.service
+```
+
+Use the actual local systemd unit name; up to eight distinct names may be comma
+separated. Do not list `ollama.service`. An empty or absent value trusts no
+ComfyUI workers. The installer preserves a valid existing allowlist on upgrade;
+it does not install ComfyUI or automatically choose trusted units.
+
+After editing this host file, restart **only the helper** to load the setting.
+The helper uses unprivileged, read-only `systemctl show`, checks the service
+invocation and exact cgroup membership before and after the hardware sample, and
+checks each GPU PID's kernel start identity. A process named `comfyui` or `python`
+is not evidence of ownership. Missing permissions, changed service incarnations
+or ambiguous samples never produce `is_comfyui: true`.
+
+This setting grants **no ComfyUI restart permission**. The sole sudoers command
+remains `systemctl restart ollama.service`; GPU resets and host reboots remain
+unsupported. Known ComfyUI workers still block the existing Ollama automatic
+recovery path, just like other non-Ollama work. The shared media broker combines
+this attribution with actual workflow completion, fresh telemetry, VRAM and
+stable-sample checks before handing the GPU to another engine. Attribution alone
+does not prove completion or give a remote backend process ownership.
+
 The initial hardware target is an AMD GPU supported by AMD SMI, including the
 reported Radeon AI PRO R9700 / AMD SMI 26.2.2 setup. NVIDIA support is not implied.
 
@@ -14,7 +52,7 @@ inference through the intermediary and keep its upstream Ollama port private.
 
 ## Safety contract
 
-- Unix HTTP socket only: `/run/ollama-intermediary-host/control.sock`, mode 0660.
+- Unix HTTP socket only: `/run/ai-intermediary-host/control.sock`, mode 0660.
   Directory mode 0750. Filesystem/group membership is the authorization boundary;
   membership grants recovery control, not just telemetry. No TCP listener or
   additional browser token is used between the intermediary and helper.
@@ -46,7 +84,7 @@ inference through the intermediary and keep its upstream Ollama port private.
   uncertain operation with saved worker/boot evidence can be verified again via
   a read-only GET. Transient post-restart activity does not permanently freeze
   its outcome. The intermediary bounds the verification window; missing proof,
-  a changed host boot, or persistent activity remains blocked. Legacy uncertain
+  a changed host boot, or persistent activity remains blocked. Uncertain
   records without proof still require manual verification. The operation is
   never silently reissued. Do not delete the journal to clear a limit.
 - Inactive/unknown GPU telemetry never becomes a fictional zero. Process names
@@ -66,7 +104,7 @@ idle hardware without prior observations is insufficient. Incarnation evidence
 does not prove that arbitrary GPU workloads are safe: non-Ollama work still blocks
 automatic recovery.
 
-Protocol additions retain `ollama-intermediary-host-v1` for compatibility:
+Host-helper wire protocol (`ollama-intermediary-host-v1`):
 
 - `GET /v1/status`: adds `memory`, capability flags, and captured systemd OOM evidence.
 - `GET /v1/ollama/operations/<uuid>`: rechecks a known operation; unknown IDs never create one.
@@ -76,7 +114,7 @@ Protocol additions retain `ollama-intermediary-host-v1` for compatibility:
 
 Worker/boot proof is private to the host journal, not returned to the browser.
 
-## Upgrading to 1.6
+## Updating the installed helper
 
 1. In the dashboard, pause inference **until manually resumed** and wait for
    active work to drain. Disable automatic recovery in Settings during the update.
@@ -87,7 +125,7 @@ Worker/boot proof is private to the host journal, not returned to the browser.
 3. On the Ollama VM, as the normal Docker-capable user, run the updated installer:
 
    ```bash
-   cd /opt/ollama_intermediary
+   cd /opt/ai-intermediary
    python3 integrations/host/install.py
    ```
 
@@ -95,11 +133,11 @@ Worker/boot proof is private to the host journal, not returned to the browser.
    preserves the host journal, and restarts the helper—not Ollama. Existing
    supported Compose mounts/groups are merged without duplication. Advanced
    deployments can instead reinstall the helper files using the manual steps
-   below and explicitly restart `ollama-intermediary-host.service`; preserve the
+   below and explicitly restart `ai-intermediary-host.service`; preserve the
    configured environment file and both recovery journals.
 4. Verify that both physical GPU readings and **Host RAM & swap** are fresh.
    Re-enable automatic recovery. For an existing lock use **Check / recover now**;
-   a legacy uncertain operation may still require the manual host-verification
+   an operation without sufficient process-identity proof may still require manual host verification
    and acknowledgment procedure. Do not clear a lock just because the GPU looks idle.
 5. Resume maintenance explicitly when verification succeeds. Guarded catch-up
    will wait if RAM data is missing or below its floor, retaining all jobs.
@@ -154,7 +192,7 @@ recovery disabled during installation. Then, as your normal Docker-capable user
 on the Ollama VM (**not** inside the container and **not** prefixed with sudo):
 
 ```bash
-cd /opt/ollama_intermediary
+cd /opt/ai-intermediary
 python3 integrations/host/install.py
 ```
 
@@ -183,7 +221,7 @@ reboot, driver installation, or deletion of persisted state is part of setup.
 Existing Compose settings are preserved. The script checks the complete resolved
 Compose configuration and refuses unrelated changes, including a different state
 volume. Backups are in a private directory under
-`~/.local/state/ollama-intermediary-installer/`; preserve them if setup stops.
+`~/.local/state/ai-intermediary-installer/`; preserve them if setup stops.
 The recovery journals, `config.yml`, and `secrets.env` are not rewritten.
 Existing helper environment settings are preserved if they match; custom paths
 or a different backend require manual review rather than automatic overwrite.
@@ -224,7 +262,7 @@ Ollama by themselves; enabling auto-recovery can later do so when required.
 1. From an updated repository checkout, verify the host prerequisites:
 
    ```bash
-   cd /opt/ollama_intermediary
+   cd /opt/ai-intermediary
    command -v amd-smi
    getent group render
    getent group video
@@ -241,17 +279,17 @@ Ollama by themselves; enabling auto-recovery can later do so when required.
    ```bash
    sudo useradd --system --user-group --no-create-home \
      --home-dir /nonexistent --shell /usr/sbin/nologin \
-     --groups render,video ollama-intermediary-host
+     --groups render,video ai-intermediary-host
    ```
 
 3. Install the reviewed helper and service definition:
 
    ```bash
-   sudo install -d -o root -g root -m 0755 /opt/ollama-intermediary-host
-   sudo install -o root -g root -m 0644 integrations/host/host_helper.py /opt/ollama-intermediary-host/host_helper.py
-   sudo install -o root -g root -m 0644 integrations/host/ollama-intermediary-host.service /etc/systemd/system/ollama-intermediary-host.service
-   sudo visudo -cf integrations/host/ollama-intermediary-host.sudoers
-   sudo install -o root -g root -m 0440 integrations/host/ollama-intermediary-host.sudoers /etc/sudoers.d/ollama-intermediary-host
+   sudo install -d -o root -g root -m 0755 /opt/ai-intermediary-host
+   sudo install -o root -g root -m 0644 integrations/host/host_helper.py /opt/ai-intermediary-host/host_helper.py
+   sudo install -o root -g root -m 0644 integrations/host/ai-intermediary-host.service /etc/systemd/system/ai-intermediary-host.service
+   sudo visudo -cf integrations/host/ai-intermediary-host.sudoers
+   sudo install -o root -g root -m 0440 integrations/host/ai-intermediary-host.sudoers /etc/sudoers.d/ai-intermediary-host
    sudo visudo -c
    ```
 
@@ -261,8 +299,8 @@ Ollama by themselves; enabling auto-recovery can later do so when required.
 4. For a **new installation**, copy the environment template once:
 
    ```bash
-   sudo install -o root -g root -m 0640 integrations/host/host-helper.env.example /etc/ollama-intermediary-host.env
-   sudoedit /etc/ollama-intermediary-host.env
+   sudo install -o root -g root -m 0640 integrations/host/host-helper.env.example /etc/ai-intermediary-host.env
+   sudoedit /etc/ai-intermediary-host.env
    ```
 
    Set `MANAGED_OLLAMA_ORIGIN` to the **exact** origin used as the intermediary's
@@ -277,11 +315,11 @@ Ollama by themselves; enabling auto-recovery can later do so when required.
    the helper. Use your actual AMD SMI path in the first two commands:
 
    ```bash
-   sudo -u ollama-intermediary-host /opt/rocm/bin/amd-smi metric --mem-usage --usage --temperature --power --json
-   sudo -u ollama-intermediary-host /opt/rocm/bin/amd-smi process --json
+   sudo -u ai-intermediary-host /opt/rocm/bin/amd-smi metric --mem-usage --usage --temperature --power --json
+   sudo -u ai-intermediary-host /opt/rocm/bin/amd-smi process --json
    sudo systemctl daemon-reload
-   sudo systemctl enable --now ollama-intermediary-host.service
-   sudo curl --unix-socket /run/ollama-intermediary-host/control.sock http://localhost/v1/status
+   sudo systemctl enable --now ai-intermediary-host.service
+   sudo curl --unix-socket /run/ai-intermediary-host/control.sock http://localhost/v1/status
    ```
 
    Expect `protocol: "ollama-intermediary-host-v1"`, correct
@@ -293,7 +331,7 @@ Ollama by themselves; enabling auto-recovery can later do so when required.
 6. Give only the intermediary container access to the helper socket:
 
    ```bash
-   getent group ollama-intermediary-host
+   getent group ai-intermediary-host
    ```
 
    Use that group's numeric GID as `HOST_HELPER_GID` in your Compose interpolation
@@ -313,7 +351,7 @@ Ollama by themselves; enabling auto-recovery can later do so when required.
    runtime directory was recreated, recreate the intermediary
    container as well so its bind refers to the current directory.
 
-   Validate your merged Compose file, then recreate only `ollama-scheduler` with
+   Validate your merged Compose file, then recreate only `ai-intermediary` with
    your normal workflow. Do not run `down -v`. A restart alone does not apply new
    socket mounts, supplementary groups or container environment variables.
 
@@ -328,9 +366,9 @@ Ollama by themselves; enabling auto-recovery can later do so when required.
 
 Updating the intermediary container alone does not update this helper. Review and
 reinstall only the root-owned Python/service/sudoers files from step 3, preserve
-the configured environment and `/var/lib/ollama-intermediary-host/state.json`,
+the configured environment and `/var/lib/ai-intermediary-host/state.json`,
 then run `sudo systemctl daemon-reload` and
-`sudo systemctl restart ollama-intermediary-host.service`. This restarts the
+`sudo systemctl restart ai-intermediary-host.service`. This restarts the
 helper, **not Ollama**. Avoid doing this during a recovery operation; interruption
 can deliberately leave that operation uncertain instead of risking a second restart.
 
@@ -338,7 +376,7 @@ To turn off automatic restarts, disable automatic recovery in intermediary
 Settings. Telemetry can remain enabled. To fully remove access, disable both
 features, remove only the optional socket/group/env additions from Compose, and
 recreate the intermediary container. Stop/disable the helper with
-`sudo systemctl disable --now ollama-intermediary-host.service`. Removing its exact
+`sudo systemctl disable --now ai-intermediary-host.service`. Removing its exact
 sudoers file additionally revokes restart authority; preserve the journal for
 audit and safe rollback. No recordings, Frigate configuration or backlog data is
 stored in this helper.

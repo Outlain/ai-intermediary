@@ -1,19 +1,19 @@
 [Unit]
-Description=Ollama intermediary local AMD telemetry and bounded recovery helper
+Description=AI Intermediary local AMD telemetry and bounded Ollama recovery helper
 After=ollama.service
 
 [Service]
 Type=simple
-User=ollama-intermediary-host
-Group=ollama-intermediary-host
+User=ai-intermediary-host
+Group=ai-intermediary-host
 SupplementaryGroups=render video
-EnvironmentFile=/etc/ollama-intermediary-host.env
-ExecStart=/usr/bin/python3 /opt/ollama-intermediary-host/host_helper.py
-WorkingDirectory=/opt/ollama-intermediary-host
-RuntimeDirectory=ollama-intermediary-host
+EnvironmentFile=/etc/ai-intermediary-host.env
+ExecStart=/usr/bin/python3 /opt/ai-intermediary-host/host_helper.py
+WorkingDirectory=/opt/ai-intermediary-host
+RuntimeDirectory=ai-intermediary-host
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=restart
-StateDirectory=ollama-intermediary-host
+StateDirectory=ai-intermediary-host
 StateDirectoryMode=0700
 UMask=0077
 Restart=on-failure

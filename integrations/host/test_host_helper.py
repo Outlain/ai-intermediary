@@ -466,9 +466,101 @@ class SystemTests(unittest.TestCase):
                 host.workers(service)
 
     def test_sudoers_grant_is_single_exact_fixed_command(self):
-        text = (Path(__file__).parent / "ollama-intermediary-host.sudoers").read_text()
+        text = (Path(__file__).parent / "ai-intermediary-host.sudoers").read_text()
         rules = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
-        self.assertEqual(rules, ["ollama-intermediary-host ALL=(root) NOPASSWD: /usr/bin/systemctl restart ollama.service"])
+        self.assertEqual(rules, ["ai-intermediary-host ALL=(root) NOPASSWD: /usr/bin/systemctl restart ollama.service"])
+
+
+class ComfyOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.proc = Path(self.temp.name)
+        self.commands = []
+        self.service_reads = 0
+        self.replace_during_sample = False
+        self.fail_service = False
+        self.cgroup = "/system.slice/comfyui.service"
+        self.unit = "comfyui.service"
+        self.processes = [{"pid": 20, "name": "python3"}, {"pid": 99, "name": "comfyui"}]
+        self.write_process(20, "/system.slice/comfyui.service/worker", "1234")
+        self.write_process(99, "/system.slice/unrelated.service", "5678")
+        self.host = helper.SystemHost(proc_root=self.proc, runner=self.runner,
+                                      comfyui_systemd_units=self.unit)
+
+    def write_process(self, pid, cgroup, start):
+        directory = self.proc / str(pid)
+        directory.mkdir(exist_ok=True)
+        (directory / "cgroup").write_text("0::" + cgroup)
+        (directory / "stat").write_text(str(pid) + " (python3) " + " ".join(["S"] + ["0"] * 18 + [start]))
+
+    def runner(self, argv, **options):
+        self.commands.append(argv)
+        if argv[0] == "/usr/bin/systemctl":
+            self.service_reads += 1
+            if self.fail_service:
+                raise helper.SafeError("command_failed")
+            invocation = NEW if self.replace_during_sample and self.service_reads > 1 else OLD
+            return ("ActiveState=active\nSubState=running\nMainPID=20\nLoadState=loaded\n"
+                    + "InvocationID=" + invocation + "\nControlGroup=" + self.cgroup + "\n")
+        if argv[1] == "metric":
+            return json.dumps([{"gpu": 0, "mem_usage": {"total_vram": "32624 MB", "used_vram": "100 MB"},
+                                "usage": {"gfx_activity": "2 %"}}])
+        if argv[1] == "process":
+            return json.dumps([{"gpu": 0, "process_info": self.processes}])
+        raise AssertionError("Unexpected command")
+
+    def sample(self):
+        return self.host.telemetry({"control_group": "/system.slice/ollama.service"})["gpus"][0]
+
+    def test_verified_cgroup_not_spoofed_name_grants_read_only_comfy_identity(self):
+        gpu = self.sample()
+        self.assertTrue(gpu["processes"][0]["is_comfyui"])
+        self.assertFalse(gpu["processes"][0]["is_ollama"])
+        self.assertFalse(gpu["processes"][1]["is_comfyui"])
+        self.assertEqual(self.service_reads, 2)
+        self.assertTrue(all("restart" not in command and "/usr/bin/sudo" not in command for command in self.commands))
+        for command in self.commands:
+            if command[0] == "/usr/bin/systemctl":
+                self.assertEqual(command[-2:], ["--", "comfyui.service"])
+
+    def test_unconfigured_unit_and_cgroup_prefix_are_never_trusted(self):
+        self.host.comfyui_systemd_units = ()
+        self.assertFalse(self.sample()["processes"][0]["is_comfyui"])
+        self.host.comfyui_systemd_units = (self.unit,)
+        self.write_process(20, "/system.slice/comfyui.service-evil/worker", "1234")
+        self.assertFalse(self.sample()["processes"][0]["is_comfyui"])
+
+    def test_cgroup_read_failure_and_systemctl_failure_never_grant_ownership(self):
+        (self.proc / "20/cgroup").unlink()
+        self.assertFalse(self.sample()["processes"][0]["is_comfyui"])
+        self.write_process(20, self.cgroup, "1234")
+        self.fail_service = True
+        self.assertFalse(self.sample()["processes"][0]["is_comfyui"])
+
+    def test_service_replacement_or_wrong_cgroup_invalidates_the_sample_identity(self):
+        self.replace_during_sample = True
+        self.assertFalse(self.sample()["processes"][0]["is_comfyui"])
+        self.replace_during_sample = False
+        self.cgroup = "/system.slice/evil-comfyui.service"
+        self.assertFalse(self.sample()["processes"][0]["is_comfyui"])
+
+    def test_pid_reuse_between_observations_is_not_verified_comfy(self):
+        identities = iter(["1234", "5678", "9999", "5678"])
+        self.host.process_identity = lambda _pid: next(identities)
+        self.assertFalse(self.sample()["processes"][0]["is_comfyui"])
+
+    def test_known_comfy_process_still_blocks_ollama_restart(self):
+        with self.assertRaisesRegex(helper.SafeError, "unrelated_gpu_process"):
+            helper.Controller.assert_safe_gpu({"available": True, "gpus": [self.sample()]})
+
+    def test_unit_allowlist_rejects_paths_duplicates_excess_and_ollama_alias(self):
+        for value in ["../comfy.service", "comfy.service;reboot", "comfyui", "ollama.service",
+                      "comfy.service,comfy.service", ",".join(f"comfy{i}.service" for i in range(9))]:
+            with self.assertRaisesRegex(helper.SafeError, "invalid_comfyui_units"):
+                helper.SystemHost(comfyui_systemd_units=value)
+        self.assertEqual(helper.comfyui_units("comfyui.service, comfyui@second.service"),
+                         ("comfyui.service", "comfyui@second.service"))
 
 
 class MemoryTests(unittest.TestCase):

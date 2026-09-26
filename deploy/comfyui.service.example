@@ -1,0 +1,32 @@
+[Unit]
+Description=ComfyUI local media backend for AI Intermediary
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=comfyui
+Group=comfyui
+SupplementaryGroups=render video
+WorkingDirectory=/opt/ComfyUI
+Environment=HOME=/var/lib/comfyui
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=COMFY_LISTEN_ADDRESS=127.0.0.1
+EnvironmentFile=/etc/ai-intermediary/comfy.env
+ExecStart=/opt/ComfyUI/.venv/bin/python /opt/ComfyUI/main.py --listen ${COMFY_LISTEN_ADDRESS} --port 8188 --disable-api-nodes --disable-all-custom-nodes --whitelist-custom-nodes ai_intermediary_bridge --use-pytorch-cross-attention --reserve-vram 2
+# The broker must reconcile an interrupted job before any restart/retry.
+Restart=no
+KillMode=control-group
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/ComfyUI
+StateDirectory=comfyui
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

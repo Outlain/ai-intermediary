@@ -8,18 +8,17 @@ http://UBUNTU_IP:11435/_intermediary/v1/status
 
 Use the Ubuntu host's LAN address. `127.0.0.1` is correct only when Home Assistant shares the intermediary's network namespace. The configuration below uses one shared REST request every five seconds for all entities.
 
-## 1. Store the bearer tokens
+## 1. Store the administrator credential
 
-Add the configured tokens from the intermediary's `secrets.env` to Home Assistant's `/config/secrets.yaml`:
+Add the `ADMIN_TOKEN` from the intermediary's `secrets.env` to Home Assistant's `/config/secrets.yaml` once:
 
 ```yaml
-ollama_intermediary_authorization: "Bearer PASTE_THE_TOKEN_HERE"
-ollama_intermediary_maintenance_authorization: "Bearer PASTE_THE_DIFFERENT_MAINTENANCE_TOKEN_HERE"
-# Optional: only needed for the historical Frigate scan action below.
-ollama_intermediary_settings_authorization: "Bearer PASTE_THE_SEPARATE_SETTINGS_TOKEN_HERE"
+ai_intermediary_authorization: "Bearer PASTE_ADMIN_TOKEN_HERE"
 ```
 
-The word `Bearer` is required. The first value is `OBSERVABILITY_TOKEN`; if that intermediary token is blank, omit the `Authorization` header from the REST snapshot below. The second value is the required, separate `MAINTENANCE_TOKEN`. The optional third value is `SETTINGS_TOKEN`; it also authorizes broader intermediary configuration access, so restrict the Home Assistant account/actions that can use it. Never reuse the read-only observability credential for administrative control. Home Assistant secrets prevent accidental publication but are not encrypted at rest.
+The word `Bearer` is required. The same credential authorizes the status snapshot, pause/resume and optional Frigate scan examples below. Home Assistant secrets prevent accidental publication but are not encrypted at rest.
+
+**Important privilege tradeoff:** even if you configure only read-only sensors, Home Assistant now holds an administrator credential that can change settings and invoke controls. Use this integration only on a trusted private network and restrict Home Assistant access accordingly. A sensor's read-only behavior does not make its password read-only.
 
 ## 2. Add the REST entities
 
@@ -33,25 +32,25 @@ rest:
     timeout: 4
     headers:
       Accept: "application/json"
-      Authorization: !secret ollama_intermediary_authorization
+      Authorization: !secret ai_intermediary_authorization
 
     sensor:
-      - name: "Ollama Intermediary State"
-        unique_id: ollama_intermediary_state
+      - name: "AI Intermediary State"
+        unique_id: ai_intermediary_state
         icon: mdi:router-network
         value_template: >-
           {{ (value_json.get('scheduler') or {}).get('state')
              | default('unknown', true) }}
 
-      - name: "Ollama Maintenance State"
-        unique_id: ollama_maintenance_state
+      - name: "AI Intermediary Maintenance State"
+        unique_id: ai_intermediary_maintenance_state
         icon: mdi:pause-circle-outline
         value_template: >-
           {{ (value_json.get('maintenance') or {}).get('state')
              | default('unknown', true) }}
 
-      - name: "Ollama Maintenance Remaining"
-        unique_id: ollama_maintenance_remaining
+      - name: "AI Intermediary Maintenance Remaining"
+        unique_id: ai_intermediary_maintenance_remaining
         icon: mdi:timer-pause-outline
         device_class: duration
         unit_of_measurement: "s"
@@ -60,43 +59,43 @@ rest:
           {{ (((value_json.get('maintenance') or {}).get('remaining_seconds'))
               or 0) | float(0) | round(1) }}
 
-      - name: "Ollama Backend State"
-        unique_id: ollama_backend_state
+      - name: "AI Intermediary Backend State"
+        unique_id: ai_intermediary_backend_state
         icon: mdi:server
         value_template: >-
           {{ (value_json.get('backend') or {}).get('state')
              | default('unknown', true) }}
 
-      - name: "Ollama Current Model"
-        unique_id: ollama_current_model
+      - name: "AI Intermediary Current Model"
+        unique_id: ai_intermediary_current_model
         icon: mdi:brain
         value_template: >-
           {{ (value_json.get('scheduler') or {}).get('current_model')
              | default('none', true) }}
 
-      - name: "Ollama Active Client"
-        unique_id: ollama_active_client
+      - name: "AI Intermediary Active Client"
+        unique_id: ai_intermediary_active_client
         icon: mdi:account-network
         value_template: >-
           {{ (value_json.get('active_request') or {}).get('client')
              | default('idle', true) }}
 
-      - name: "Ollama Active Model"
-        unique_id: ollama_active_model
+      - name: "AI Intermediary Active Model"
+        unique_id: ai_intermediary_active_model
         icon: mdi:brain
         value_template: >-
           {{ (value_json.get('active_request') or {}).get('model')
              | default('idle', true) }}
 
-      - name: "Ollama Active Request Type"
-        unique_id: ollama_active_request_type
+      - name: "AI Intermediary Active Request Type"
+        unique_id: ai_intermediary_active_request_type
         icon: mdi:message-processing
         value_template: >-
           {{ (value_json.get('active_request') or {}).get('type')
              | default('idle', true) }}
 
-      - name: "Ollama Active Request Runtime"
-        unique_id: ollama_active_request_runtime
+      - name: "AI Intermediary Active Request Runtime"
+        unique_id: ai_intermediary_active_request_runtime
         icon: mdi:timer-outline
         device_class: duration
         unit_of_measurement: "s"
@@ -105,16 +104,16 @@ rest:
           {{ (((value_json.get('active_request') or {}).get('running_seconds'))
               or 0) | float(0) | round(1) }}
 
-      - name: "Ollama Queued Requests"
-        unique_id: ollama_queued_requests
+      - name: "AI Intermediary Queued Requests"
+        unique_id: ai_intermediary_queued_requests
         icon: mdi:tray-full
         unit_of_measurement: "requests"
         state_class: measurement
         value_template: >-
           {{ (value_json.get('queue') or {}).get('total') | int(0) }}
 
-      - name: "Ollama Odysseus Queue"
-        unique_id: ollama_odysseus_queue
+      - name: "AI Intermediary Odysseus Queue"
+        unique_id: ai_intermediary_odysseus_queue
         icon: mdi:alpha-o-box-outline
         unit_of_measurement: "requests"
         state_class: measurement
@@ -122,8 +121,8 @@ rest:
           {{ (((value_json.get('queue') or {}).get('by_client') or {})
               .get('odysseus')) | int(0) }}
 
-      - name: "Ollama Frigate Queue"
-        unique_id: ollama_frigate_queue
+      - name: "AI Intermediary Frigate Queue"
+        unique_id: ai_intermediary_frigate_queue
         icon: mdi:cctv
         unit_of_measurement: "requests"
         state_class: measurement
@@ -131,8 +130,8 @@ rest:
           {{ (((value_json.get('queue') or {}).get('by_client') or {})
               .get('frigate')) | int(0) }}
 
-      - name: "Ollama Oldest Queue Wait"
-        unique_id: ollama_oldest_queue_wait
+      - name: "AI Intermediary Oldest Queue Wait"
+        unique_id: ai_intermediary_oldest_queue_wait
         icon: mdi:timer-sand
         device_class: duration
         unit_of_measurement: "s"
@@ -141,8 +140,8 @@ rest:
           {{ ((value_json.get('queue') or {}).get('oldest_wait_seconds')
               or 0) | float(0) | round(1) }}
 
-      - name: "Ollama Model Switches"
-        unique_id: ollama_model_switches
+      - name: "AI Intermediary Model Switches"
+        unique_id: ai_intermediary_model_switches
         icon: mdi:swap-horizontal
         unit_of_measurement: "switches"
         state_class: total_increasing
@@ -152,15 +151,15 @@ rest:
 
       # Optional Frigate catch-up sensors: keep these under this same shared
       # REST resource, not a second resource with another polling loop.
-      - name: "Ollama Frigate Recovery State"
-        unique_id: ollama_frigate_recovery_state
+      - name: "AI Intermediary Frigate Recovery State"
+        unique_id: ai_intermediary_frigate_recovery_state
         icon: mdi:cctv
         value_template: >-
           {{ (value_json.get('frigate') or {}).get('state')
              | default('disabled', true) }}
 
-      - name: "Ollama Frigate Pending Descriptions"
-        unique_id: ollama_frigate_pending_descriptions
+      - name: "AI Intermediary Frigate Pending Descriptions"
+        unique_id: ai_intermediary_frigate_pending_descriptions
         icon: mdi:playlist-clock
         unit_of_measurement: "descriptions"
         state_class: measurement
@@ -171,8 +170,8 @@ rest:
              + (counts.get('waiting_result', 0) | int(0))
              + (counts.get('retrying', 0) | int(0)) }}
 
-      - name: "Ollama Frigate Lifetime Completed Descriptions"
-        unique_id: ollama_frigate_completed_descriptions
+      - name: "AI Intermediary Frigate Lifetime Completed Descriptions"
+        unique_id: ai_intermediary_frigate_completed_descriptions
         icon: mdi:check-all
         unit_of_measurement: "descriptions"
         state_class: total_increasing
@@ -182,16 +181,16 @@ rest:
 
       # Optional: already included in pending, not an additional queue count.
       # Attention does not stop automatic retries.
-      - name: "Ollama Frigate Descriptions Needing Attention"
-        unique_id: ollama_frigate_descriptions_needing_attention
+      - name: "AI Intermediary Frigate Descriptions Needing Attention"
+        unique_id: ai_intermediary_frigate_descriptions_needing_attention
         icon: mdi:alert-circle-outline
         unit_of_measurement: "descriptions"
         state_class: measurement
         value_template: >-
           {{ ((value_json.get('frigate') or {}).get('attention_count')) | int(0) }}
 
-      - name: "Ollama Frigate Lifetime Skipped Descriptions"
-        unique_id: ollama_frigate_skipped_descriptions
+      - name: "AI Intermediary Frigate Lifetime Skipped Descriptions"
+        unique_id: ai_intermediary_frigate_skipped_descriptions
         icon: mdi:skip-next-circle-outline
         unit_of_measurement: "descriptions"
         state_class: total_increasing
@@ -200,43 +199,43 @@ rest:
               .get('skipped')) | int(0) }}
 
     binary_sensor:
-      - name: "Ollama Intermediary Ready"
-        unique_id: ollama_intermediary_ready
+      - name: "AI Intermediary Ready"
+        unique_id: ai_intermediary_ready
         device_class: running
         value_template: >-
           {{ ((value_json.get('service') or {}).get('ready', false))
              | bool(false) }}
 
-      - name: "Ollama Backend Reachable"
-        unique_id: ollama_backend_reachable
+      - name: "AI Intermediary Backend Reachable"
+        unique_id: ai_intermediary_backend_reachable
         device_class: connectivity
         value_template: >-
           {{ ((value_json.get('backend') or {}).get('reachable', false))
              | bool(false) }}
 
-      - name: "Ollama GPU Recovery Required"
-        unique_id: ollama_gpu_recovery_required
+      - name: "AI Intermediary GPU Recovery Required"
+        unique_id: ai_intermediary_gpu_recovery_required
         device_class: problem
         value_template: >-
           {{ ((value_json.get('backend') or {}).get('recovery_required', false))
              | bool(false) }}
 
-      - name: "Ollama Upstream Draining"
-        unique_id: ollama_upstream_draining
+      - name: "AI Intermediary Upstream Draining"
+        unique_id: ai_intermediary_upstream_draining
         device_class: running
         value_template: >-
           {{ ((value_json.get('scheduler') or {}).get('upstream_draining', false))
              | bool(false) }}
 
-      - name: "Ollama Maintenance Paused"
-        unique_id: ollama_maintenance_paused
+      - name: "AI Intermediary Maintenance Paused"
+        unique_id: ai_intermediary_maintenance_paused
         icon: mdi:pause-octagon
         value_template: >-
           {{ ((value_json.get('maintenance') or {}).get('paused', false))
              | bool(false) }}
 
-      - name: "Ollama GPU Released For Maintenance"
-        unique_id: ollama_gpu_released_for_maintenance
+      - name: "AI Intermediary GPU Released For Maintenance"
+        unique_id: ai_intermediary_gpu_released_for_maintenance
         icon: mdi:memory-arrow-down
         value_template: >-
           {{ ((value_json.get('maintenance') or {}).get('gpu_released', false))
@@ -249,39 +248,39 @@ Add this separate top-level block to `/config/configuration.yaml`, replacing `UB
 
 ```yaml
 rest_command:
-  ollama_intermediary_pause:
+  ai_intermediary_pause:
     url: "http://UBUNTU_IP:11435/_intermediary/v1/maintenance/pause"
     method: POST
     headers:
-      Authorization: !secret ollama_intermediary_maintenance_authorization
+      Authorization: !secret ai_intermediary_authorization
     content_type: "application/json"
     payload: '{"reason":"Home Assistant manual pause"}'
     timeout: 30
 
-  ollama_intermediary_pause_4h:
+  ai_intermediary_pause_4h:
     url: "http://UBUNTU_IP:11435/_intermediary/v1/maintenance/pause"
     method: POST
     headers:
-      Authorization: !secret ollama_intermediary_maintenance_authorization
+      Authorization: !secret ai_intermediary_authorization
     content_type: "application/json"
     payload: '{"duration":"4h","reason":"Home Assistant timed pause"}'
     timeout: 30
 
-  ollama_intermediary_resume:
+  ai_intermediary_resume:
     url: "http://UBUNTU_IP:11435/_intermediary/v1/maintenance/resume"
     method: POST
     headers:
-      Authorization: !secret ollama_intermediary_maintenance_authorization
+      Authorization: !secret ai_intermediary_authorization
     content_type: "application/json"
     payload: '{}'
     timeout: 30
 
   # Optional; requires Frigate catch-up to be configured and enabled.
-  ollama_intermediary_frigate_scan:
+  ai_intermediary_frigate_scan:
     url: "http://UBUNTU_IP:11435/_intermediary/v1/frigate/scan"
     method: POST
     headers:
-      Authorization: !secret ollama_intermediary_settings_authorization
+      Authorization: !secret ai_intermediary_authorization
     content_type: "application/json"
     payload: '{"confirm":true}'
     timeout: 30
@@ -293,7 +292,7 @@ The optional scan action finds retained items missing descriptions and skips res
 
 The pending sensor includes items waiting for live results, queued recovery, accepted regenerations awaiting results, and delayed retries. Completed/skipped sensors read persistent lifetime totals; skipped can include expired media, deleted events, or items no longer eligible. Check the intermediary dashboard's recent jobs, early-trigger-only camera warnings, capacity warnings, and degraded/error state for details. Normal first enablement starts from that moment forward; only the explicit scan includes earlier history.
 
-Before starting the other GPU task, require `sensor.ollama_maintenance_state` to read `paused` and `binary_sensor.ollama_gpu_released_for_maintenance` to be `on`. An `error` state or a released sensor that remains off means the unload was not confirmed.
+Before starting the other GPU task, require `sensor.ai_intermediary_maintenance_state` to read `paused` and `binary_sensor.ai_intermediary_gpu_released_for_maintenance` to be `on`. An `error` state or a released sensor that remains off means the unload was not confirmed.
 
 Keep these REST commands and their dashboard buttons limited to trusted Home Assistant administrators. The button confirmation prevents an accidental tap, but it is not an authorization boundary; Home Assistant holds the administrative token and sends it on the user's behalf.
 
@@ -316,8 +315,10 @@ docker restart homeassistant
 If the entities are unavailable, run this from the Home Assistant host or container and verify that it returns JSON:
 
 ```bash
-curl -H "Authorization: Bearer PASTE_THE_TOKEN_HERE" \
-  http://UBUNTU_IP:11435/_intermediary/v1/status
+read -rsp 'AI Intermediary admin password: ' ADMIN_TOKEN; printf '\n'
+curl --header @- http://UBUNTU_IP:11435/_intermediary/v1/status \
+  <<<"Authorization: Bearer ${ADMIN_TOKEN}"
+unset ADMIN_TOKEN
 ```
 
 ## 5. Add the mobile dashboard card
@@ -330,11 +331,11 @@ cards:
   - type: conditional
     conditions:
       - condition: state
-        entity: binary_sensor.ollama_gpu_recovery_required
+        entity: binary_sensor.ai_intermediary_gpu_recovery_required
         state: "on"
     card:
       type: tile
-      entity: binary_sensor.ollama_gpu_recovery_required
+      entity: binary_sensor.ai_intermediary_gpu_recovery_required
       name: "GPU recovery required — check the intermediary"
       icon: mdi:alert-octagon
       color: red
@@ -344,39 +345,39 @@ cards:
     square: false
     cards:
       - type: tile
-        entity: binary_sensor.ollama_intermediary_ready
+        entity: binary_sensor.ai_intermediary_ready
         name: Intermediary
       - type: tile
-        entity: binary_sensor.ollama_backend_reachable
+        entity: binary_sensor.ai_intermediary_backend_reachable
         name: Ollama backend
       - type: tile
-        entity: sensor.ollama_current_model
+        entity: sensor.ai_intermediary_current_model
         name: Loaded model
       - type: tile
-        entity: sensor.ollama_active_client
+        entity: sensor.ai_intermediary_active_client
         name: Active client
       - type: tile
-        entity: sensor.ollama_queued_requests
+        entity: sensor.ai_intermediary_queued_requests
         name: Total queued
       - type: tile
-        entity: sensor.ollama_oldest_queue_wait
+        entity: sensor.ai_intermediary_oldest_queue_wait
         name: Oldest wait
       - type: tile
-        entity: sensor.ollama_maintenance_state
+        entity: sensor.ai_intermediary_maintenance_state
         name: Maintenance
       - type: tile
-        entity: binary_sensor.ollama_gpu_released_for_maintenance
+        entity: binary_sensor.ai_intermediary_gpu_released_for_maintenance
         name: GPU released
 
   - type: entities
     title: Current inference
     show_header_toggle: false
     entities:
-      - sensor.ollama_active_client
-      - sensor.ollama_active_model
-      - sensor.ollama_active_request_type
-      - sensor.ollama_active_request_runtime
-      - binary_sensor.ollama_upstream_draining
+      - sensor.ai_intermediary_active_client
+      - sensor.ai_intermediary_active_model
+      - sensor.ai_intermediary_active_request_type
+      - sensor.ai_intermediary_active_request_runtime
+      - binary_sensor.ai_intermediary_upstream_draining
 
   - type: horizontal-stack
     cards:
@@ -385,66 +386,66 @@ cards:
         icon: mdi:pause
         tap_action:
           action: perform-action
-          perform_action: rest_command.ollama_intermediary_pause
+          perform_action: rest_command.ai_intermediary_pause
           confirmation:
-            text: "Pause Ollama scheduling and release the GPU?"
+            text: "Pause AI scheduling and release the GPU?"
       - type: button
         name: Pause 4 hours
         icon: mdi:timer-pause
         tap_action:
           action: perform-action
-          perform_action: rest_command.ollama_intermediary_pause_4h
+          perform_action: rest_command.ai_intermediary_pause_4h
           confirmation:
-            text: "Pause Ollama scheduling for four hours after GPU release?"
+            text: "Pause AI scheduling for four hours after GPU release?"
       - type: button
         name: Resume
         icon: mdi:play
         tap_action:
           action: perform-action
-          perform_action: rest_command.ollama_intermediary_resume
+          perform_action: rest_command.ai_intermediary_resume
           confirmation:
-            text: "Allow Ollama inference requests again?"
+            text: "Allow AI workloads again?"
 
   - type: entities
     title: Scheduler
     show_header_toggle: false
     entities:
-      - sensor.ollama_intermediary_state
-      - sensor.ollama_maintenance_state
-      - sensor.ollama_maintenance_remaining
-      - binary_sensor.ollama_maintenance_paused
-      - binary_sensor.ollama_gpu_released_for_maintenance
-      - sensor.ollama_backend_state
-      - sensor.ollama_current_model
-      - sensor.ollama_queued_requests
-      - sensor.ollama_odysseus_queue
-      - sensor.ollama_frigate_queue
-      - sensor.ollama_oldest_queue_wait
-      - sensor.ollama_model_switches
+      - sensor.ai_intermediary_state
+      - sensor.ai_intermediary_maintenance_state
+      - sensor.ai_intermediary_maintenance_remaining
+      - binary_sensor.ai_intermediary_maintenance_paused
+      - binary_sensor.ai_intermediary_gpu_released_for_maintenance
+      - sensor.ai_intermediary_backend_state
+      - sensor.ai_intermediary_current_model
+      - sensor.ai_intermediary_queued_requests
+      - sensor.ai_intermediary_odysseus_queue
+      - sensor.ai_intermediary_frigate_queue
+      - sensor.ai_intermediary_oldest_queue_wait
+      - sensor.ai_intermediary_model_switches
 
   # Optional Frigate recovery card; uses the sensors/action above.
   - type: entities
     title: Frigate description recovery
     show_header_toggle: false
     entities:
-      - sensor.ollama_frigate_recovery_state
-      - sensor.ollama_frigate_pending_descriptions
-      - sensor.ollama_frigate_descriptions_needing_attention
-      - sensor.ollama_frigate_lifetime_completed_descriptions
-      - sensor.ollama_frigate_lifetime_skipped_descriptions
+      - sensor.ai_intermediary_frigate_recovery_state
+      - sensor.ai_intermediary_frigate_pending_descriptions
+      - sensor.ai_intermediary_frigate_descriptions_needing_attention
+      - sensor.ai_intermediary_frigate_lifetime_completed_descriptions
+      - sensor.ai_intermediary_frigate_lifetime_skipped_descriptions
 
   - type: button
     name: Fill missing Frigate descriptions
     icon: mdi:playlist-plus
     tap_action:
       action: perform-action
-      perform_action: rest_command.ollama_intermediary_frigate_scan
+      perform_action: rest_command.ai_intermediary_frigate_scan
       confirmation:
         text: "Scan retained Frigate history for missing descriptions and queue eligible items?"
 ```
 
 Home Assistant may append `_2` to an entity ID if that ID already exists. Check the actual IDs under **Settings → Tools → States** and adjust the card if necessary.
 
-The faster catch-up worker preserves the existing sensors and scan action; updating their YAML is not required. The optional **Descriptions Needing Attention** sensor above uses the same shared REST snapshot, with no extra polling request. It counts jobs with prolonged unsuccessful attempts (24h by default); those jobs continue retrying and are already included in pending descriptions. Do not add the attention count to the pending total. The dashboard's completed/skipped history is bounded (1,000 rows by default), while the lifetime sensors continue to use persistent totals rather than the currently visible history size.
+The optional **Descriptions Needing Attention** sensor above uses the same shared REST snapshot, with no extra polling request. It counts jobs with prolonged unsuccessful attempts (24h by default); those jobs continue retrying and are already included in pending descriptions. Do not add the attention count to the pending total. The dashboard's completed/skipped history is bounded (1,000 rows by default), while the lifetime sensors continue to use persistent totals rather than the currently visible history size.
 
 References: [RESTful integration](https://www.home-assistant.io/integrations/rest/), [RESTful Command](https://www.home-assistant.io/integrations/rest_command/), [secrets](https://www.home-assistant.io/docs/configuration/secrets/), [dashboard actions](https://www.home-assistant.io/dashboards/actions/), [dashboard cards](https://www.home-assistant.io/dashboards/cards/), and [conditional cards](https://www.home-assistant.io/dashboards/conditional/).

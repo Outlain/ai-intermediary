@@ -1,0 +1,5 @@
+# Keep ComfyUI dependency installation from silently swapping the ROCm wheels.
+# Installed first from https://download.pytorch.org/whl/rocm7.2
+torch==2.11.0+rocm7.2
+torchvision==0.26.0+rocm7.2
+torchaudio==2.11.0+rocm7.2

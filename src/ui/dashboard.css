@@ -162,21 +162,29 @@ main { padding-block: 28px 16px; }
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16);
 }
 .card-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; }
-.maintenance-card { grid-column: 1 / -1; grid-row: 1; }
-.work-policy-card { grid-column: 1 / -1; grid-row: 7; }
+.ai-backends-card { grid-column: 1 / -1; grid-row: 1; }
+.media-card { grid-column: 1 / -1; grid-row: 3; }
+.ai-backends-card p, .media-card p, .media-card li { overflow-wrap: anywhere; }
+.media-card .queue-list { max-height: 420px; overflow-y: auto; }
+.media-card .queue-item p { margin-block: 7px 0; }
+.media-card .notice { display: block; }
+.media-card .notice > p { margin-top: 10px; }
+.media-card button { white-space: normal; }
+.maintenance-card { grid-column: 1 / -1; grid-row: 2; }
+.work-policy-card { grid-column: 1 / -1; grid-row: 9; }
 .work-policy-card input, .work-policy-card select { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border-soft); border-radius: 8px; color: var(--text); background: var(--surface); }
 .work-policy-card .maintenance-action-row { flex-wrap: wrap; }
 .work-policy-card p { overflow-wrap: anywhere; }
-.recovery-card { grid-column: 1 / -1; grid-row: 2; }
-.host-gpu-card { grid-column: 1 / -1; grid-row: 5; }
-.catchup-card { grid-column: 1 / -1; grid-row: 6; }
+.recovery-card { grid-column: 1 / -1; grid-row: 4; }
+.host-gpu-card { grid-column: 1 / -1; grid-row: 7; }
+.catchup-card { grid-column: 1 / -1; grid-row: 8; }
 .catchup-card > p { overflow-wrap: anywhere; }
 .catchup-card h3 { margin-bottom: 12px; }
 .catchup-card .queue-item p { margin-block: 8px 0; overflow-wrap: anywhere; }
-.current-card { grid-column: 1; grid-row: 3; }
-.queue-card { grid-column: 2; grid-row: 3; }
-.backend-card { grid-column: 1; grid-row: 4; }
-.events-card { grid-column: 2; grid-row: 4; }
+.current-card { grid-column: 1; grid-row: 5; }
+.queue-card { grid-column: 2; grid-row: 5; }
+.backend-card { grid-column: 1; grid-row: 6; }
+.events-card { grid-column: 2; grid-row: 6; }
 .recovery-card p, .host-gpu-card p, .host-gpu-item h3 { overflow-wrap: anywhere; }
 .recovery-card .detail-grid, .host-gpu-item .detail-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .recovery-controls { display: grid; justify-items: start; gap: 16px; margin-block: 18px; }
@@ -341,15 +349,18 @@ main { padding-block: 28px 16px; }
 
 @media (max-width: 900px) {
   .dashboard-grid { grid-template-columns: 1fr; }
-  .maintenance-card, .recovery-card, .host-gpu-card, .current-card, .queue-card, .backend-card, .events-card, .catchup-card { grid-column: 1; grid-row: auto; }
+  .ai-backends-card, .media-card, .maintenance-card, .recovery-card, .host-gpu-card, .current-card, .queue-card, .backend-card, .events-card, .catchup-card, .work-policy-card { grid-column: 1; grid-row: auto; }
+  .ai-backends-card { order: 0; }
   .maintenance-card { order: 1; }
-  .recovery-card { order: 2; }
-  .current-card { order: 3; }
-  .queue-card { order: 4; }
-  .backend-card { order: 5; }
-  .host-gpu-card { order: 6; }
-  .events-card { order: 7; }
-  .catchup-card { order: 8; }
+  .media-card { order: 2; }
+  .recovery-card { order: 3; }
+  .current-card { order: 4; }
+  .queue-card { order: 5; }
+  .backend-card { order: 6; }
+  .host-gpu-card { order: 7; }
+  .events-card { order: 8; }
+  .catchup-card { order: 9; }
+  .work-policy-card { order: 10; }
   .maintenance-layout { grid-template-columns: 1fr; }
   .metadata-strip { grid-template-columns: repeat(4, minmax(70px, 1fr)); }
 }

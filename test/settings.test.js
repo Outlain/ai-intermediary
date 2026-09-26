@@ -79,6 +79,57 @@ function fixture(t) {
   };
 }
 
+test('backend registry migration, source routing and removal round-trip without exposing media secrets', async (t) => {
+  const options = fixture(t);
+  options.baseRaw.media = { auth_token: 'private-media-token', state_path: '/app/state/private-media.json', storage_path: '/app/state/media' };
+  const store = new SettingsStore(options); await store.load();
+  const primary = store.snapshot().settings.backends.ollama;
+  const registry = { ollama: primary, comfy: { type: 'comfyui', enabled: false, url: 'http://192.0.2.10:8188', resource_group: 'gpu0' } };
+  await store.save({ backends: registry, clients: { media: { backend: 'comfy', allowed_backends: ['comfy'], priority: 50 } } });
+  const restored = new SettingsStore(options); await restored.load();
+  assert.equal(restored.getEffectiveConfig().clients.media.backend, 'comfy');
+  assert.equal(restored.getEffectiveConfig().ollama.url, options.environment.OLLAMA_URL);
+  assert.equal(restored.getEffectiveConfig().media.auth_token, 'private-media-token');
+  assert.equal(restored.snapshot().secrets.media_token_configured, true);
+  assert.equal(JSON.stringify(restored.snapshot()).includes('private-media-token'), false);
+  assert.equal(fs.readFileSync(options.statePath, 'utf8').includes('private-media-token'), false);
+  assert.equal(restored.validate({ backends: { comfy: null } }).valid, false, 'referenced backend cannot be removed');
+  await restored.save({ backends: { comfy: null }, clients: { media: { backend: 'ollama', allowed_backends: ['ollama'] } } });
+  const removed = new SettingsStore(options); await removed.load();
+  assert.equal(removed.getEffectiveConfig().backends.comfy, undefined);
+  assert.equal(removed.getEffectiveConfig().clients.odysseus.priority, 100);
+});
+
+test('removing a file-configured backend persists a tombstone and never silently recreates it', async (t) => {
+  const options = fixture(t);
+  options.baseRaw.backends = { ollama: { type: 'ollama', url: '${OLLAMA_URL}' },
+    comfy: { type: 'comfyui', url: 'http://192.0.2.10:8188', enabled: false } };
+  const store = new SettingsStore(options); await store.load();
+  await store.save({ backends: { comfy: null } });
+  assert.equal(JSON.parse(fs.readFileSync(options.statePath, 'utf8')).overrides.backends.comfy, null);
+  const restored = new SettingsStore(options); await restored.load();
+  assert.equal(restored.getEffectiveConfig().backends.comfy, undefined);
+  assert.equal(restored.validate({ backends: { ollama: null } }).valid, false);
+});
+
+test('media settings expose safe policies but never permit browser-managed secrets or filesystem paths', (t) => {
+  const options = fixture(t);
+  for (const [field, value] of [['auth_token', 'browser-secret'], ['storage_path', '/tmp/output'], ['state_path', '/tmp/jobs']]) {
+    const result = validateSettingsDraft({ ...options, draft: { media: { [field]: value } } });
+    assert.equal(result.valid, false);
+    assert.ok(result.diagnostics.some((item) => item.path === `media.${field}`));
+  }
+  const result = validateSettingsDraft({ ...options, draft: { media: { retention: '24h', max_jobs: 20,
+    max_idle_utilization_percent: 3, stable_samples: 4, allowed_node_types: ['KSampler'] } } });
+  assert.equal(result.valid, true);
+  assert.equal(result.settings.media.retention, '24h');
+  assert.equal(result.settings.media.state_path, undefined);
+  assert.equal(result.settings.media.auth_token, undefined);
+  assert.equal(result.settings.media.pollIntervalMs, undefined);
+  assert.deepEqual(maskSettings({ backends: { bad: { type: 'comfyui', url: 'http://user:secret@host:8188/?token=hidden' } } }).backends.bad,
+    { type: 'comfyui', url: 'http://host:8188/' });
+});
+
 test('source policies and weekly schedules round-trip without replacing legacy fallback or secrets', async (t) => {
   const options = fixture(t);
   const store = new SettingsStore(options); await store.load();

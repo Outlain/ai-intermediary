@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#090e16">
-  <title>Settings · Ollama Intermediary</title>
+  <title>Settings · AI Intermediary</title>
   <link rel="stylesheet" href="/_intermediary/ui/settings.css">
   <script defer src="/_intermediary/ui/settings.js"></script>
 </head>
@@ -13,7 +13,7 @@
   <header class="site-header">
     <div class="shell header-inner">
       <a class="brand" href="/debug" aria-label="Return to operations dashboard">
-        <span class="brand-mark" aria-hidden="true">OI</span>
+        <span class="brand-mark" aria-hidden="true">AI</span>
         <span>
           <span class="eyebrow">Administration</span>
           <strong>Intermediary settings</strong>
@@ -22,7 +22,7 @@
       <div class="header-actions">
         <span id="document-state" class="status-pill status-neutral" role="status" aria-live="polite">Not loaded</span>
         <a class="quiet-button" href="/debug">Dashboard</a>
-        <button id="forget-token" class="quiet-button" type="button" hidden>Forget admin token</button>
+        <button id="forget-token" class="quiet-button" type="button" hidden>Log out</button>
       </div>
     </div>
   </header>
@@ -33,16 +33,16 @@
     <section id="auth-panel" class="auth-panel" aria-labelledby="auth-heading">
       <div>
         <p class="eyebrow">Protected configuration</p>
-        <h1 id="auth-heading">Enter the settings admin token</h1>
-        <p id="auth-message" class="muted">This token permits configuration changes. It is kept only in this browser tab.</p>
+        <h1 id="auth-heading">Log in as admin</h1>
+        <p id="auth-message" class="muted">Your administrator login permits configuration changes and is kept only in this browser tab.</p>
       </div>
       <form id="auth-form" class="auth-form">
-        <label for="admin-token">Admin token</label>
+        <label for="admin-token">Administrator password</label>
         <div class="input-action-row">
           <input id="admin-token" type="password" autocomplete="off" spellcheck="false" required>
           <button type="submit">Open settings</button>
         </div>
-        <p class="field-help">The token is stored in sessionStorage, never localStorage, and is cleared when this tab session ends.</p>
+        <p class="field-help">Your login is stored in sessionStorage, never localStorage, and is cleared when this tab session ends.</p>
       </form>
     </section>
 
@@ -74,7 +74,8 @@
         <div id="validation-summary" class="notice notice-error" role="alert" tabindex="-1" hidden></div>
 
         <nav class="section-nav" aria-label="Settings sections">
-          <a href="#backend">Backend</a>
+          <a href="#backend">Backends</a>
+          <a href="#media">Media</a>
           <a href="#frigate-source">Frigate source</a>
           <a href="#scheduler">Scheduler</a>
           <a href="#sources">Sources &amp; ports</a>
@@ -90,13 +91,13 @@
 
         <section id="sources" class="settings-card" aria-labelledby="sources-heading">
           <div class="card-heading"><h2 id="sources-heading">Sources &amp; dedicated ports</h2></div>
-          <p class="section-intro">One Ollama backend, one inference at a time. Larger priority numbers run first; equal priorities use arrival order. Identification: dedicated port → enabled client header → IP/subnet → legacy model mapping → default source. Headers and ports are routing hints, not authentication.</p>
+          <p class="section-intro">One shared GPU, one running workload at a time. Sources decide priority; backends decide which compatible engine runs the work. Larger priority numbers run first; equal priorities use arrival order. Identification: dedicated port → enabled client header → IP/subnet → model mapping → default source. Headers and ports are routing hints, not authentication.</p>
           <div id="source-editors"></div>
           <div class="field"><label>New source name <input id="new-source-name" type="text" placeholder="misc" pattern="[a-zA-Z0-9_-]+"></label></div>
           <button id="add-source" type="button" class="secondary-button">Add source</button>
           <p class="field-help">Adding misc does not change your current default source. Map Odysseus first, then select misc under Scheduler if desired. Disable a source to stop inference without removing its identity.</p>
           <h3>Docker port publication</h3>
-          <p class="field-help">Applying a listener port starts it inside the container after a safe restart. Docker must also publish it. Add the lines below under the existing ollama-scheduler service in your Compose file, preserving your current ports, then recreate that service. Host port reachability is not automatically verified. Do not forward clients directly to Ollama.</p>
+          <p class="field-help">Applying a listener port starts it inside the container after a safe restart. Docker must also publish it. Add the lines below under the ai-intermediary service, preserving its current ports, then recreate that same service. Do not add a second scheduler. Host port reachability is not automatically verified. Do not forward clients directly to a backend.</p>
           <pre id="source-compose"></pre>
           <p class="field-help">Example: with port 11436 assigned to odysseus and published as 11436:11436, use http://ubuntu-ai:11436 in Odysseus. Responses stream back on that same connection. No second proxy is needed.</p>
         </section>
@@ -111,11 +112,17 @@
         </section>
         <section id="backend" class="settings-card" aria-labelledby="backend-heading">
           <div class="card-heading">
-            <div><p class="eyebrow">Upstream service</p><h2 id="backend-heading">Ollama backend</h2></div>
+            <div><p class="eyebrow">Engine registry</p><h2 id="backend-heading">Backends &amp; shared GPU</h2></div>
             <span id="backend-connectivity" class="status-pill status-neutral">Checked after restart</span>
           </div>
+          <p class="section-intro">This release supports exactly one enabled Ollama instance and ComfyUI instances on the same GPU resource, gpu0. A new instance of supported software is configurable; another software type requires an adapter. Adding a backend does not grant it a separate GPU queue or translate incompatible request formats.</p>
+          <p class="field-help">Restrict direct access to raw backend ports so applications cannot bypass GPU ownership. ComfyUI execution also requires Media to be enabled, authenticated, and limited to explicitly trusted local node types. Disabling or removing a backend never deletes its models or files. Remove source references before removing a backend.</p>
+          <div id="backend-editors"></div>
+          <div class="field"><label>New backend name <input id="new-backend-name" type="text" placeholder="comfy-main"></label></div>
+          <button id="add-backend" type="button" class="secondary-button">Add ComfyUI backend</button>
+          <h3>Ollama adapter timing</h3>
           <div class="field-grid field-grid-2">
-            <div class="field field-wide" data-field-wrap="ollama.url">
+            <div id="base-ollama-url" class="field field-wide" data-field-wrap="ollama.url">
               <label for="ollama-url">Ollama URL <span aria-hidden="true">*</span></label>
               <input id="ollama-url" data-path="ollama.url" type="url" inputmode="url" spellcheck="false" placeholder="http://192.168.1.10:11434" required>
               <p class="field-help">Use the host's LAN address when Ollama runs under systemd and this intermediary runs in Docker. Never point this URL back at the intermediary.</p>
@@ -142,6 +149,26 @@
               <p id="backend-connectivity-detail">Validation checks URL structure and cross-field safety without making a network request. Ollama reachability is checked after a saved configuration restarts.</p>
               <button id="test-backend" class="secondary-button" type="button">Validate backend settings</button>
             </div>
+          </div>
+        </section>
+
+        <section id="media" class="settings-card" aria-labelledby="media-heading">
+          <div class="card-heading"><h2 id="media-heading">Durable media jobs &amp; cleanup</h2><span id="media-secret-state" class="configured-badge">Not reported</span></div>
+          <p id="media-setup-help" class="section-intro">Media is off on upgrade. Install ComfyUI locally, restrict its raw port, enable host telemetry, configure machine authentication and allow trusted local workflow node types before enabling it. API / partner cloud nodes are not supported. Credentials and storage paths cannot be changed here.</p>
+          <p class="field-help">Accepted media jobs persist independently of an HTTP connection. Source HTTP queue lifetime does not expire an already accepted media job. New submissions during a pause are rejected by default. A running image or video finishes before another source takes the GPU; priority does not interrupt it.</p>
+          <div class="field-grid field-grid-2">
+            <label class="check-field"><input data-path="media.enabled" type="checkbox"><span><strong>Enable local media execution</strong></span></label>
+            <div class="field"><label>Trusted node types (comma separated)<input data-path="media.allowed_node_types" data-list="true" type="text" placeholder="Explicitly reviewed local node class names"></label><p class="field-help">Empty means no workflows may execute. Review custom node code before trusting it; a name allowlist is not a sandbox.</p></div>
+            <div class="field"><label>Job polling interval<input data-path="media.poll_interval" type="text" placeholder="2s"></label></div>
+            <div class="field"><label>Maximum running job duration<input data-path="media.job_timeout" type="text" placeholder="6h"></label><p class="field-help">Timeout does not prove GPU work stopped. Uncertain completion keeps GPU ownership blocked until verified.</p></div>
+            <div class="field"><label>Completed output retention<input data-path="media.retention" type="text" placeholder="168h"></label><p class="field-help">Automatically expire completed outputs after this age. Cleanup affects intermediary-owned media only, never model weights or unrelated files. Expired result links stop working.</p></div>
+            <div class="field"><label>Media storage limit (bytes)<input data-path="media.max_storage_bytes" type="number" min="1048576" step="1"></label><p class="field-help">Default 10 GiB. Old completed outputs may be removed to make room; active work and retained job inputs are not disposable.</p></div>
+            <div class="field"><label>Maximum unfinished media jobs<input data-path="media.max_jobs" type="number" min="1" max="10000" step="1"></label><p class="field-help">Bounds queued and active work. Completed job metadata has a separate fixed 1,000-record cap; output retention and disk limits above determine how long generated files remain.</p></div>
+            <div class="field"><label>Maximum workflow payload (bytes)<input data-path="media.max_workflow_bytes" type="number" min="1024" step="1"></label></div>
+            <div class="field"><label>Maximum output file (bytes)<input data-path="media.max_output_bytes" type="number" min="1024" step="1"></label></div>
+            <div class="field"><label>Released-GPU VRAM ceiling (MiB)<input data-path="media.max_idle_vram_mb" type="number" min="64" max="4096" step="1"></label></div>
+            <div class="field"><label>Idle GPU utilization ceiling (%)<input data-path="media.max_idle_utilization_percent" type="number" min="0" max="10" step="1"></label><p class="field-help">Allows small telemetry noise only alongside process and backend completion checks; utilization alone cannot prove safe handoff.</p></div>
+            <div class="field"><label>Consecutive stable release samples<input data-path="media.stable_samples" type="number" min="2" max="10" step="1"></label></div>
           </div>
         </section>
 
@@ -337,7 +364,7 @@
           <p class="section-intro">One-time setup: pause inference, then run <code>python3 integrations/host/install.py</code> from the updated repository on your Ollama VM as your normal Docker user. The script checks the VM, backs up and merges configuration, and asks for confirmation before sudo. This helper is custom intermediary code, not an AMD service. Disabled monitoring does not check installation; a missing socket can mean either missing host setup or a missing container mount.</p>
           <div class="field-grid field-grid-3">
             <label class="check-field" data-field-wrap="host_helper.enabled"><input data-path="host_helper.enabled" type="checkbox"><span><strong>Host GPU monitoring</strong><small>Read physical VRAM, utilization, temperature, power, and process telemetry from the installed helper.</small></span><span class="field-error" data-error-for="host_helper.enabled"></span></label>
-            <label class="check-field" data-field-wrap="auto_recovery.enabled"><input data-path="auto_recovery.enabled" type="checkbox"><span><strong>Automatic Ollama recovery</strong><small>Permit bounded Ollama-only restarts when completion is uncertain. Requires the host helper and a configured maintenance token. Never resumes a manual pause.</small></span><span class="field-error" data-error-for="auto_recovery.enabled"></span></label>
+            <label class="check-field" data-field-wrap="auto_recovery.enabled"><input data-path="auto_recovery.enabled" type="checkbox"><span><strong>Automatic Ollama recovery</strong><small>Permit bounded Ollama-only restarts when completion is uncertain. Requires the host helper and the administrator password. Never resumes a manual pause.</small></span><span class="field-error" data-error-for="auto_recovery.enabled"></span></label>
             <div class="field" data-field-wrap="host_helper.poll_interval"><label>Hardware sample interval<input data-path="host_helper.poll_interval" type="text" placeholder="5s"></label><p class="field-error" data-error-for="host_helper.poll_interval"></p></div>
             <div class="field" data-field-wrap="host_helper.request_timeout"><label>Host helper request timeout<input data-path="host_helper.request_timeout" type="text" placeholder="15s"></label><p class="field-error" data-error-for="host_helper.request_timeout"></p></div>
             <div class="field" data-field-wrap="host_helper.stale_after"><label>Mark telemetry stale after<input data-path="host_helper.stale_after" type="text" placeholder="30s"></label><p class="field-help">Stale or missing telemetry is unknown, never zero usage.</p><p class="field-error" data-error-for="host_helper.stale_after"></p></div>
@@ -368,28 +395,21 @@
           <div class="field-grid field-grid-3">
             <label class="check-field" data-field-wrap="maintenance.enabled"><input data-path="maintenance.enabled" type="checkbox"><span><strong>Maintenance controls</strong><small>Allow authenticated pause and resume actions.</small></span><span class="field-error" data-error-for="maintenance.enabled"></span></label>
             <label class="check-field" data-field-wrap="observability.enabled"><input data-path="observability.enabled" type="checkbox"><span><strong>Observability API</strong><small>Expose protected operational metadata.</small></span><span class="field-error" data-error-for="observability.enabled"></span></label>
-            <label class="check-field" data-field-wrap="observability.ui_enabled"><input data-path="observability.ui_enabled" type="checkbox"><span><strong>Operations dashboard</strong><small>Serve the <code>/debug</code> monitor with separately authenticated controls. The protected settings recovery page remains available.</small></span><span class="field-error" data-error-for="observability.ui_enabled"></span></label>
+            <label class="check-field" data-field-wrap="observability.ui_enabled"><input data-path="observability.ui_enabled" type="checkbox"><span><strong>Operations dashboard</strong><small>Serve the <code>/debug</code> monitor with administrator-authenticated controls. The protected settings recovery page remains available.</small></span><span class="field-error" data-error-for="observability.ui_enabled"></span></label>
             <div class="field" data-field-wrap="maintenance.max_pause"><label>Maximum timed pause<input data-path="maintenance.max_pause" type="text" placeholder="168h"></label><p class="field-error" data-error-for="maintenance.max_pause"></p></div>
             <div class="field" data-field-wrap="observability.history_limit"><label>Event history limit<input data-path="observability.history_limit" type="number" min="1" max="1000" step="1"></label><p class="field-error" data-error-for="observability.history_limit"></p></div>
             <div class="field" data-field-wrap="observability.queue_items_limit"><label>Visible queue item limit<input data-path="observability.queue_items_limit" type="number" min="1" max="500" step="1"></label><p class="field-error" data-error-for="observability.queue_items_limit"></p></div>
           </div>
 
           <div class="secrets-heading">
-            <h3>Host-managed tokens</h3>
+            <h3>Admin login</h3>
+            <p id="authentication-mode-help">One administrator password unlocks Dashboard, Settings, maintenance, recovery and media. Dashboard and Settings share it within this browser tab; a dedicated media port may ask for the same password because it is a separate browser origin. ComfyUI's machine credential is configured automatically by the host setup tool.</p>
             <p>Token values are never returned to this page and cannot be changed from the browser. Edit <code>secrets.env</code> on the host, then recreate the intermediary container.</p>
           </div>
           <div class="field-grid field-grid-3 secret-grid">
             <div class="secret-field">
-              <div class="secret-label"><strong>Maintenance token</strong><span id="maintenance-secret-state" class="configured-badge">Unknown</span></div>
-              <div class="secret-readout"><span>Value hidden</span><code>MAINTENANCE_TOKEN</code></div>
-            </div>
-            <div class="secret-field">
-              <div class="secret-label"><strong>Observability token</strong><span id="observability-secret-state" class="configured-badge">Unknown</span></div>
-              <div class="secret-readout"><span>Value hidden</span><code>OBSERVABILITY_TOKEN</code></div>
-            </div>
-            <div class="secret-field">
-              <div class="secret-label"><strong>Settings admin token</strong><span id="admin-secret-state" class="configured-badge">Unknown</span></div>
-              <div class="secret-readout"><span>Value hidden</span><code>SETTINGS_TOKEN</code></div>
+              <div class="secret-label"><strong id="admin-secret-name">Admin credential</strong><span id="admin-secret-state" class="configured-badge">Unknown</span></div>
+              <div class="secret-readout"><span>Value hidden</span><code id="admin-secret-variable">ADMIN_TOKEN</code></div>
             </div>
           </div>
         </section>

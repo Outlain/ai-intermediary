@@ -20,21 +20,21 @@ Use Docker's official installation instructions when those commands are unavaila
 
 ## Install a release
 
-Use a tag actually published at [Outlain/ollama_intermediary releases](https://github.com/Outlain/ollama_intermediary/releases), replacing the example `v1.0.0`. A version bump in source does not publish a container by itself:
+The following creates a new installation from [Outlain/ai-intermediary releases](https://github.com/Outlain/ai-intermediary/releases). Use the desired published version tag:
 
 ```sh
-mkdir -p /tmp/ollama-scheduler-install
-cd /tmp/ollama-scheduler-install
+mkdir -p /tmp/ai-intermediary-install
+cd /tmp/ai-intermediary-install
 
-gh release download v1.0.0 \
-  --repo Outlain/ollama_intermediary \
-  --pattern 'ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz*'
+gh release download v2.0.0 \
+  --repo Outlain/ai-intermediary \
+  --pattern 'ai-intermediary-v2.0.0-linux-amd64.tar.gz*'
 
-sha256sum -c ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz.sha256
-tar -xzf ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz
-sudo mv ollama-scheduling-proxy-v1.0.0-linux-amd64 /opt/ollama_intermediary
-sudo chown -R "$USER":"$USER" /opt/ollama_intermediary
-cd /opt/ollama_intermediary
+sha256sum -c ai-intermediary-v2.0.0-linux-amd64.tar.gz.sha256
+tar -xzf ai-intermediary-v2.0.0-linux-amd64.tar.gz
+sudo mv ai-intermediary-v2.0.0-linux-amd64 /opt/ai-intermediary
+sudo chown -R "$USER":"$USER" /opt/ai-intermediary
+cd /opt/ai-intermediary
 
 cp config.example.yml config.yml
 cp secrets.example.env secrets.env
@@ -48,48 +48,44 @@ Edit `secrets.env`:
 ```dotenv
 OLLAMA_URL=http://YOUR_OLLAMA_HOST:11434
 FRIGATE_SOURCE=
-OBSERVABILITY_TOKEN=
-SETTINGS_TOKEN=
-MAINTENANCE_TOKEN=
+ADMIN_TOKEN=YOUR_PRIVATE_ADMINISTRATOR_VALUE
 ```
 
 The supplied configuration treats every unmatched request as Odysseus, so Odysseus needs no IP setting. Set `FRIGATE_SOURCE` to Frigate's stable IP or CIDR when Frigate is connected. It can remain blank until then.
 
-`OBSERVABILITY_TOKEN` protects the detailed dashboard data and Home Assistant endpoint. Generate a token with `openssl rand -hex 32`, or leave it blank only when port `11435` is restricted to a trusted LAN/VPN.
-
-`SETTINGS_TOKEN` is required to use configuration reads and changes at `/settings`. Generate it separately with `openssl rand -hex 32`. It is intentionally loaded directly from the container environment so it can still authenticate the restricted recovery page when ordinary configuration is invalid.
-
-`MAINTENANCE_TOKEN` is required and protects the state-changing pause/resume API. Generate it with `openssl rand -hex 32`. Keep all three tokens distinct, and never commit them to Git.
+Generate `ADMIN_TOKEN` once with `openssl rand -hex 32`; do not use the literal placeholder. This one human administrator credential protects Dashboard, Settings, maintenance/recovery, Home Assistant administration and the optional media gateway. It is read from the container environment so configuration recovery still works when ordinary YAML is invalid. Never commit it or put it in workflow JSON.
 
 Validate and start:
 
 ```sh
-docker compose config
+docker compose config --quiet
 docker compose pull
 docker compose up -d
 docker compose ps
 curl http://127.0.0.1:11435/readyz
-curl http://127.0.0.1:11435/status
 ```
 
-Open `http://YOUR_UBUNTU_IP:11435/debug` to view the live dashboard. If a token is configured, enter the raw token when prompted. For Home Assistant, follow [HOME_ASSISTANT.md](HOME_ASSISTANT.md).
+Open `http://YOUR_UBUNTU_IP:11435/debug` to view the live dashboard and enter `ADMIN_TOKEN` when prompted. For Home Assistant, follow [HOME_ASSISTANT.md](HOME_ASSISTANT.md).
 
-Open `http://YOUR_UBUNTU_IP:11435/settings` to view or change structured application settings. Enter `SETTINGS_TOKEN`; it is retained only in the current browser tab's session storage.
+Open `http://YOUR_UBUNTU_IP:11435/settings` to view or change structured application settings. Enter `ADMIN_TOKEN`; it is retained only in the current browser tab's session storage.
 
 The image uses `restart: unless-stopped`, so it returns after Docker or host restarts and after a settings apply. A named Docker volume stores maintenance state, validated settings overrides, and the optional Frigate backlog under `/app/state`; they survive container recreation and upgrades. Container logs rotate at 10 MiB across three files.
 
+For local images and videos, complete the optional [ComfyUI AMD installation](COMFYUI_AMD.md)
+and [shared-GPU backend configuration](AI_INTERMEDIARY.md). Keep media disabled until
+the bridge, host telemetry and a small local workflow have passed their checks.
+
 ## Upgrade
 
-Keep local machine-specific Compose changes in `docker-compose.override.yml`. It is ignored by this repository and Compose loads it automatically alongside the supplied `docker-compose.yml`. The tracked/bundled base file can then receive project updates while the override retains host-specific additions. Always inspect the merged result with `docker compose config`.
-
-For a release-bundle installation, download and verify the new bundle in a temporary directory. Install the new bundled base Compose file and image reference without replacing `config.yml`, `secrets.env`, `docker-compose.override.yml`, or the named state volume:
+Download and verify each new bundle in a separate temporary directory. **Keep your existing base Compose and override files**, then edit only the service's image reference to the new published tag. Preserve the project and physical state-volume identity:
 
 ```sh
-cd /opt/ollama_intermediary
-cp /path/to/new-release/docker-compose.yml ./docker-compose.yml
-docker compose config
-docker compose pull
-docker compose up -d
+cd /opt/ai-intermediary
+# Edit only the existing service's image tag; preserve all mounts/project/ports.
+nano docker-compose.yml
+docker compose config --quiet
+docker compose pull ai-intermediary
+docker compose up -d --no-deps ai-intermediary
 docker compose ps
 ```
 
@@ -97,13 +93,15 @@ docker compose ps
 
 Upgrade while idle, or first pause from `/debug` and wait for the active request to drain. Container replacement has a finite stop grace period and is not a safe way to interrupt a long-running GPU request. A persisted maintenance pause remains paused after the update until you resume it.
 
-Version 1.1 defaults to strict Odysseus priority, even when an older config has no `scheduler.mode`. Choose `balanced` explicitly in Settings only if you want the previous aging, maximum-wait promotion, and affinity behavior. Existing connection settings and secrets are not reset. Frigate recovery is disabled until you configure and enable it.
-
-When upgrading an installation that predates the settings page, add a unique `SETTINGS_TOKEN` to `secrets.env`. The new image can use the existing `/app/state` volume for `/app/state/settings.json`; no second volume is required. Installations predating maintenance pause also need a unique `MAINTENANCE_TOKEN` and the `maintenance:` section from `config.example.yml`. The supplied `${MAINTENANCE_TOKEN:?...}` expression intentionally prevents normal startup with a blank administrative token.
+Strict priority is the default. Choose `balanced` explicitly in Settings only if you want priority aging, maximum-wait promotion and model affinity instead. Updates do not reset connection settings or secrets. Frigate recovery is disabled until you configure and enable it.
 
 ## Roll back
 
-Restore the previous release's `docker-compose.yml`, which references an immutable version tag, then run:
+Roll back only to a version known to understand the current persisted state.
+Never start a version without media-job recovery support against unresolved
+media work. At a paused/drained boundary, restore the compatible previous image
+reference in your **same existing Compose file**, keeping all project and mount
+identities, then run:
 
 ```sh
 docker compose pull
@@ -119,33 +117,33 @@ ollama ps
 sudo rocm-smi --showmeminfo vram --showpids
 ```
 
-Pause the intermediary and wait until no inference/management request is active. Restart Ollama if needed. If `rocm-smi` still shows an `UNKNOWN` process retaining substantial VRAM, stop and investigate the driver/host before acknowledging recovery. This project does not authorize an automatic GPU reset or reboot. Once physical GPU memory is back to its expected idle baseline and `ollama ps` is empty, acknowledge the recovery using the separate maintenance credential. The endpoint requires maintenance to remain paused and independently checks the current loaded-model list:
+Pause the intermediary and wait until no inference/management request is active. Restart Ollama if needed. If `rocm-smi` still shows an `UNKNOWN` process retaining substantial VRAM, stop and investigate the driver/host before acknowledging recovery. This project does not authorize an automatic GPU reset or reboot. Once physical GPU memory is back to its expected idle baseline and `ollama ps` is empty, acknowledge recovery using `ADMIN_TOKEN`. The endpoint requires maintenance to remain paused and independently checks the current loaded-model list:
 
 ```sh
-read -rsp 'Maintenance token: ' MAINTENANCE_TOKEN; printf '\n'
+read -rsp 'Administrator token: ' ADMIN_TOKEN; printf '\n'
 curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/recovery/acknowledge \
-  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H 'Content-Type: application/json' \
   --data '{"confirm_gpu_recovered":true}'
 curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/resume \
-  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H 'Content-Type: application/json' \
   --data '{}'
-unset MAINTENANCE_TOKEN
+unset ADMIN_TOKEN
 curl http://127.0.0.1:11435/readyz
 ```
 
 Acknowledgment does not reset hardware and does not resume inference by itself. The separate resume command above deliberately reopens admission only after the acknowledgment succeeds. Run these commands one at a time and stop if acknowledgment returns an error.
 
-## Enable physical GPU monitoring and bounded self-recovery (1.4)
+## Enable physical GPU monitoring and bounded self-recovery
 
-**Updating the intermediary container alone does not enable host monitoring or service restarts.** Those require the optional helper on the same Linux host as the real Ollama service, not the Frigate host. No new Frigate image or bridge rebuild is needed for this upgrade.
+**Starting the intermediary container alone does not enable host monitoring or service restarts.** Those require the optional helper on the same Linux host as the real Ollama service, not the Frigate host. The helper is also required for ComfyUI's shared-GPU handoffs.
 
-For the standard local Ubuntu/Compose deployment, update the intermediary, pause
+For the standard local Ubuntu/Compose deployment, start the intermediary, pause
 inference, leave automatic recovery off, and run this as your normal Docker user:
 
 ```bash
-cd /opt/ollama_intermediary
+cd /opt/ai-intermediary
 python3 integrations/host/install.py
 ```
 
@@ -157,11 +155,11 @@ verify monitoring in Settings, then explicitly enable automatic recovery. See
 the [installer prerequisites and safeguards](../integrations/host/README.md#recommended-interactive-one-command-setup)
 for supported deployments; advanced layouts use the manual procedure below.
 
-1. Update the intermediary while safely drained using your existing source or release installation method. Preserve `config.yml`, `secrets.env`, saved settings, and all state volumes. Version 1.4 keeps host monitoring and automatic recovery disabled until explicitly enabled.
+1. Start the intermediary using your chosen source or release installation method, then pause and drain it. Preserve `config.yml`, `secrets.env`, saved settings and all state volumes. Host monitoring and automatic recovery stay disabled until explicitly enabled.
 2. Follow [the host helper installation guide](../integrations/host/README.md) on the Ollama host. Its manual steps install an unprivileged, Unix-socket-only helper and narrowly scoped permission to restart **only `ollama.service`**, with an independent persisted limit of two restarts per hour and a five-minute cooldown. It has no GPU-reset or reboot permission. Review the service, environment, and sudoers artifacts before installing them; the interactive installer above automates these steps only after your confirmation.
 3. Merge the supplied host-helper Compose example into the existing `docker-compose.override.yml`, preserving other overrides. Mount only the helper runtime directory and add its numeric socket group. Do not mount the Docker socket, host filesystem root, or GPU devices into the intermediary. Do not make the helper socket world-writable. If Ollama runs on a different host from the intermediary, this local-socket integration cannot be used as-is.
 4. Enable only host monitoring first. Use **Settings → GPU safety** or the host-managed `HOST_HELPER_ENABLED=true` environment opt-in. Recreate the container after adding socket mounts/groups or changing environment variables. Inspect the dashboard for fresh physical VRAM/process telemetry and the correct Ollama service identity.
-5. Configure a distinct `MAINTENANCE_TOKEN` if not already set. Once the helper is verified, enable `auto_recovery.enabled` in Settings, or establish the base opt-in with `AUTO_RECOVERY_ENABLED=true` in `secrets.env`. Environment values do not override previously saved UI overrides. Validate/apply, then explicitly resume a deliberate maintenance pause when ready; automatic recovery never resumes it for you.
+5. Once the helper is verified, enable `auto_recovery.enabled` in Settings, or establish the base opt-in with `AUTO_RECOVERY_ENABLED=true` in `secrets.env`. Environment values do not override previously saved UI overrides. Validate/apply, then explicitly resume a deliberate maintenance pause when ready; automatic recovery never resumes it for you.
 6. Check the recovery panel after the next real failure. A protected **Check recovery now** action may be used for an already latched incident. It cannot bypass the **two-attempt limit for that incident**, the **two-per-rolling-hour limit**, or the **five-minute cooldown**; it is not a force-reset button. After two unsuccessful attempts, waiting another hour does not grant more attempts for that incident. Investigate the persistent failure and acknowledge recovery manually only after verifying the host. Never deliberately crash or exhaust production VRAM just to test the feature.
 
 Default verification requires three fresh stable samples, no loaded Ollama models, no reported GPU processes, and no more than 512 MiB used VRAM per GPU after a confirmed service restart. The application baseline can be lowered for stricter checks, but increasing its setting above 512 does not bypass the helper's independent 512 MiB ceiling. Do not raise thresholds to hide a stuck process. Missing or stale telemetry is unknown, not a healthy reading. Persistent driver faults, non-Ollama GPU workloads, helper failures, and exhausted restart limits keep admission locked for operator investigation.
@@ -181,16 +179,9 @@ One-at-a-time scheduling prevents overlapping admitted inference, but it cannot 
 
 ## Install from source instead
 
-For the 1.6 recovery/RAM upgrade on an existing helper-enabled installation,
-follow [Upgrading to 1.6](../integrations/host/README.md#upgrading-to-16).
-Both the container and the installed host helper need updating; preserve their
-state. A container-only upgrade with an old helper lacks RAM evidence, so guarded
-catch-up/context rescue will wait until the helper is updated. No new token,
-GPU reset permission, host reboot permission, or Frigate image rebuild is needed.
-
 ```sh
-git clone https://github.com/Outlain/ollama_intermediary.git
-cd ollama_intermediary
+git clone https://github.com/Outlain/ai-intermediary.git
+cd ai-intermediary
 cp config.example.yml config.yml
 cp secrets.example.env secrets.env
 chmod 600 secrets.env
@@ -199,26 +190,26 @@ docker compose up -d --build
 
 The two `cp` commands above are for a first installation only. Never run them over an existing installation during an upgrade.
 
-For a normal source update, leave `config.yml`, `secrets.env`, and `docker-compose.override.yml` in place:
+For a source update, leave `config.yml`, `secrets.env` and `docker-compose.override.yml` in place and review tracked Compose changes before pulling:
 
 ```sh
-cd /opt/ollama_intermediary
+cd /opt/ai-intermediary
 git pull --ff-only
 docker compose config --quiet
-INTERMEDIARY_BUILD="$(git rev-parse --short HEAD)" docker compose build ollama-scheduler
-docker compose up -d --no-deps ollama-scheduler
+INTERMEDIARY_BUILD="$(git rev-parse --short HEAD)" docker compose build ai-intermediary
+docker compose up -d --no-deps ai-intermediary
 docker compose ps
 curl -fsS http://127.0.0.1:11435/readyz
 ```
 
-Those three local deployment files are ignored by Git, and the named state volume is outside the source tree, so the pull does not replace base settings, secrets, saved browser overrides, or maintenance state.
+Those three local deployment files are ignored by Git, and the named state volume is outside the source tree. However, `docker-compose.yml` is tracked: a changed project or volume name can select a different volume even without deleting the old one. Verify the effective service/project/mount identities before recreating anything.
 
 The build argument labels the running source build in the status snapshot. `docker compose config --quiet` validates without printing resolved secret values; if inspecting the full merged Compose output, do not paste its environment values publicly.
 
 If `git pull` says a locally modified tracked `docker-compose.yml` would be overwritten, preserve that edit while updating:
 
 ```sh
-cd /opt/ollama_intermediary
+cd /opt/ai-intermediary
 git stash push -m "local Compose settings before upgrade" -- docker-compose.yml
 git pull --ff-only
 git stash pop
@@ -229,14 +220,14 @@ docker compose up -d --build
 If `git stash pop` reports a conflict, do not discard either side. Keep the new project defaults and move only the host-specific values into `docker-compose.override.yml`, then run `docker compose config` again. Even without a conflict, migrating local base-file edits into the ignored override prevents the next pull from stopping. First retain a patch copy of the exact local edit:
 
 ```sh
-git diff -- docker-compose.yml > /tmp/ollama-intermediary-compose-local.patch
+git diff -- docker-compose.yml > /tmp/ai-intermediary-compose-local.patch
 ```
 
 A small override looks like this:
 
 ```yaml
 services:
-  ollama-scheduler:
+  ai-intermediary:
     environment:
       LOG_LEVEL: debug
 ```
@@ -252,11 +243,11 @@ ports:
   - "127.0.0.1:11435:11434"
 ```
 
-Inference remains compatible with Ollama's unauthenticated local API. Keep it on a trusted LAN/VPN or place it behind an authenticated reverse proxy. The settings API and maintenance mutation endpoints additionally require separate bearer tokens, but those tokens do not protect ordinary Ollama routes. Prevent applications from reaching Ollama directly, or they can bypass scheduler serialization and maintenance pause.
+Inference remains compatible with Ollama's unauthenticated local API. Keep it on a trusted LAN/VPN or place it behind an authenticated reverse proxy. `ADMIN_TOKEN` protects human-facing administration, not ordinary Ollama inference routes. Prevent applications from reaching Ollama directly, or they can bypass scheduler serialization and maintenance pause.
 
 ## Settings page and configuration recovery
 
-Open `http://YOUR_UBUNTU_IP:11435/settings` and enter `SETTINGS_TOKEN`. The page exposes only structured application settings that the intermediary knows how to validate. It never edits raw YAML, `config.yml`, `secrets.env`, Docker Compose, Docker networks, volumes, ports, or the Docker socket.
+Open `http://YOUR_UBUNTU_IP:11435/settings` and enter `ADMIN_TOKEN`. The page exposes only structured application settings that the intermediary knows how to validate. It never edits raw YAML, `config.yml`, `secrets.env`, Docker Compose, Docker networks, volumes, ports, or the Docker socket.
 
 The effective configuration is assembled in this order:
 
@@ -270,7 +261,7 @@ The page requires validation before apply. A successful apply atomically saves a
 
 1. Keep Frigate's Ollama provider pointed at this intermediary. Verify live requests are identified as `frigate` before enabling recovery.
 2. Set `FRIGATE_URL` in `secrets.env` to the reachable Frigate origin (for example `https://YOUR_FRIGATE_HOST:8971`, without `/api`). For an authenticated endpoint, supply `FRIGATE_USERNAME` and `FRIGATE_PASSWORD`, or `FRIGATE_AUTH_TOKEN`, for an administrator-capable connection. Use trusted TLS, and do not put credentials into the URL or UI. If you deliberately use the open internal API, use its reachable HTTP address (commonly port 5000), leave credentials unset, and select **No login required — trusted local API** in the Catch-up settings. Restrict that open API to trusted hosts.
-3. Recreate the intermediary after environment changes: `docker compose up -d --force-recreate ollama-scheduler`. Do this at an idle/paused boundary.
+3. Recreate the intermediary after environment changes: `docker compose up -d --force-recreate ai-intermediary`. Do this at an idle/paused boundary.
 4. Open `/settings`, enable Frigate recovery, and validate/apply. Normal discovery starts at enablement, not weeks of old history. Retained connection settings and the existing state volume are reused.
 5. Confirm the dashboard reports both object and review API capabilities. Review regeneration requires a Frigate build exposing the individual review regeneration API; Frigate 0.18 lacks it, while the targeted development build `0.19.0-bb6c2e9` includes it. For correlated completion reports and the faster pipeline, separately prepare and deploy the [pinned Frigate bridge](../integrations/frigate/README.md). The intermediary does not modify or replace Frigate automatically. Without that bridge the dashboard explicitly shows compatibility mode.
 6. Test one retained object and one ended review. Check that the descriptions actually appear in Frigate; an accepted API request is not yet success. Then use **Fill missing descriptions** only if you want to include older retained items.
@@ -283,24 +274,20 @@ The backlog is tied to the configured Frigate server address. Changing its host,
 
 See the [README catch-up section](../README.md#frigate-description-catch-up) for timing limits and the [Home Assistant optional sensors/action](HOME_ASSISTANT.md) for quick-view controls. Production API permissions, media availability, and GPU stability still need verification on your actual deployment.
 
-### Upgrade an existing catch-up deployment
+### Catch-up defaults and validation
 
-Preserve `config.yml`, `secrets.env`, browser-saved overrides, and the named state volume. Do **not** replace your configuration with `config.example.yml` or use `docker compose down -v`. At an idle/paused boundary, update the repository and rebuild/recreate `ollama-scheduler` using the normal update procedure. Refresh the dashboard and Settings page after restart. The existing backlog is reused; descriptions and images remain in Frigate.
+Defaults are **2s confirmation**, **1m cleanup / 25 jobs per pass**, **24h attention flagging**, **1,000 combined completed/skipped history records**, and **4 descriptions awaiting save**. Discovery remains on its own interval, normally 30s. With verified bridge support, one native attempt can run while up to four finished attempts await saving; a known native failure releases the next eligible job promptly. Without the bridge, one unconfirmed handoff remains the limit. Both modes always retain one GPU inference at a time and back off temporary API failures.
 
-Before the first upgrade to the correlated pipeline, back up the persistent state volume while the intermediary is stopped at a safely drained boundary. Include the actual configured `frigate.state_path` (which may differ from the default), `settings.json`, and GPU/maintenance state. The backlog upgrades to schema **2** while preserving jobs, retry metadata, history, and lifetime totals. Older intermediary releases do not understand this schema; do not point an older image at the upgraded file or manually lower its schema version. A rollback needs a compatible image or the matching pre-upgrade state backup, restored only with the service stopped and no outstanding inference. Keep both versions intact; restoring an older backup also rolls back its queue progress.
+In `/settings`:
 
-New fields default to fast **2s confirmation**, **1m cleanup / 25 jobs per pass**, **24h attention flagging**, **1,000 combined completed/skipped history records**, and **4 descriptions awaiting save**. Discovery remains on its own interval, normally 30s. With verified bridge support, one native attempt can run while up to four finished attempts await saving; a known native failure releases the next eligible job promptly. Without the bridge, one unconfirmed handoff remains the limit. Both modes always retain one GPU inference at a time and back off temporary API failures.
-
-Explicit existing values continue to win over new defaults. In `/settings`:
-
-1. Under **Catch-up**, set **Maximum retry delay** to `5h` if your older configuration still explicitly uses `1h`. Retries continue with increasing delays; the 24h attention flag is informational, not a stop condition.
-2. Under **Frigate**, consider **Ollama keep-alive** of `2m` if it is still `15s`. This can reduce reloads; it does not extend Frigate's scheduler priority or change its idle hold. Exact-model overrides can still supersede the client policy.
+1. Under **Catch-up**, keep **Maximum retry delay** at `5h` initially. Retries continue with increasing delays; the 24h attention flag is informational, not a stop condition.
+2. Under **Frigate**, keep **Ollama keep-alive** at `2m` initially. This can reduce reloads; it does not extend Frigate's scheduler priority or change its idle hold. Exact-model overrides can still supersede the client policy.
 3. Under **Catch-up**, keep **Maximum descriptions awaiting save** at `4` initially. It only controls pending save checks with the bridge, not simultaneous GPU requests. Verify **Frigate bridge connected** appears after installing the separate pinned integration; a Frigate version number alone does not enable this mode.
 4. Validate/apply at an idle/paused boundary. Verify an object and a review description are saved, then verify Odysseus and live Frigate still take priority over queued catch-up. Resume inference explicitly if maintenance pause is active.
 
 Use the dashboard's separate **Retrying / Needs attention** views to investigate failures. **Retry when idle** still respects priority, pause, and outstanding generations. The cleanup pass checks for deleted events/missing media independently of GPU availability; it does not blindly expire everything older than two weeks. **Recheck availability** can revisit media that later becomes available. Recent completed/skipped rows roll off at the chosen limit, not pending jobs, lifetime totals, or Frigate's descriptions. Increasing history cannot restore rows that already rolled off before upgrading.
 
-Existing Home Assistant sensors/actions remain compatible; no replacement YAML is required for the faster worker or queue views.
+The [Home Assistant guide](HOME_ASSISTANT.md) provides optional status sensors and administrative actions.
 
 ### Context-size failures and apparent catch-up stalls
 
@@ -337,7 +324,7 @@ If application configuration is invalid, the intermediary starts a restricted re
 - Safe, editable application values can be validated and applied from the page.
 - Invalid YAML, missing host-only credentials, an invalid `SETTINGS_PATH`, a bad volume mount, or Compose/listener problems must be fixed on the host.
 
-The settings API is locked unless `SETTINGS_TOKEN` exists in the container environment, including during recovery. After changing `secrets.env`, recreate the container so Docker loads the new value:
+The settings API is locked unless `ADMIN_TOKEN` exists in the container environment, including during recovery. After changing `secrets.env`, recreate the container so Docker loads the new value:
 
 ```sh
 docker compose up -d --force-recreate
@@ -351,14 +338,14 @@ For a planned GPU-heavy task, keep the intermediary running and pause scheduling
 
 The pause request receives HTTP 202 after its state is persisted. Drain and unload continue asynchronously, so always check maintenance status before starting the external workload.
 
-You can use the **Pause mode** card on `/debug`; enter the separate maintenance token, choose a manual or timed pause, and wait for **GPU released: Yes**. The equivalent API commands are below.
+You can use the **Pause mode** card on `/debug`; enter `ADMIN_TOKEN`, choose a manual or timed pause, and wait for **GPU released: Yes**. The equivalent API commands are below.
 
 Prompt for the administrative token without putting it in shell history, then start a manual pause:
 
 ```sh
-read -rsp 'Maintenance token: ' MAINTENANCE_TOKEN; printf '\n'
+read -rsp 'Administrator token: ' ADMIN_TOKEN; printf '\n'
 curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/pause \
-  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H 'Content-Type: application/json' \
   --data '{"reason":"exclusive GPU task"}'
 ```
@@ -367,7 +354,7 @@ Use a timed pause only when the task has a reliable upper bound:
 
 ```sh
 curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/pause \
-  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H 'Content-Type: application/json' \
   --data '{"duration":"4h","reason":"exclusive GPU task"}'
 ```
@@ -382,10 +369,10 @@ Resume after the other task finishes:
 
 ```sh
 curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/resume \
-  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H 'Content-Type: application/json' \
   --data '{}'
-unset MAINTENANCE_TOKEN
+unset ADMIN_TOKEN
 ```
 
 Ollama normally may remain running because the confirmed unload frees its model VRAM. If clients can bypass the intermediary or process-level isolation is required, wait for `gpu_released: true`, run `sudo systemctl stop ollama`, and leave the intermediary online. Run `sudo systemctl start ollama` and verify `curl -fsS http://127.0.0.1:11434/api/tags` before resuming. A manual pause is safest when task duration is uncertain because a timed pause intentionally resumes admission at expiry.

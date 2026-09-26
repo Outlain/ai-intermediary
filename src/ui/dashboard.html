@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#0a0f18">
-  <title>Ollama Intermediary</title>
+  <title>AI Intermediary</title>
   <link rel="stylesheet" href="/_intermediary/ui/dashboard.css">
   <script defer src="/_intermediary/ui/dashboard.js"></script>
 </head>
@@ -13,10 +13,10 @@
   <header class="site-header">
     <div class="shell header-inner">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">OI</span>
+        <span class="brand-mark" aria-hidden="true">AI</span>
         <div>
           <p class="eyebrow">Operations monitor</p>
-          <h1>Ollama Intermediary</h1>
+          <h1>AI Intermediary</h1>
         </div>
       </div>
       <div class="header-actions">
@@ -25,7 +25,7 @@
           <span class="connection-dot" aria-hidden="true"></span>
           <span id="connection-label">Connecting</span>
         </span>
-        <button id="forget-token" class="quiet-button" type="button" hidden>Forget token</button>
+        <button id="forget-token" class="quiet-button" type="button" hidden>Log out</button>
       </div>
     </div>
   </header>
@@ -36,16 +36,16 @@
     <section id="auth-panel" class="auth-panel" aria-labelledby="auth-title" hidden>
       <div>
         <p class="eyebrow">Protected endpoint</p>
-        <h2 id="auth-title">Enter the observability token</h2>
-        <p id="auth-message" class="muted">This dashboard needs a token to read operational metadata.</p>
+        <h2 id="auth-title">Administrator login</h2>
+        <p id="auth-message" class="muted">Use the same password for Dashboard, Settings, maintenance and media.</p>
       </div>
       <form id="token-form" class="token-form">
-        <label for="token-input">Bearer token</label>
+        <label for="token-input">Administrator password</label>
         <div class="token-row">
           <input id="token-input" name="token" type="password" autocomplete="off" spellcheck="false" required>
           <button type="submit">Connect</button>
         </div>
-        <p class="form-help">The token is kept only in this browser tab's session storage.</p>
+        <p class="form-help">Your login is kept only in this browser tab's session storage.</p>
       </form>
     </section>
 
@@ -69,6 +69,37 @@
     </section>
 
     <div class="dashboard-grid">
+      <section class="card ai-backends-card" aria-labelledby="ai-backends-heading">
+        <div class="card-header"><div><p class="eyebrow">One GPU · one workload</p><h2 id="ai-backends-heading">Shared GPU &amp; backend engines</h2></div><span id="gpu-owner-state" class="tag tag-neutral">Waiting</span></div>
+        <p id="gpu-owner-detail" class="muted">Waiting for backend and ownership metadata.</p>
+        <ul id="backend-registry-list" class="queue-list" aria-label="Configured backend engines"></ul>
+        <p id="backend-registry-empty" class="compact-empty">No backend registry has been reported.</p>
+        <p class="form-help">Source priority selects the next job; its backend selects the compatible engine. A running image or video finishes before higher-priority chat. Enabled means configured, not a successful hardware health test. Direct backend access can bypass this scheduler and must be restricted on the host.</p>
+        <p><a class="quiet-button" href="/settings#backend">Configure backends</a></p>
+      </section>
+
+      <section class="card media-card" aria-labelledby="media-heading">
+        <div class="card-header"><div><p class="eyebrow">Persistent image &amp; video work</p><h2 id="media-heading">ComfyUI media jobs</h2></div><span id="media-state" class="tag tag-neutral">Not reported</span></div>
+        <p id="media-detail" class="muted">Waiting for media status.</p>
+        <dl class="queue-summary"><div><dt>Queued</dt><dd id="media-queued">0</dd></div><div><dt>Dispatching / running</dt><dd id="media-running">0</dd></div><div><dt>Uncertain</dt><dd id="media-uncertain">0</dd></div></dl>
+        <p id="media-error" class="notice notice-error" hidden></p>
+        <p id="media-jobs-empty" class="compact-empty">No retained media jobs.</p>
+        <ul id="media-jobs" class="queue-list" aria-label="Retained media job metadata"></ul>
+        <p id="media-jobs-limit" class="form-help" hidden></p>
+        <p class="form-help">Queued jobs have not started on the GPU. Running jobs keep exclusive GPU ownership until completion and release are verified. Uncertain does not mean stopped. Accepted jobs survive browser disconnects; new submissions during pause are rejected unless that source explicitly allows them.</p>
+        <p id="media-access-help" class="form-help">Open your configured media gateway to create workflows or view results using the same admin credential. A different port may ask you to log in once more because browsers isolate it. Old completed outputs expire according to retention and storage limits.</p>
+        <div id="media-recovery-panel" class="notice notice-warning" hidden>
+          <strong>Manual media recovery · verify the host first</strong>
+          <p id="media-recovery-detail">Pause inference, then stop the old ComfyUI service and verify all of its previous workers have stopped. An idle GPU reading or closed browser alone is not proof.</p>
+          <p>This acknowledgment does not stop ComfyUI, restart a service, reset the GPU or reboot the host. It asks the intermediary to verify safe release and resolve uncertain media work. Previously generated outputs may need review; resubmitting a job can produce duplicates.</p>
+          <label class="recovery-confirm"><input id="media-recovery-confirm" type="checkbox"><span>I have stopped the old ComfyUI service and verified its previous workers are no longer running.</span></label>
+          <button id="media-recovery-acknowledge" class="control-button control-button-warning" type="button" disabled>Acknowledge verified media recovery</button>
+          <p id="media-recovery-control-state" class="form-help">Log in as administrator and pause inference first.</p>
+        </div>
+        <p id="media-recovery-action-status" class="action-status" role="status" aria-live="polite"></p>
+        <p><a class="quiet-button" href="/settings#media">Configure media &amp; cleanup</a></p>
+      </section>
+
       <section class="card maintenance-card" aria-labelledby="maintenance-heading">
         <div class="card-header">
           <div>
@@ -81,7 +112,7 @@
         <div class="maintenance-layout">
           <div class="maintenance-status-panel">
             <h3 id="maintenance-title">Waiting for status…</h3>
-            <p id="maintenance-detail" class="muted">Pause mode can temporarily reserve the GPU for work outside Ollama.</p>
+            <p id="maintenance-detail" class="muted">Pause mode can temporarily reserve the shared GPU for other work.</p>
             <dl class="maintenance-details">
               <div><dt>Automatic resume</dt><dd id="maintenance-resume-at">—</dd></div>
               <div><dt>Time remaining</dt><dd id="maintenance-countdown">—</dd></div>
@@ -91,16 +122,6 @@
           </div>
 
           <div class="maintenance-controls-panel">
-            <form id="maintenance-token-form" class="maintenance-token-form">
-              <label for="maintenance-token-input">Maintenance control token</label>
-              <div class="maintenance-token-row">
-                <input id="maintenance-token-input" name="maintenance-token" type="password" autocomplete="off" spellcheck="false" aria-describedby="maintenance-token-state" required>
-                <button id="maintenance-token-submit" class="control-button control-button-secondary" type="submit">Use token</button>
-                <button id="forget-maintenance-token" class="quiet-button" type="button" hidden>Forget</button>
-              </div>
-              <p id="maintenance-token-state" class="form-help">Enter the separate maintenance token to enable controls.</p>
-            </form>
-
             <div class="maintenance-action-row">
               <div class="duration-control">
                 <label for="pause-duration">Pause duration</label>
@@ -126,7 +147,7 @@
 
         <div id="maintenance-warning" class="notice notice-warning maintenance-warning" role="note">
           <strong>What happens when pause mode starts</strong>
-          <span>The active inference request drains, then Ollama models unload. Queued and new requests receive HTTP 503 by default. Sources explicitly configured to hold paused requests retain only bounded, still-connected requests; expiry and disconnect still cancel them.</span>
+          <span>The active workload finishes, then managed engines release GPU memory. Queued and new HTTP requests receive HTTP 503 by default. Sources explicitly configured to hold paused HTTP requests retain only bounded, still-connected requests; expiry and disconnect still cancel them. Already accepted durable media jobs and Frigate catch-up IDs remain saved for later.</span>
         </div>
       </section>
 
@@ -154,7 +175,7 @@
             <button id="recovery-acknowledge" class="control-button control-button-warning" type="button" disabled>Acknowledge verified recovery</button>
           </details>
         </div>
-        <p id="recovery-control-state" class="form-help">Use the maintenance control token above. Recovery never resumes a manual pause.</p>
+        <p id="recovery-control-state" class="form-help">Log in as administrator to use recovery controls. Recovery never resumes a manual pause.</p>
         <p id="recovery-action-status" class="action-status" role="status" aria-live="polite"></p>
         <p class="muted">Automatic recovery may restart only Ollama when configured. It never resets the GPU or reboots the host. Live priority and one-at-a-time inference still apply.</p>
       </section>
@@ -211,12 +232,7 @@
           <p class="muted">Each view covers its entire saved list. Positions can change as events arrive or jobs finish. Needs attention is a subset of unfinished jobs, not a permanent failure.</p>
         </section>
         <details class="catchup-controls">
-          <summary>Retry and availability controls · Settings admin token required</summary>
-          <form id="catchup-token-form" class="token-form">
-            <label for="catchup-token-input">Settings admin token (separate from dashboard and maintenance tokens)</label>
-            <div class="token-row"><input id="catchup-token-input" type="password" autocomplete="off" spellcheck="false" aria-describedby="catchup-control-state"><button type="submit">Unlock controls</button></div>
-          </form>
-          <div class="catchup-pagination"><button id="catchup-use-saved-token" class="quiet-button" type="button" hidden>Use saved Settings token</button><button id="catchup-lock" class="quiet-button" type="button" hidden>Lock controls</button></div>
+          <summary id="catchup-controls-heading">Retry and availability controls · admin login</summary>
           <p><button id="catchup-refresh" class="quiet-button" type="button" disabled>Recheck Frigate connection</button></p>
           <p class="form-help">Refreshes API and bridge capabilities now. Does not retry jobs, clear the queue, restart services, or bypass an outstanding generation.</p>
           <p id="catchup-control-state" class="muted">Controls are locked. Retrying never bypasses live priority, pause mode, or the active handoff.</p>

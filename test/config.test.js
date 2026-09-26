@@ -1,6 +1,112 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
 import { applyHostEnvironment, normalizeConfig, parseConfigSource, parseDuration } from '../src/config.js';
+import { configuredAdminToken, deriveComfyBridgeToken } from '../src/auth.js';
+
+const backendFixture = () => ({
+  server: { listen: '127.0.0.1:0' },
+  backends: {
+    'ollama-main': { type: 'ollama', url: 'http://192.0.2.10:11434' },
+    'comfy-main': { type: 'comfyui', url: 'http://192.0.2.10:8188' },
+  },
+});
+
+test('single-admin authentication overrides legacy credentials and derives a separate stable machine key', () => {
+  const admin = 'one-private-admin-credential';
+  const raw = { ...backendFixture(), observability: { auth_token: 'old-read' }, maintenance: { auth_token: 'old-control' }, media: { auth_token: 'old-media' } };
+  const config = normalizeConfig(applyHostEnvironment(raw, { ADMIN_TOKEN: admin, MEDIA_TOKEN: 'env-legacy-media' }));
+  assert.equal(config.security.auth_mode, 'single_admin');
+  assert.equal(config.security.admin_token, admin);
+  assert.equal(config.observability.auth_token, admin);
+  assert.equal(config.maintenance.auth_token, admin);
+  const derived = createHmac('sha256', admin).update('ai-intermediary/comfyui-bridge/v1').digest('hex');
+  assert.equal(config.media.auth_token, derived);
+  assert.equal(deriveComfyBridgeToken(admin), derived);
+  assert.notEqual(derived, admin);
+  assert.notEqual(deriveComfyBridgeToken(admin + 'changed'), derived);
+  assert.equal(raw.maintenance.auth_token, 'old-control', 'caller-owned base configuration is unchanged');
+});
+
+test('absent admin secret preserves separate legacy tokens and invalid admin secrets fail closed', () => {
+  const raw = { ...backendFixture(), observability: { auth_token: 'reader' }, maintenance: { auth_token: 'operator' }, media: { auth_token: 'machine' } };
+  const config = normalizeConfig(applyHostEnvironment(raw, { ADMIN_TOKEN: '' }));
+  assert.equal(config.security.auth_mode, 'legacy');
+  assert.equal(config.observability.auth_token, 'reader');
+  assert.equal(config.maintenance.auth_token, 'operator');
+  assert.equal(config.media.auth_token, 'machine');
+  for (const ADMIN_TOKEN of [' ', ' secret', 'secret ', 'line\nbreak', 'null\0byte', 'caf\u00e9', '\u{1f510}-private', 'x'.repeat(4097)]) {
+    assert.throws(() => configuredAdminToken({ ADMIN_TOKEN }), /ADMIN_TOKEN/);
+  }
+  assert.equal(configuredAdminToken({}), '');
+  assert.equal(configuredAdminToken({ ADMIN_TOKEN: 'valid ASCII !@#$%^&*()' }), 'valid ASCII !@#$%^&*()');
+  assert.throws(() => deriveComfyBridgeToken(''), /ADMIN_TOKEN/);
+});
+
+test('legacy upgrade synthesizes Ollama registry without changing source priority or enabling media', () => {
+  const config = normalizeConfig({ server: { listen: '127.0.0.1:0' }, ollama: { url: 'http://ollama:11434' },
+    clients: { odysseus: { priority: 100 }, frigate: { priority: 30 } } });
+  assert.deepEqual(config.backends, { ollama: { type: 'ollama', url: 'http://ollama:11434', enabled: true, resource_group: 'gpu0' } });
+  assert.equal(config.primaryBackend, 'ollama');
+  assert.equal(config.clients.odysseus.priority, 100);
+  assert.equal(config.clients.frigate.priority, 30);
+  assert.equal(config.clients.odysseus.backend, 'ollama');
+  assert.deepEqual(config.clients.odysseus.allowed_backends, ['ollama']);
+  assert.equal(config.clients.media, undefined);
+  assert.equal(config.media.enabled, false);
+  assert.equal(config.media.retentionMs, 168 * 60 * 60 * 1000);
+  assert.equal(config.media.max_idle_utilization_percent, 5);
+});
+
+test('explicit backend registry controls primary URL and independent source mappings', () => {
+  const config = normalizeConfig({ ...backendFixture(), clients: {
+    default: { backend: 'comfy-main' }, odysseus: { priority: 100 },
+    media: { backend: 'comfy-main', allowed_backends: ['comfy-main', 'ollama-main'] },
+  } });
+  assert.equal(config.primaryBackend, 'ollama-main');
+  assert.equal(config.ollama.url, 'http://192.0.2.10:11434');
+  assert.equal(config.clients.odysseus.backend, 'ollama-main', 'source does not inherit a miscellaneous media route');
+  assert.deepEqual(config.clients.odysseus.allowed_backends, ['ollama-main']);
+  assert.equal(config.clients.media.backend, 'comfy-main');
+});
+
+test('backend registry rejects unsupported ownership and incompatible source mappings', () => {
+  const make = (change) => { const value = backendFixture(); change(value); return () => normalizeConfig(value); };
+  assert.throws(make((value) => { value.backends.other = { type: 'unknown', url: 'http://other:8188' }; }), /requires an adapter/);
+  assert.throws(make((value) => { value.backends.other = { type: 'ollama', url: 'http://other:11434' }; }), /exactly one Ollama/);
+  assert.throws(make((value) => { value.backends['comfy-main'].resource_group = 'gpu1'; }), /one shared GPU/);
+  assert.throws(make((value) => { value.backends['ollama-main'].enabled = false; }), /must remain true/);
+  assert.throws(make((value) => { value.backends['comfy-main'].url = 'http://192.0.2.10:11434/'; }), /duplicates/);
+  assert.throws(make((value) => { value.backends['comfy-main'].url = 'http://user:secret@192.0.2.10:8188'; }), /without credentials/);
+  assert.throws(make((value) => { value.clients = { default: { listener_port: 8188 } }; value.backends['comfy-main'].url = 'http://127.0.0.2:8188'; }), /points back/);
+  assert.throws(make((value) => { value.clients = { default: { backend: 'missing' } }; }), /must name a configured backend/);
+  assert.throws(make((value) => { value.clients = { default: { allowed_backends: ['comfy-main'] } }; }), /include the default backend/);
+  assert.throws(make((value) => { value.clients = { frigate: { backend: 'comfy-main' } }; }), /Frigate requests are not ComfyUI/);
+});
+
+test('local media stays fail-closed without token, host helper, reviewed nodes and enabled ComfyUI', () => {
+  const raw = backendFixture(); raw.media = { enabled: true };
+  assert.throws(() => normalizeConfig(raw), /requires host_helper.enabled/);
+  raw.host_helper = { enabled: true };
+  assert.throws(() => normalizeConfig(raw), /ADMIN_TOKEN/);
+  raw.media.auth_token = 'media-test-secret';
+  assert.throws(() => normalizeConfig(raw), /allowed_node_types/);
+  raw.media.allowed_node_types = ['CheckpointLoaderSimple', 'KSampler'];
+  assert.equal(normalizeConfig(raw).media.enabled, true);
+  raw.backends['comfy-main'].enabled = false;
+  assert.throws(() => normalizeConfig(raw), /enabled ComfyUI/);
+});
+
+test('media storage and release thresholds are bounded, and its token is host-configured', () => {
+  const normalize = (media) => normalizeConfig({ ...backendFixture(), media });
+  for (const media of [{ storage_path: '/' }, { state_path: 'relative' }, { max_idle_utilization_percent: 11 },
+    { stable_samples: 1 }, { max_jobs: 0 }, { retention: '0s' }, { max_output_bytes: 20 * 1024 ** 3 },
+    { allowed_node_types: [''] }, { allowed_node_types: [42] }, { max_storage_bytes: Number.MAX_SAFE_INTEGER + 1 }]) {
+    assert.throws(() => normalize(media), /media\./);
+  }
+  const raw = applyHostEnvironment(backendFixture(), { MEDIA_TOKEN: 'a separate secret' });
+  assert.equal(normalizeConfig(raw).media.auth_token, 'a separate secret');
+});
 
 test('host monitoring and automatic recovery remain disabled on an ordinary upgrade', () => {
   const config = normalizeConfig({ server: { listen: '127.0.0.1:0' } });
@@ -18,7 +124,7 @@ test('host monitoring and automatic recovery remain disabled on an ordinary upgr
 test('automatic recovery needs explicit helper installation opt-in and maintenance credentials', () => {
   const normalize = (overlay) => normalizeConfig({ server: { listen: '127.0.0.1:0' }, ...overlay });
   assert.throws(() => normalize({ auto_recovery: { enabled: true } }), /requires host_helper.enabled/);
-  assert.throws(() => normalize({ host_helper: { enabled: true }, auto_recovery: { enabled: true } }), /maintenance.auth_token/);
+  assert.throws(() => normalize({ host_helper: { enabled: true }, auto_recovery: { enabled: true } }), /ADMIN_TOKEN/);
   assert.throws(() => normalize({ host_helper: { enabled: true }, auto_recovery: { enabled: true }, maintenance: { enabled: false, auth_token: 'test' } }), /maintenance.enabled/);
   assert.doesNotThrow(() => normalize({ host_helper: { enabled: true }, auto_recovery: { enabled: true }, maintenance: { enabled: true, auth_token: 'test' } }));
 });

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SETTINGS_API = '/_intermediary/v1/settings';
-const SETTINGS_TOKEN = 'startup-test-settings-token';
+const ADMIN_TOKEN = 'startup-test-administrator-password';
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -31,7 +31,7 @@ async function stopChild(child) {
 }
 
 async function startIntermediary(t, configText, environment = {}) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ollama-intermediary-startup-'));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-intermediary-startup-'));
   const configPath = path.join(directory, 'config.yml');
   const settingsPath = path.join(directory, 'state', 'settings.json');
   fs.writeFileSync(configPath, configText, 'utf8');
@@ -43,7 +43,7 @@ async function startIntermediary(t, configText, environment = {}) {
       CONFIG_PATH: configPath,
       SETTINGS_PATH: settingsPath,
       SETTINGS_RECOVERY_LISTEN: '127.0.0.1:0',
-      SETTINGS_TOKEN,
+      ADMIN_TOKEN,
       LOG_LEVEL: 'info',
       ...environment,
     },
@@ -91,11 +91,11 @@ async function startIntermediary(t, configText, environment = {}) {
     await stopChild(child);
     fs.rmSync(directory, { recursive: true, force: true });
   });
-  return { child, logs, waitForLog };
+  return { child, logs, waitForLog, output: () => output };
 }
 
 function authenticatedHeaders() {
-  return { authorization: `Bearer ${SETTINGS_TOKEN}` };
+  return { authorization: `Bearer ${ADMIN_TOKEN}` };
 }
 
 const VALID_CONFIG = `
@@ -132,6 +132,56 @@ test('valid configuration starts the normal proxy and exposes settings in runnin
   assert.equal(instance.logs.some((entry) => entry.message === 'configuration recovery listener started'), false);
 });
 
+test('official startup refuses missing ADMIN_TOKEN even when old role credentials exist', async (t) => {
+  const instance = await startIntermediary(t, VALID_CONFIG, {
+    ADMIN_TOKEN: '', SETTINGS_TOKEN: 'old-settings', OBSERVABILITY_TOKEN: 'old-read',
+    MAINTENANCE_TOKEN: 'old-maintenance', MEDIA_TOKEN: 'old-media',
+  });
+  await assert.rejects(instance.waitForLog('proxy listener started'), /ADMIN_TOKEN is required/);
+  assert.notEqual(instance.child.exitCode, 0);
+  assert.equal(instance.logs.some((entry) => entry.message === 'configuration recovery listener started'), false);
+  assert.doesNotMatch(instance.output(), /old-settings|old-read|old-maintenance|old-media/);
+});
+
+test('one ADMIN_TOKEN secures all administrative endpoints without exposing secrets', async (t) => {
+  const admin = 'startup-single-admin-private';
+  const instance = await startIntermediary(t, `
+server:
+  listen: 127.0.0.1:0
+  shutdown_grace: 100ms
+ollama:
+  url: http://127.0.0.1:1
+  health_interval: 50ms
+  health_timeout: 50ms
+maintenance:
+  enabled: true
+  auth_token: "\${MAINTENANCE_TOKEN:?required legacy credential}"
+observability:
+  enabled: true
+  auth_token: "\${OBSERVABILITY_TOKEN:?required legacy credential}"
+media:
+  auth_token: "\${MEDIA_TOKEN:?required legacy credential}"
+`, { ADMIN_TOKEN: admin, MAINTENANCE_TOKEN: '', OBSERVABILITY_TOKEN: '', MEDIA_TOKEN: '' });
+  const started = await instance.waitForLog('proxy listener started');
+  const base = `http://127.0.0.1:${started.address.port}`;
+  const headers = { authorization: `Bearer ${admin}` };
+  const response = await fetch(`${base}${SETTINGS_API}`, { headers });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.mode, 'running');
+  assert.equal(body.valid, true);
+  assert.deepEqual(body.authentication, { mode: 'single_admin' });
+  assert.equal(body.diagnostics.some((item) => item.code === 'required_environment_missing'), false);
+  assert.equal(JSON.stringify(body).includes(admin), false);
+  assert.equal((await fetch(`${base}${SETTINGS_API}`, { headers: authenticatedHeaders() })).status, 401);
+  const status = await fetch(`${base}/_intermediary/v1/status`, { headers });
+  assert.equal(status.status, 200);
+  assert.equal((await status.text()).includes(admin), false);
+  const maintenance = await fetch(`${base}/_intermediary/v1/maintenance/pause`, { headers });
+  assert.equal(maintenance.status, 405, 'the same credential reaches method validation without mutating pause state');
+  assert.equal((await fetch(`${base}/_intermediary/v1/status`)).status, 401);
+});
+
 test('host environment opt-ins are parsed strictly and invalid values enter host-fix recovery', async (t) => {
   const instance = await startIntermediary(t, VALID_CONFIG, { HOST_HELPER_ENABLED: '"1"' });
   const started = await instance.waitForLog('configuration recovery listener started');
@@ -164,6 +214,7 @@ observability:
   enabled: false
   ui_enabled: false
 `, {
+    ADMIN_TOKEN: literalToken,
     MAINTENANCE_TOKEN: literalToken,
     NESTED_VALUE: 'must-not-replace',
   });

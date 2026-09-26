@@ -33,6 +33,12 @@ jobs:
       - name: Test isolated host helper with mocked hardware
         run: python3 -m unittest discover -s integrations/host -p 'test_*.py' -v
 
+      - name: Test isolated ComfyUI execution bridge
+        run: python3 -m unittest discover -s integrations/comfyui -p 'test_*.py' -v
+
+      - name: Test machine-credential tooling with mocked Docker
+        run: python3 -m unittest discover -s test -p 'test_configure_comfy_auth.py' -v
+
       - name: Fetch exact Frigate bridge test sources
         shell: bash
         run: |
@@ -57,4 +63,4 @@ jobs:
         run: python3 -m unittest discover -s integrations/frigate -p 'test_*.py' -v
 
       - name: Build container
-        run: docker build --tag ollama-scheduling-proxy:ci .
+        run: docker build --tag ai-intermediary:ci .

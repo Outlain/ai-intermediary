@@ -15,7 +15,7 @@ case "$version" in
   *) echo "version tag must look like v1.0.0" >&2; exit 2 ;;
 esac
 
-bundle_name="ollama-scheduling-proxy-${version}-linux-amd64"
+bundle_name="ai-intermediary-${version}-linux-amd64"
 bundle_directory="${output}/${bundle_name}"
 
 mkdir -p "${bundle_directory}/docs"
@@ -25,12 +25,20 @@ cp secrets.example.env "${bundle_directory}/secrets.example.env"
 cp README.md SECURITY.md "${bundle_directory}/"
 cp docs/INSTALL.md "${bundle_directory}/docs/INSTALL.md"
 cp docs/SOURCES_AND_SCHEDULES.md "${bundle_directory}/docs/SOURCES_AND_SCHEDULES.md"
+cp docs/AI_INTERMEDIARY.md "${bundle_directory}/docs/AI_INTERMEDIARY.md"
+cp docs/COMFYUI_AMD.md "${bundle_directory}/docs/COMFYUI_AMD.md"
+mkdir -p "${bundle_directory}/scripts"
+cp scripts/configure-comfy-auth.py "${bundle_directory}/scripts/"
+mkdir -p "${bundle_directory}/deploy" "${bundle_directory}/integrations/comfyui"
+cp deploy/compose.media.example.yml "${bundle_directory}/deploy/"
+cp deploy/comfyui.service.example deploy/comfyui-rocm.constraints.txt "${bundle_directory}/deploy/"
+cp integrations/comfyui/README.md integrations/comfyui/__init__.py integrations/comfyui/bridge.py "${bundle_directory}/integrations/comfyui/"
 cp docs/HOME_ASSISTANT.md "${bundle_directory}/docs/HOME_ASSISTANT.md"
 cp docs/RELEASING.md "${bundle_directory}/docs/RELEASING.md"
 mkdir -p "${bundle_directory}/integrations/frigate"
 cp integrations/frigate/README.md integrations/frigate/Dockerfile integrations/frigate/apply_bridge.py integrations/frigate/bridge.py "${bundle_directory}/integrations/frigate/"
 mkdir -p "${bundle_directory}/integrations/host"
-cp integrations/host/README.md integrations/host/host_helper.py integrations/host/ollama-intermediary-host.service integrations/host/ollama-intermediary-host.sudoers integrations/host/host-helper.env.example integrations/host/compose.host-helper.example.yml "${bundle_directory}/integrations/host/"
+cp integrations/host/README.md integrations/host/host_helper.py integrations/host/ai-intermediary-host.service integrations/host/ai-intermediary-host.sudoers integrations/host/host-helper.env.example integrations/host/compose.host-helper.example.yml "${bundle_directory}/integrations/host/"
 cp integrations/host/install.py integrations/host/installer-compose.mjs "${bundle_directory}/integrations/host/"
 printf '%s\n' "$version" > "${bundle_directory}/VERSION"
 

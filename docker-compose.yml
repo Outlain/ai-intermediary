@@ -1,10 +1,12 @@
+# AI Intermediary source deployment. Preserve state mounts during updates.
+name: ai-intermediary
 services:
-  ollama-scheduler:
+  ai-intermediary:
     build:
       context: .
       args:
         INTERMEDIARY_BUILD: ${INTERMEDIARY_BUILD:-unknown}
-    container_name: ollama-scheduler
+    container_name: ai-intermediary
     restart: unless-stopped
     init: true
     logging:
@@ -30,7 +32,7 @@ services:
       # Base configuration is intentionally read-only. The settings page writes
       # only a validated override document under /app/state.
       - ./config.yml:/app/config.yml:ro
-      - ollama-scheduler-state:/app/state
+      - ai-intermediary-state:/app/state
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -44,4 +46,4 @@ services:
           memory: 256M
 
 volumes:
-  ollama-scheduler-state:
+  ai-intermediary-state:

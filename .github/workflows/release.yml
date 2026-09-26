@@ -30,6 +30,8 @@ jobs:
           npm run check:public
           npm test
           python3 -m unittest discover -s integrations/host -p 'test_*.py' -v
+          python3 -m unittest discover -s integrations/comfyui -p 'test_*.py' -v
+          python3 -m unittest discover -s test -p 'test_configure_comfy_auth.py' -v
 
       - name: Compute image name
         id: image
@@ -44,13 +46,16 @@ jobs:
         shell: bash
         run: |
           docker buildx create --name release-builder --use
+          tags=(--tag "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}")
+          if [[ "$GITHUB_REF_NAME" != *-* ]]; then
+            tags+=(--tag "${{ steps.image.outputs.name }}:latest")
+          fi
           docker buildx build \
             --build-arg "INTERMEDIARY_BUILD=${GITHUB_SHA}" \
             --platform linux/amd64 \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
-            --tag "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}" \
-            --tag "${{ steps.image.outputs.name }}:latest" \
+            "${tags[@]}" \
             --provenance=mode=max \
             --sbom=true \
             --push \
@@ -60,7 +65,7 @@ jobs:
         id: bundle
         shell: bash
         run: |
-          bundle_name="ollama-scheduling-proxy-${GITHUB_REF_NAME}-linux-amd64"
+          bundle_name="ai-intermediary-${GITHUB_REF_NAME}-linux-amd64"
           sh scripts/package-release.sh "${{ steps.image.outputs.name }}" "$GITHUB_REF_NAME" dist
           echo "archive=dist/${bundle_name}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${bundle_name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
@@ -69,9 +74,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          release_flags=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
           gh release create "$GITHUB_REF_NAME" \
             "${{ steps.bundle.outputs.archive }}" \
             "${{ steps.bundle.outputs.checksum }}" \
             --verify-tag \
             --generate-notes \
-            --title "Ollama Scheduling Proxy ${GITHUB_REF_NAME}"
+            --title "AI Intermediary ${GITHUB_REF_NAME}" \
+            "${release_flags[@]}"

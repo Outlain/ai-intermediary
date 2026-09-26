@@ -215,6 +215,40 @@ test('model management runs exclusively at the next inference boundary', async (
   assert.ok(mock.events.indexOf('/api/pull') < mock.events.indexOf('O2'));
 });
 
+test('model management rechecks admission after media release preflight', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  service.media.prepareOllama = async () => { service.settingsRestartPending = true; };
+  const response = await requestJson(`${proxyUrl}/api/pull`, { model: 'new-model' });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).code, 'shutting_down');
+  assert.equal(mock.events.includes('/api/pull'), false);
+  assert.equal(service.gate.active, false);
+});
+
+test('model management rechecks admission after a slow request body arrives', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  let prepared = false;
+  service.media.prepareOllama = async () => { prepared = true; };
+  const pending = http.request(`${proxyUrl}/api/pull`, { method: 'POST', headers: { 'content-type': 'application/json' } });
+  const responseReady = new Promise((resolve, reject) => {
+    pending.on('response', (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({ status: response.statusCode, body: JSON.parse(Buffer.concat(chunks)) }));
+    });
+    pending.on('error', reject);
+  });
+  pending.write('{"model":');
+  await waitFor(() => prepared);
+  service.settingsRestartPending = true;
+  pending.end('"new-model"}');
+  const response = await responseReady;
+  assert.equal(response.status, 503);
+  assert.equal(response.body.code, 'shutting_down');
+  assert.equal(mock.events.includes('/api/pull'), false);
+  assert.equal(service.gate.active, false);
+});
+
 test('maintenance pause drains active work, fails queues, unloads models, and resumes safely', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ollama-intermediary-proxy-pause-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -497,7 +531,7 @@ test('dashboard assets are same-origin, secured, and contain no external depende
   assert.equal(dashboard.status, 200);
   assert.match(dashboard.headers.get('content-security-policy'), /default-src 'self'/);
   assert.equal(dashboard.headers.get('x-frame-options'), 'DENY');
-  assert.match(html, /Ollama Intermediary/i);
+  assert.match(html, /AI Intermediary/i);
   assert.doesNotMatch(html, /https?:\/\//);
 
   const script = await fetch(`${proxyUrl}/_intermediary/ui/dashboard.js`);

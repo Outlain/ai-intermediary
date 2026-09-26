@@ -1,18 +1,17 @@
 # Sources, pause scopes and schedules
 
-One Ollama backend, one GPU, one inference at a time. This update adds no second
-proxy container, GPU reset or VM reboot. Existing secrets, settings, recovery
-locks, manual maintenance state, Frigate records and tested context caps remain
-in place. New ports and schedules are opt-in; the default source is not changed.
+Ollama and optional ComfyUI backends share one GPU, with one workload executing
+at a time. Sources set priority and route compatible work to a backend. Dedicated
+ports and pause schedules are opt-in. No GPU reset or VM reboot is performed.
 
 ## Sources and priorities
 
-Use **Settings → Sources & ports** with the Settings admin token. Each source has
+Use **Settings → Sources & ports** with `ADMIN_TOKEN`. Each source has
 an enabled flag, numeric priority, queue limit/lifetime, overflow policy,
 follow-up hold and model keep-alive. Larger priorities run first. Equal-priority
 live requests use arrival order across sources and models. Running inference is
 never preempted. Strict priority deliberately allows lower-priority starvation;
-legacy `balanced` mode remains available but its aging/batching settings do not
+Optional `balanced` mode is available, but its aging/batching settings do not
 apply in strict mode.
 
 A follow-up hold delays lower-priority work after a live response. Equal/higher
@@ -22,7 +21,7 @@ memory. Existing exact-model overrides in `models` still take precedence over
 source model policies; most installations should keep `models: {}`.
 
 Identification order: dedicated listener → enabled `X-Ollama-Client` header →
-IP/subnet → legacy model mapping → `scheduler.default_client`. Disabling a source
+IP/subnet → exact-model mapping → `scheduler.default_client`. Disabling a source
 rejects its inference rather than reclassifying it. Cross-source IP overlaps and
 duplicate listener ports are rejected. Empty IP lists disable IP identification.
 Headers and ports are routing hints, **not authentication**; restrict them to
@@ -38,7 +37,7 @@ Only enable forwarded-IP trust behind a proxy that strips untrusted values.
 
    ```yaml
    services:
-     ollama-scheduler:
+     ai-intermediary:
        ports:
          - "11435:11434" # existing main endpoint
          - "11436:11436" # dedicated Odysseus endpoint
@@ -47,9 +46,9 @@ Only enable forwarded-IP trust behind a proxy that strips untrusted values.
 3. Recreate only the intermediary:
 
    ```sh
-   cd /opt/ollama_intermediary
+   cd /opt/ai-intermediary
    docker compose config --quiet
-   docker compose up -d --no-deps ollama-scheduler
+   docker compose up -d --no-deps ai-intermediary
    curl --fail -sS http://127.0.0.1:11436/api/version
    ```
 
@@ -58,8 +57,8 @@ Only enable forwarded-IP trust behind a proxy that strips untrusted values.
    redirect, extra proxy hop or response-port setting.
 
 Settings generates additional port lines but cannot edit Docker or verify host
-publication. No Docker socket is mounted. Legacy `server.dedicated_listeners`
-remain supported and must not duplicate source ports. Runtime port collisions
+publication. No Docker socket is mounted. Explicit `server.dedicated_listeners`
+must not duplicate source ports. Runtime port collisions
 with unrelated host processes mark that source listener unavailable; the main
 Settings endpoint stays available so you can correct the port and apply again.
 
@@ -69,8 +68,8 @@ clients must use the intermediary: direct Ollama requests bypass its safety gate
 
 ## Manual pauses and replay
 
-Existing **Pause inference** reserves the whole GPU: drain active inference,
-block new inference, then unload Ollama. **Source pauses & schedules** instead
+**Pause inference** reserves the whole GPU: drain active work,
+block new work, then verify backend release. **Source pauses & schedules** instead
 pauses selected work without promising GPU release. Select comma-separated
 source names or `*`, and `all`, `live`, or `catchup` traffic. Only Frigate has a
 durable catch-up adapter. Metadata endpoints, discovery, cleanup and saved-result
@@ -87,8 +86,9 @@ them through its API after the pause. This requires catch-up to be enabled,
 retained media, and an event in the configured discovery range (or an explicit
 retained-history scan). It is not replaying cached HTTP request bodies.
 
-Manual scope controls use the maintenance token, not the Settings/dashboard
-token. POST `/_intermediary/v1/maintenance/scopes/pause` accepts
+Manual scope controls use `ADMIN_TOKEN`, the same human credential as Settings
+and Dashboard.
+POST `/_intermediary/v1/maintenance/scopes/pause` accepts
 `{"sources":["frigate"],"traffic":"all","duration":"2h"}`; omit duration for
 an indefinite pause. POST `/_intermediary/v1/maintenance/scopes/resume` accepts
 `{"id":"<returned pause ID>"}`. Resume removes only that manual pause.
@@ -152,4 +152,4 @@ process ownership and missing telemetry still defer; there is no arbitrary
 utilization threshold. RAM, VRAM headroom, tested context cap and one-enlarged-
 dispatch-per-retained-job guards remain. Idle telemetry never clears a recovery
 lock. Temporary refusals appear amber as **Request deferred**, not an Ollama
-generation failure. Your tested cap is neither increased nor reset by migration.
+generation failure. Settings changes do not automatically increase a tested cap.

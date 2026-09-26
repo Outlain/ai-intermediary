@@ -15,11 +15,11 @@ def runtime(**changes):
 
 
 def compose():
-    before = {'name': 'existing', 'services': {'ollama-scheduler': {'environment': {'KEEP': 'yes'},
+    before = {'name': 'existing', 'services': {'ai-intermediary': {'environment': {'KEEP': 'yes'},
               'volumes': [{'type': 'volume', 'source': 'old-state', 'target': '/app/state'}]}},
               'volumes': {'old-state': {'name': 'existing_state'}}}
     after = copy.deepcopy(before)
-    service = after['services']['ollama-scheduler']
+    service = after['services']['ai-intermediary']
     service['group_add'] = ['993']
     service['environment'].update(HOST_HELPER_ENABLED='true', AUTO_RECOVERY_ENABLED='false',
                                   HOST_HELPER_SOCKET_PATH=installer.RUNTIME + '/control.sock')
@@ -51,6 +51,11 @@ class ValidationTests(unittest.TestCase):
     def test_existing_configuration_preserved_or_refused_not_overwritten(self):
         text = installer.environment_text('http://192.0.2.10:11434', '/opt/rocm/bin/amd-smi')
         self.assertEqual(installer.environment_text('http://192.0.2.10:11434', '/opt/rocm/bin/amd-smi', text), text)
+        with_comfy = text + 'COMFYUI_SYSTEMD_UNITS=comfyui.service,comfyui@second.service\n'
+        self.assertEqual(installer.environment_text('http://192.0.2.10:11434', '/opt/rocm/bin/amd-smi', with_comfy), with_comfy)
+        for units in ['ollama.service', '../bad.service', 'one.service,one.service']:
+            with self.assertRaises(installer.SetupError):
+                installer.environment_text('http://192.0.2.10:11434', '/opt/rocm/bin/amd-smi', text + 'COMFYUI_SYSTEMD_UNITS=' + units + '\n')
         for changed in [text.replace('192.0.2.10', '192.0.2.11'), text.replace('/var/lib/', '/somewhere/'), text + 'CUSTOM=yes\n']:
             with self.assertRaises(installer.SetupError):
                 installer.environment_text('http://192.0.2.10:11434', '/opt/rocm/bin/amd-smi', changed)
@@ -60,14 +65,38 @@ class ValidationTests(unittest.TestCase):
         installer.validate_compose_change(before, after, 993)
         for mutate in [
             lambda v: v.update(name='different-project'),
-            lambda v: v['services']['ollama-scheduler']['volumes'][0].update(source='new-empty-state'),
-            lambda v: v['services']['ollama-scheduler'].update(privileged=True),
-            lambda v: v['services']['ollama-scheduler']['environment'].update(AUTO_RECOVERY_ENABLED='true'),
-            lambda v: v['services']['ollama-scheduler']['volumes'][1].update(read_only=False),
+            lambda v: v['services']['ai-intermediary']['volumes'][0].update(source='new-empty-state'),
+            lambda v: v['services']['ai-intermediary'].update(privileged=True),
+            lambda v: v['services']['ai-intermediary']['environment'].update(AUTO_RECOVERY_ENABLED='true'),
+            lambda v: v['services']['ai-intermediary']['volumes'][1].update(read_only=False),
         ]:
             changed = copy.deepcopy(after); mutate(changed)
             with self.assertRaises(installer.SetupError):
                 installer.validate_compose_change(before, changed, 993)
+
+    def test_canonical_service_keeps_existing_state_mount(self):
+        before, after = compose()
+        installer.validate_compose_change(before, after, 993)
+        self.assertEqual(installer.ACCOUNT, 'ai-intermediary-host')
+        self.assertEqual(installer.RUNTIME, '/run/ai-intermediary-host')
+        self.assertEqual(after['volumes']['old-state']['name'], 'existing_state')
+        before['services']['different-service'] = before['services'].pop('ai-intermediary')
+        with self.assertRaises(installer.SetupError):
+            installer.validate_compose_change(before, after, 993)
+
+    def test_conflicting_helper_cannot_run_with_independent_restart_budget(self):
+        safe = ['LoadState=not-found\n',
+                'LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n',
+                'LoadState=masked\nActiveState=inactive\nUnitFileState=masked\n']
+        for value in safe:
+            with mock.patch.object(installer, 'run', return_value=value):
+                installer.validate_no_conflicting_helper()
+        unsafe = ['', 'LoadState=loaded\nActiveState=active\nUnitFileState=disabled\n',
+                  'LoadState=loaded\nActiveState=inactive\nUnitFileState=enabled\n',
+                  'LoadState=loaded\nActiveState=activating\nUnitFileState=disabled\n']
+        for value in unsafe:
+            with mock.patch.object(installer, 'run', return_value=value), self.assertRaises(installer.SetupError):
+                installer.validate_no_conflicting_helper()
 
     def test_incomplete_telemetry_does_not_finish_setup(self):
         good = {'protocol': 'ollama-intermediary-host-v1', 'managed_ollama_origin': 'http://192.0.2.10:11434',
@@ -98,7 +127,7 @@ class InstallationTests(unittest.TestCase):
             setup.origin = 'http://192.0.2.10:11434'; setup.gid = 993
             setup.before, _ = compose()
             commands = []
-            staged = 'services: {ollama-scheduler: {group_add: [993]}}\n'
+            staged = 'services: {ai-intermediary: {group_add: [993]}}\n'
             good = {'protocol': 'ollama-intermediary-host-v1', 'managed_ollama_origin': setup.origin,
                     'service': {'active': True}, 'telemetry': {'available': True, 'gpus': [{'processes_known': True, 'vram_total_bytes': 1}]}}
 
@@ -120,6 +149,7 @@ class InstallationTests(unittest.TestCase):
                     mock.patch.object(installer.Path, 'home', return_value=root), \
                     mock.patch.object(setup, 'prepare_override', return_value=staged), \
                     mock.patch.object(setup, 'still_paused'), \
+                    mock.patch.object(installer, 'validate_no_conflicting_helper'), \
                     mock.patch.object(setup, 'compose', side_effect=compose_call), \
                     mock.patch.object(setup, 'container', return_value=runtime(telemetry_verified=True)):
                 setup.install()
@@ -127,7 +157,7 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual((setup.backup / 'docker-compose.override.yml').read_text(), '# original override\n')
             restarts = [v for v in commands if 'restart' in v]
             self.assertEqual(restarts, [['sudo', '/usr/bin/systemctl', 'restart', installer.SERVICE]])
-            self.assertIn(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ollama-scheduler'], commands)
+            self.assertIn(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ai-intermediary'], commands)
             joined = json.dumps(commands)
             for forbidden in ['reboot', 'gpu-reset', 'down', 'restart ollama.service']:
                 self.assertNotIn(forbidden, joined)

@@ -1,6 +1,22 @@
-# Ollama Scheduling Proxy
+# AI Intermediary
 
-A streaming reverse proxy for multiple applications sharing one Ollama server and one GPU. It runs at most one inference at a time, uses configurable priorities (Odysseus first by default), and recovers missing Frigate descriptions through a persistent backlog. See [sources, dedicated ports and pause schedules](docs/SOURCES_AND_SCHEDULES.md) for the new controls and migration steps.
+A local AI scheduler for applications sharing one GPU: streaming Ollama requests
+and opt-in, durable ComfyUI image/video workflows use the same exclusive gate.
+Sources control priorities; configurable backends control where compatible work
+runs. It also recovers missing Frigate descriptions through a persistent backlog.
+See [the AI/ComfyUI setup guide](docs/AI_INTERMEDIARY.md) and
+[sources, dedicated ports and pause schedules](docs/SOURCES_AND_SCHEDULES.md).
+For an Ubuntu AMD host, the [ComfyUI installation recipe](docs/COMFYUI_AMD.md)
+covers the isolated Python environment, protected service and first local image workflow.
+
+**AI Intermediary 2.0:** media is disabled by default. ComfyUI requires the
+bundled execution bridge, read-only host ownership telemetry, private networking and tested local
+workflows. Automated mock tests are not a real AMD GPU deployment validation.
+
+The initial backend adapters support one Ollama instance and multiple ComfyUI
+instances in one GPU resource group. New backend software needs an adapter;
+adding a URL cannot safely support an arbitrary execution protocol. Media jobs
+are non-preemptive: an already-running video finishes before a new chat starts.
 
 The supplied defaults target these workloads without tying them to particular model names:
 
@@ -15,15 +31,15 @@ Tagged releases publish two artifacts:
 - A versioned Linux `amd64` container image in GitHub Container Registry.
 - A small deployment bundle containing Compose, configuration templates, documentation, and a SHA-256 checksum.
 
-Once a version has actually been published on [GitHub Releases](https://github.com/Outlain/ollama_intermediary/releases), use its tag below. The version in source code alone does not mean that an image or release exists yet.
+Once a version has actually been published on [GitHub Releases](https://github.com/Outlain/ai-intermediary/releases), use its tag below. The version in source code alone does not mean that an image or release exists yet.
 
 ```sh
-gh release download v1.0.0 \
-  --repo Outlain/ollama_intermediary \
-  --pattern 'ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz*'
-sha256sum -c ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz.sha256
-tar -xzf ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz
-cd ollama-scheduling-proxy-v1.0.0-linux-amd64
+gh release download v2.0.0 \
+  --repo Outlain/ai-intermediary \
+  --pattern 'ai-intermediary-v2.0.0-linux-amd64.tar.gz*'
+sha256sum -c ai-intermediary-v2.0.0-linux-amd64.tar.gz.sha256
+tar -xzf ai-intermediary-v2.0.0-linux-amd64.tar.gz
+cd ai-intermediary-v2.0.0-linux-amd64
 cp config.example.yml config.yml
 cp secrets.example.env secrets.env
 chmod 600 secrets.env
@@ -42,12 +58,12 @@ cp secrets.example.env secrets.env
 # Edit secrets.env with the real backend and optional Frigate source CIDR.
 docker compose up -d --build
 curl http://127.0.0.1:11435/readyz
-curl http://127.0.0.1:11435/status
+# Open /debug and sign in with ADMIN_TOKEN to inspect protected status.
 ```
 
-Open `http://<docker-host>:11435/debug` for the live read-only dashboard. It uses the same listener and does not require another port.
+Open `http://<docker-host>:11435/debug` for the live dashboard. It uses the same listener and does not require another port.
 
-Open `http://<docker-host>:11435/settings` for protected, structured configuration. Enter the separate `SETTINGS_TOKEN` from `secrets.env`; the browser keeps it only in that tab's session storage.
+Open `http://<docker-host>:11435/settings` for protected, structured configuration. Use the same `ADMIN_TOKEN` from `secrets.env` for Dashboard, Settings, maintenance, recovery, catch-up controls and media. Dashboard and Settings share this login within the browser tab's session storage. A dedicated media port is a different browser origin and may ask for the same password once there too.
 
 Then change each application's Ollama base URL to `http://<docker-host>:11435`. If possible, configure one of these headers:
 
@@ -56,7 +72,7 @@ X-Ollama-Client: odysseus
 X-Ollama-Client: frigate
 ```
 
-Dedicated listeners win, then enabled client headers, then source IP/subnet mappings, legacy model mappings, and `scheduler.default_client`. The supplied configuration retains the `odysseus` fallback for compatibility. For more sources, assign Odysseus a dedicated port, verify routing, then optionally add `misc` as the default. Cross-source IP overlaps and duplicate listener ports are rejected. The example contains no model mappings, so every model works automatically.
+Dedicated listeners win, then enabled client headers, then source IP/subnet mappings, exact-model mappings, and `scheduler.default_client`. The supplied configuration uses `odysseus` as the fallback source. For more sources, assign Odysseus a dedicated port, verify routing, then optionally add `misc` as the default. Cross-source IP overlaps and duplicate listener ports are rejected. The example contains no model mappings, so every model works automatically.
 
 `clients` are workload-policy identities, not model registrations. They let the proxy give interactive Odysseus work higher priority while applying short TTL and overflow rules to Frigate. Each client's `model_policy` applies to every model that client requests. The `models` section is empty by default and exists only for rare exact-model overrides.
 
@@ -66,7 +82,7 @@ The container publishes host port `11435` to proxy port `11434`. The real Ollama
 
 Inference endpoints enter an in-memory queue. A single dispatcher is the only code path that can open a scheduled generation request to Ollama.
 
-`scheduler.mode: strict_priority` is the default, including for older configuration files without a mode field. At each dispatch boundary:
+`scheduler.mode: strict_priority` is the default. At each dispatch boundary:
 
 1. Expired and disconnected live HTTP requests are removed.
 2. Eligible live requests use numeric priority (larger first), then arrival order across all sources and models. There is no hard-coded Odysseus exception.
@@ -77,7 +93,7 @@ Active inference is never interrupted to give another client a turn. In strict m
 
 For `O1 F1 O2 F2 O3`, when the later requests arrive while O1 runs, the order is `O1 O2 O3`, the idle hold, then `F1 F2` if no new Odysseus request arrives.
 
-For deployments that intentionally want the old fairness/affinity behavior, explicitly choose `scheduler.mode: balanced`. Only that compatibility mode applies priority aging, `max_wait` promotion, and model batch limits. A `max_wait` of zero disables forced promotion; it does not mean immediate expiration. Queue TTL is a separate setting in both modes.
+For deployments that want fairness and model affinity instead of strict priority, choose `scheduler.mode: balanced`. Only that mode applies priority aging, `max_wait` promotion, and model batch limits. A `max_wait` of zero disables forced promotion; it does not mean immediate expiration. Queue TTL is a separate setting in both modes.
 
 ### Lease versus Ollama keep-alive
 
@@ -139,16 +155,20 @@ Docker Compose loads `secrets.env` into the container. The YAML loader parses YA
 ```dotenv
 OLLAMA_URL=http://192.0.2.10:11434
 FRIGATE_SOURCE=192.0.2.50/32
-OBSERVABILITY_TOKEN=
-SETTINGS_TOKEN=
-MAINTENANCE_TOKEN=
+ADMIN_TOKEN=
 FRIGATE_URL=
 FRIGATE_USERNAME=
 FRIGATE_PASSWORD=
 FRIGATE_AUTH_TOKEN=
 ```
 
-`OLLAMA_URL` and `MAINTENANCE_TOKEN` are required by the supplied base configuration, and `SETTINGS_TOKEN` is required to use the settings page/API. Generate each administrative token independently with `openssl rand -hex 32`. `SETTINGS_TOKEN` protects configuration reads and changes; `MAINTENANCE_TOKEN` authorizes pause/resume. Neither should be reused as the optional read-only `OBSERVABILITY_TOKEN`. `FRIGATE_SOURCE` can remain blank until Frigate is connected, or when Frigate sends `X-Ollama-Client: frigate`. The supplied `scheduler.default_client: odysseus` setting means an unmatched source automatically receives the Odysseus policy; Odysseus's changing container IP never needs to be configured. `secrets.env` is ignored by Git and excluded from the Docker build context.
+Set `OLLAMA_URL` and a strong `ADMIN_TOKEN` before starting a new installation. Generate one with `openssl rand -hex 32`, or use a strong printable-ASCII password without leading/trailing whitespace. The maximum is 4,096 characters. This single credential unlocks Dashboard, Settings, maintenance, recovery, catch-up controls and media. It remains host-managed and cannot be viewed or changed through Settings.
+
+ComfyUI still needs a machine credential to keep its raw execution port protected, but you do not need to create or remember another password. Host setup derives and provisions it from `ADMIN_TOKEN` using [scripts/configure-comfy-auth.py](scripts/configure-comfy-auth.py); the derived value cannot log into the intermediary. After changing `ADMIN_TOKEN`, recreate the intermediary, rerun provisioning and restart ComfyUI when safely idle so both sides use the new machine credential. See the [AI/ComfyUI guide](docs/AI_INTERMEDIARY.md).
+
+**Privilege tradeoff:** the single password grants administrative access, even when used by a status-only consumer such as Home Assistant or a metrics scraper. Do not share it with untrusted viewers. Single-admin mode does not provide a separate read-only credential. Protect connections and keep the service on a trusted private network; the password does not add TLS or protect ordinary Ollama-compatible inference routes.
+
+`FRIGATE_SOURCE` can remain blank until Frigate is connected, or when Frigate sends `X-Ollama-Client: frigate`. The supplied `scheduler.default_client: odysseus` setting means an unmatched source automatically receives the Odysseus policy; Odysseus's changing container IP never needs to be configured. Frigate's own optional login credentials remain separate because they authenticate to another application. `secrets.env` is ignored by Git and excluded from the Docker build context.
 
 The `192.0.2.0/24` addresses above are documentation placeholders. Replace them with addresses valid for your deployment.
 
@@ -159,14 +179,14 @@ The settings page edits an allowlisted set of application settings such as the O
 Configuration has three deliberately separate owners:
 
 - `config.yml` is the read-only base configuration managed on the host.
-- `/app/state/settings.json` contains validated, versioned browser overrides. It lives in the existing `ollama-scheduler-state` volume and takes precedence over matching base values.
+- `/app/state/settings.json` contains validated, versioned browser overrides. It lives in the persistent volume mounted at `/app/state` and takes precedence over matching base values. Preserve the same physical volume identity, including its Compose project prefix, during updates.
 - `secrets.env` remains host-only. The page reports only whether a token is configured; it never returns or changes token values.
 
 Docker Compose is also host-only. The container has neither the Compose file nor the Docker socket mounted for writing, so the page cannot change ports, mounts, restart policy, image tags, memory limits, or Docker networking. Keep machine-specific Compose changes in the ignored `docker-compose.override.yml`, not in the tracked base file.
 
 Use **Validate changes** before **Apply settings**. Apply atomically saves the override plus one last-known-good revision, stops admitting new inference, and waits for already-dispatched work to finish before beginning shutdown and exiting with status 75. The supplied Compose `restart: unless-stopped` policy starts it again with the new values. A systemd installation needs `Restart=on-failure`; a foreground `node` process must be started again manually.
 
-If a safely editable setting prevents normal startup, the service enters a restricted configuration-recovery mode on the same container listener. `/settings` and `/healthz` remain available, `/readyz` and `/status` return HTTP 503 with `configuration_invalid`, and inference receives HTTP 503 until a valid configuration is applied and the supervisor restarts the service. Invalid YAML, a missing host-managed token, a bad volume mount, or a listener/Compose problem still requires a host-side fix. `SETTINGS_TOKEN` must be present in `secrets.env` even in recovery mode; without it, the static page loads but the settings API remains locked.
+If a safely editable setting prevents normal startup, the service enters a restricted configuration-recovery mode on the same container listener. `/settings` and `/healthz` remain available, `/readyz` and `/status` return HTTP 503 with `configuration_invalid`, and inference receives HTTP 503 until a valid configuration is applied and the supervisor restarts the service. Invalid YAML, a missing host-managed token, a bad volume mount, or a listener/Compose problem still requires a host-side fix. The same `ADMIN_TOKEN` protects Settings in recovery mode; without it, the settings API remains locked.
 
 Because saved overrides take precedence, later edits to an overridden field in `config.yml` will not change that field until its saved override is reset. The page always displays the effective values, their revision, validation diagnostics, and whether the service is running normally or in configuration recovery.
 
@@ -202,14 +222,14 @@ When `/status` reports `backend.state: recovery_required`:
 
 1. Check `ollama ps` and `sudo rocm-smi --showmeminfo vram --showpids` on the host.
 2. Restart Ollama if necessary while inference is paused. If substantial unexplained VRAM usage or driver errors remain, stop and investigate the host; do not clear the lock or repeatedly restart services. GPU resets and host reboots are outside the recovery integration's authority.
-3. Keep maintenance paused, with no active inference or management operation. Acknowledge recovery only after checking physical GPU state: `POST /_intermediary/v1/recovery/acknowledge`, authenticated with `MAINTENANCE_TOKEN`, and JSON `{"confirm_gpu_recovered":true}`. The endpoint checks a fresh Ollama loaded-model list and requires it to be empty; it does not reset the GPU or independently prove that driver allocations are gone.
+3. Keep maintenance paused, with no active inference or management operation. Acknowledge recovery only after checking physical GPU state: `POST /_intermediary/v1/recovery/acknowledge`, authenticated with `ADMIN_TOKEN`, and JSON `{"confirm_gpu_recovered":true}`. The endpoint checks a fresh Ollama loaded-model list and requires it to be empty; it does not reset the GPU or independently prove that driver allocations are gone.
 4. Recovery acknowledgment leaves maintenance paused. Resume explicitly, then confirm `/readyz` returns 200 before sending inference again.
 
 The recovery latch is intentionally not cleared by an HTTP health probe: `/api/tags` can succeed while ROCm still holds orphaned VRAM.
 
-### Optional bounded self-recovery and physical GPU monitoring (1.4)
+### Optional bounded self-recovery and physical GPU monitoring
 
-This update does not silently grant host permissions. `host_helper.enabled` and `auto_recovery.enabled` default to `false`, including when upgrading an old configuration. Install and validate the [Linux host helper](integrations/host/README.md), explicitly mount its protected Unix socket directory into the intermediary, and then enable the features. No Frigate image rebuild is needed; the existing pinned description bridge is unchanged.
+Host permissions are an explicit opt-in. `host_helper.enabled` and `auto_recovery.enabled` default to `false`. Install and validate the [Linux host helper](integrations/host/README.md), explicitly mount its protected Unix socket directory into the intermediary, and then enable the features. Host telemetry and recovery are independent of the Frigate description bridge.
 
 For standard Ubuntu/Compose deployments, the guided setup is `python3 integrations/host/install.py` on the Ollama host as your normal Docker user, after pausing inference. It previews changes, asks for confirmation/sudo, backs up and safely merges configuration, verifies AMD telemetry, and recreates only the intermediary. `--check` performs preflight without installation. Automatic recovery remains off until enabled in Settings. This is our custom integration using AMD's existing tools, not an AMD-provided service; the container is not given host installation privileges.
 
@@ -219,20 +239,19 @@ For a recoverable uncertain operation, automatic recovery keeps inference admiss
 
 Defaults require **3 stable samples**, empty Ollama loaded-model state, no reported GPU processes, and at most **512 MB baseline VRAM per GPU** after the service restart. The allowance accounts for idle display/driver use; it is not a VRAM target or a context-size setting. The application permits at most **2 restart attempts per recovery incident**, also bounded to **2 per rolling hour** with a **5-minute cooldown**. After two unsuccessful attempts for the same incident, waiting another hour does not reset that incident's limit; persistent failure needs operator investigation. The host helper independently enforces the rolling-hour ceiling and cooldown with persisted state, so restarting the container cannot reset the limit. Missing telemetry, a refused/failed restart, unchanged service identity, persistent GPU activity, or exhausted limits leave recovery blocked with an explicit status instead of pretending it succeeded.
 
-An existing manual maintenance pause is never overridden or automatically resumed. **Check recovery now** is a maintenance-token-protected explicit action; it cannot bypass either the per-incident or rolling restart limits, shorten the cooldown, or resume a paused service. **Acknowledge verified recovery** remains the operator-only fallback after actual host checks. The recovery panel explains what is blocked rather than simultaneously claiming that inference is running normally.
+An existing manual maintenance pause is never overridden or automatically resumed. **Check recovery now** is an administrator-authenticated explicit action; it cannot bypass either the per-incident or rolling restart limits, shorten the cooldown, or resume a paused service. **Acknowledge verified recovery** remains the operator-only fallback after actual host checks. The recovery panel explains what is blocked rather than simultaneously claiming that inference is running normally.
 
-Host-only paths (`host_helper.socket_path`, `auto_recovery.state_path`) are not browser-editable. Other settings are validated and allowlisted in the settings page; automatic recovery requires the helper and a configured maintenance credential. For older operator-owned YAML files, `HOST_HELPER_ENABLED`, `HOST_HELPER_SOCKET_PATH`, and `AUTO_RECOVERY_ENABLED` can establish the base values through `secrets.env`; saved browser overrides still take precedence. Accepted boolean environment values are exactly `true`, `false`, `1`, or `0`.
+Host-only paths (`host_helper.socket_path`, `auto_recovery.state_path`) are not browser-editable. Other settings are validated and allowlisted in the settings page; automatic recovery requires the helper and `ADMIN_TOKEN`. `HOST_HELPER_ENABLED`, `HOST_HELPER_SOCKET_PATH`, and `AUTO_RECOVERY_ENABLED` can establish base values through `secrets.env`; saved browser overrides still take precedence. Accepted boolean environment values are exactly `true`, `false`, `1`, or `0`.
 
 The helper also enforces its own 512 MiB post-restart residual-VRAM ceiling. Lowering the application's `max_idle_vram_mb` makes its verification stricter; increasing it above 512 does not bypass that separate host check. A host whose normal idle baseline exceeds the helper ceiling requires operator investigation rather than simply increasing a browser setting.
 
 This is failure containment and bounded recovery, not a guarantee against AMD driver faults. A context-window overflow is a definite rejected request, not a reason to restart Ollama. Fix its input sizing/context separately. If driver allocations persist after the allowed service restart, recovery requires operator attention; automatic GPU resets and host rebooting are intentionally not implemented.
 
-### Recovery reconciliation and host RAM guards (1.6)
+### Recovery reconciliation and host RAM guards
 
-Update **both the intermediary and the host helper** for this upgrade. The
-[upgrade procedure](integrations/host/README.md#upgrading-to-16) preserves saved
-jobs, credentials, recovery records, and restart limits. No Frigate rebuild is
-needed. Version numbers in source do not imply that an image has been published.
+Install the matching intermediary and host helper versions using the
+[host setup guide](integrations/host/README.md). Preserve saved jobs, credentials,
+recovery records and restart limits when updating either component.
 
 - A transient busy-GPU reading immediately after an Ollama restart no longer
   strands the incident indefinitely. The intermediary rechecks the same durable
@@ -243,7 +262,7 @@ needed. Version numbers in source do not imply that an image has been published.
 - A systemd/operator restart can be adopted without an extra helper restart if
   the helper has prior durable worker observations and proves that the new
   service started after the incident, the old workers are gone, and the GPU is
-  idle. Empty VRAM alone never qualifies. Legacy uncertain records without this
+  idle. Empty VRAM alone never qualifies. Uncertain records without this
   evidence still need manual host verification.
 - Host telemetry now includes VM RAM total/available, swap total/used, optional
   Linux memory-pressure measurements, and the system-wide OOM-kill counter since
@@ -319,17 +338,17 @@ The low-rate cleanup pass removes confirmed deleted events or missing required m
 
 Only completed/skipped metadata rows roll off at the history limit. The existing pending backlog and lifetime completed/skipped totals remain separate, and no Frigate description or camera media is deleted. Existing history that already rolled off before an upgrade cannot be recovered by raising the limit.
 
-`GET /_intermediary/v1/status` exposes `frigate.state`, `frigate.counts` (`pending`, `waiting_live`, `waiting_result`, `retrying`), `frigate.attention_count`, and persistent `frigate.totals.completed` / `frigate.totals.skipped`. Existing count keys remain compatible; `waiting_result` includes generation and saved-result verification, and `attention_count` overlaps unfinished work. New `bridge_mode`, `verifying_count`, `max_verifying`, and per-job `phase` distinguish native execution from saving; `active_job` identifies the native generation slot, not finished attempts merely awaiting a saved result. Recent jobs show reasons; connection or state-store failures appear as degraded/error state. To request the historical missing-description scan, use `POST /_intermediary/v1/frigate/scan` with `SETTINGS_TOKEN` and JSON `{"confirm":true}`. The scan requests work; it does not synchronously generate every description. Home Assistant examples are in [docs/HOME_ASSISTANT.md](docs/HOME_ASSISTANT.md).
+`GET /_intermediary/v1/status` exposes `frigate.state`, `frigate.counts` (`pending`, `waiting_live`, `waiting_result`, `retrying`), `frigate.attention_count`, and persistent `frigate.totals.completed` / `frigate.totals.skipped`. Existing count keys remain compatible; `waiting_result` includes generation and saved-result verification, and `attention_count` overlaps unfinished work. New `bridge_mode`, `verifying_count`, `max_verifying`, and per-job `phase` distinguish native execution from saving; `active_job` identifies the native generation slot, not finished attempts merely awaiting a saved result. Recent jobs show reasons; connection or state-store failures appear as degraded/error state. To request the historical missing-description scan, use `POST /_intermediary/v1/frigate/scan` with `ADMIN_TOKEN` and JSON `{"confirm":true}`. The scan requests work; it does not synchronously generate every description. Home Assistant examples are in [docs/HOME_ASSISTANT.md](docs/HOME_ASSISTANT.md).
 
 The dashboard separates **Waiting**, **Awaiting result**, **Retrying**, **Needs attention**, **Completed**, and **Skipped** views. Each paginates the whole matching saved set, not just a filter over the first visible page. **Needs attention** is a subset of unfinished work, not an additional queue; it remains flagged during a later outstanding attempt and must not be added to the pending total. `GET /_intermediary/v1/frigate/jobs?view=waiting&offset=0&limit=30` uses the same read authentication as catch-up status. Supported views are `all` (the default active backlog), `waiting`, `awaiting`, `retrying`, `attention`, `completed`, and `skipped`; `limit` accepts 1–100. Pages can shift as jobs arrive or finish. Completed/skipped views are bounded history, not an unlimited archive.
 
-**Retry when idle** requests an earlier opportunity for an eligible retrying job; **Recheck availability** revisits a known unavailable item. These use `POST /_intermediary/v1/frigate/retry` or `/recheck` with `SETTINGS_TOKEN` and JSON `{"confirm":true,"kind":"object","id":"FRIGATE_EVENT_ID"}` (`kind` may also be `review`). They revalidate the current item and never bypass live priority, maintenance/GPU safety, or the outstanding-handoff guard. The read-only dashboard token alone cannot perform these actions. An already saved description is preserved at the final fresh check, subject to the Frigate race limitation above.
+**Retry when idle** requests an earlier opportunity for an eligible retrying job; **Recheck availability** revisits a known unavailable item. These use `POST /_intermediary/v1/frigate/retry` or `/recheck` with `ADMIN_TOKEN` and JSON `{"confirm":true,"kind":"object","id":"FRIGATE_EVENT_ID"}` (`kind` may also be `review`). They revalidate the current item and never bypass live priority, maintenance/GPU safety, or the outstanding-handoff guard. An already saved description is preserved at the final fresh check, subject to the Frigate race limitation above.
 
 The **Awaiting result** view distinguishes **Preparing in Frigate**, **Queued for GPU**, **Generating**, **Awaiting saved description**, and **Outcome uncertain**. In correlated mode, awaiting-save rows do not hold the generation slot unless their configured cap is full. In compatibility mode, **Waiting result** can still remain for the confirmation window (`generation_timeout`, normally 10 minutes), even after an inference error: the proxy cannot safely attribute an untagged native failure to a particular job. The dashboard states which mode is active instead of implying that the GPU is continuously generating. Repeated context-size errors still require fixing the Frigate request/model context; this pipeline improvement does not make an oversized request fit.
 
-After installing or changing the bridge, **Recheck Frigate connection** under the dashboard's settings-token-protected catch-up controls refreshes capabilities immediately instead of waiting for the normal five-minute probe. Its API is `POST /_intermediary/v1/frigate/refresh` with `SETTINGS_TOKEN` and `{"confirm":true}`. It is rate-limited to once per five seconds and coalesces concurrent probes. It does not start a historical scan, retry jobs, clear an outstanding handoff, restart a service, or change pause/recovery guards.
+After installing or changing the bridge, **Recheck Frigate connection** under the dashboard's administrator-authenticated catch-up controls refreshes capabilities immediately instead of waiting for the normal five-minute probe. Its API is `POST /_intermediary/v1/frigate/refresh` with `ADMIN_TOKEN` and `{"confirm":true}`. It is rate-limited to once per five seconds and coalesces concurrent probes. It does not start a historical scan, retry jobs, clear an outstanding handoff, restart a service, or change pause/recovery guards.
 
-For nearby catch-up jobs, a Frigate model `keep_alive` of `2m` can reduce unnecessary unload/reload cycles while leaving scheduling priority unchanged. The supplied new-install example uses this value. Existing host or saved settings are **not overwritten**: check **Settings → Frigate → Ollama keep-alive**, and, when upgrading an earlier configuration, change **Catch-up → Maximum retry delay** from an explicit `1h` to `5h` if you want the new recommended cap. Keep-alive is not idle hold, generation timeout, or a reservation of the GPU; Odysseus remains higher priority and model switching still follows GPU-safety cleanup.
+For nearby catch-up jobs, a Frigate model `keep_alive` of `2m` can reduce unnecessary unload/reload cycles while leaving scheduling priority unchanged. The supplied configuration uses this value and a `5h` maximum retry delay. Configure them under **Settings → Frigate → Ollama keep-alive** and **Catch-up → Maximum retry delay**. Keep-alive is not idle hold, generation timeout, or a reservation of the GPU; Odysseus remains higher priority and model switching still follows GPU-safety cleanup.
 
 `frigate.eligibility_skipped` counts discovery observations by exclusion reason, not distinct events: overlapping or repeated scans can count the same item again. Camera warnings and these counts help explain why a missing description is not eligible; they are not failed-generation totals.
 
@@ -337,7 +356,7 @@ Before enabling unattended recovery, test one retained object and one ended revi
 
 ### Error-only context rescue
 
-Optional **Settings → Catch-up → Conservative context rescue** can rescue one confirmed overflow without changing normal Frigate context or its upstream frame selection. It defaults **off** on both new installs and upgrades. Configure the exact model tag and a maximum context you have independently tested on that model/GPU/Ollama setup; there is deliberately no automatic 32 GB “safe cap.” The existing pinned Frigate bridge and enabled, backend-matched host monitoring are required; neither integration needs rebuilding for this feature. Automatic service restart can remain disabled.
+Optional **Settings → Catch-up → Conservative context rescue** can rescue one confirmed overflow without changing normal Frigate context or its upstream frame selection. It defaults **off**. Configure the exact model tag and a maximum context you have independently tested on that model/GPU/Ollama setup; there is deliberately no automatic 32 GB “safe cap.” The pinned Frigate bridge and enabled, backend-matched host monitoring are required. Automatic service restart can remain disabled.
 
 - Only a complete HTTP 400 typed `exceed_context_size_error`, with valid numeric input/context counts, qualifies. Generic 400s, output-format failures, partial responses, socket failures and GPU/OOM errors do not.
 - The first confirmed overflow records counts and a request fingerprint, not prompts, images or output text. After the native attempt ends, the job follows its normal retry backoff and fresh media/description checks. A later correlated request must match that complete original input, model, options and backend; changed input cannot borrow an old measurement.
@@ -363,25 +382,25 @@ Model-management and other unsafe pass-through operations also receive the maint
 
 The pause endpoint returns HTTP 202 as soon as the pause record is safely persisted. Drain and unload then continue in the background; accepting the command is not yet proof that the GPU is free.
 
-The simplest control surface is the **Pause mode** card at `http://<docker-host>:11435/debug`. Enter the separate maintenance token, choose **Manual** or a duration, and wait for the card to report both **Paused** and **GPU released: Yes**. The dashboard retains that credential only in the current browser tab's session storage.
+The simplest control surface is the **Pause mode** card at `http://<docker-host>:11435/debug`. Sign in once with `ADMIN_TOKEN`, choose **Manual** or a duration, and wait for the card to report both **Paused** and **GPU released: Yes**. There is no second maintenance password in single-admin mode. The dashboard retains the credential only in the current browser tab's session storage.
 
-For a manual pause with no automatic expiry:
+For a manual pause with no automatic expiry, use Bash below. It reads the password without echoing and supplies the authorization header on standard input rather than placing it in curl's process arguments. Do not enable shell tracing while handling credentials.
 
-```sh
-read -rsp 'Maintenance token: ' MAINTENANCE_TOKEN; printf '\n'
+```bash
+read -rsp 'Admin password: ' ADMIN_TOKEN; printf '\n'
 curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/pause \
-  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  --header @- \
   -H 'Content-Type: application/json' \
-  --data '{"reason":"exclusive GPU task"}'
+  --data '{"reason":"exclusive GPU task"}' <<<"Authorization: Bearer ${ADMIN_TOKEN}"
 ```
 
 For a timed pause, include a duration string. The supplied maximum is seven days (`168h`):
 
-```sh
+```bash
 curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/pause \
-  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  --header @- \
   -H 'Content-Type: application/json' \
-  --data '{"duration":"4h","reason":"exclusive GPU task"}'
+  --data '{"duration":"4h","reason":"exclusive GPU task"}' <<<"Authorization: Bearer ${ADMIN_TOKEN}"
 ```
 
 The timed interval begins only after the active request has drained and model-unload confirmation has released the GPU. Use a manual pause for work whose end time is uncertain; a timed pause deliberately admits Ollama work again when it expires.
@@ -398,12 +417,12 @@ maintenance.unload_error = null
 
 Resume manually when the exclusive task is finished:
 
-```sh
+```bash
 curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/resume \
-  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  --header @- \
   -H 'Content-Type: application/json' \
-  --data '{}'
-unset MAINTENANCE_TOKEN
+  --data '{}' <<<"Authorization: Bearer ${ADMIN_TOKEN}"
+unset ADMIN_TOKEN
 ```
 
 The pause record is stored in the Compose volume mounted at `/app/state`, so manual and timed pauses survive intermediary container restarts. `maintenance.max_pause` limits only timed pauses; a manual pause remains until resumed.
@@ -435,7 +454,7 @@ The versioned read-only API is:
 - `GET /_intermediary/v1/history?limit=50` for bounded in-memory history
 - `GET /_intermediary/v1/events` for live Server-Sent Events
 
-Set `OBSERVABILITY_TOKEN` in `secrets.env` to require a bearer token for these data endpoints and legacy `/status` and `/metrics`. The static dashboard will request it and retain it only in the browser tab's session storage. A blank token is convenient on a trusted LAN but provides no read-API authentication. Pause/resume/recovery acknowledgment and settings/catch-up scanning are separate administrative operations protected by `MAINTENANCE_TOKEN` and `SETTINGS_TOKEN`; an observability token cannot mutate state.
+These data endpoints, `/status` and `/metrics` require `ADMIN_TOKEN`. The static dashboard retains the login only in the browser tab's session storage. These endpoints are read-only, but their credential is not: anyone holding `ADMIN_TOKEN` can also invoke administrative controls. Do not give this password to a status-only consumer that you would not trust with administrative access.
 
 Home Assistant can turn the shared snapshot into native sensors with one five-second REST poll. See [Home Assistant setup](docs/HOME_ASSISTANT.md).
 
@@ -520,7 +539,7 @@ Recommended rollout:
 4. Observe response latency, drops, and model switches for at least a day before tuning holds/batches.
 5. Only then reduce Ollama's internal queue.
 
-The Ollama-compatible inference and model-management surface has no authentication layer, matching Ollama's local API model. Bind/publish it only on a trusted LAN or protect it with an authenticated reverse proxy/firewall. The settings and maintenance mutation APIs have their own bearer tokens, but those tokens do not protect ordinary Ollama routes. Do not expose model-management endpoints to untrusted callers.
+The Ollama-compatible inference and model-management surface has no authentication layer, matching Ollama's local API model. Bind/publish it only on a trusted LAN or protect it with an authenticated reverse proxy/firewall. `ADMIN_TOKEN` protects administrative interfaces and media, but it does not protect ordinary Ollama routes. Do not expose model-management endpoints to untrusted callers.
 
 ## Development and tests
 
@@ -530,4 +549,4 @@ npm test
 npm run test:coverage
 ```
 
-The tests use Node's built-in test runner and HTTP mocks. Coverage includes strict priority and balanced compatibility, same-model client holds, higher-priority hold bypass, bounded payload memory and metric cardinality, endpoint safety classification, streaming errors/draining, unload-before-switch, recovery latching, maintenance persistence, Frigate discovery/regeneration state transitions, settings validation/restarts, status/metrics, and existing streaming behavior. Live Frigate media access and ROCm hardware recovery require deployment acceptance tests.
+The tests use Node's built-in test runner and HTTP mocks. Coverage includes strict priority and balanced scheduling, same-model client holds, higher-priority hold bypass, bounded payload memory and metric cardinality, endpoint safety classification, streaming errors/draining, unload-before-switch, recovery latching, maintenance persistence, Frigate discovery/regeneration state transitions, settings validation/restarts, status/metrics, durable media jobs and authenticated ComfyUI routing. Live Frigate media access, ComfyUI execution and ROCm hardware recovery require deployment acceptance tests.
