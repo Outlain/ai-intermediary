@@ -1,6 +1,6 @@
 {
   "name": "ai-intermediary",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "AI Intermediary: one-GPU scheduling for Ollama and durable local ComfyUI workflows",
   "type": "module",
   "private": true,

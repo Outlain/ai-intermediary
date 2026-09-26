@@ -17,8 +17,8 @@ The release workflow runs for semantic version tags matching `v*.*.*`:
 ```sh
 npm run check:public
 npm test
-git tag -a v2.0.1 -m "AI Intermediary v2.0.1"
-git push origin v2.0.1
+git tag -a v2.0.2 -m "AI Intermediary v2.0.2"
+git push origin v2.0.2
 ```
 
 The workflow:

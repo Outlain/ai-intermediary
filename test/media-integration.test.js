@@ -453,6 +453,107 @@ test('media JSON envelope permits bounded private UI metadata in addition to wor
   await waitFor(() => service.media.store.get(job.id).state === 'completed');
 });
 
+test('native ComfyUI 1.52.7 requests queue durably with only local workflow metadata forwarded', async (t) => {
+  const { service, comfy, config } = await setup(t);
+  service.scheduler.pause();
+  service.config.clients.media.queue_while_paused = true;
+  await service.startServer('127.0.0.1:0', 'media');
+  const url = `http://127.0.0.1:${service.addresses().find((entry) => entry.forcedClient === 'media').address.port}`;
+  const login = await fetch(`${url}/media-login`, { method: 'POST', body: new URLSearchParams({ token }), redirect: 'manual' });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const retained = { extra_pnginfo: { workflow: { id: 'native-test', nodes: [], notes: 'private-graph-note' } } };
+  // Mirrors queuePrompt in ComfyUI_frontend v1.52.7. Cloud auth can be absent,
+  // null or populated by a browser; none of it belongs in a local-only job.
+  const body = { prompt: workflow, client_id: 'native-browser', extra_data: {
+    ...retained, comfy_usage_source: 'comfyui-frontend', preview_method: 'latent2rgb',
+    auth_token_comfy_org: 'private-cloud-token', api_key_comfy_org: 'private-api-key',
+  } };
+  const warnings = [];
+  service.logger.warn = (...args) => warnings.push(args);
+  const created = await requestJson(`${url}/api/prompt`, body, { cookie, 'idempotency-key': 'native-request' });
+  assert.equal(created.status, 200);
+  const { prompt_id: id } = await created.json();
+  assert.equal(service.media.store.get(id).state, 'queued');
+  assert.deepEqual(service.media.store.getInternal(id).extraData, retained);
+  assert.deepEqual(comfy.submitted, [], 'native Run must not bypass the shared paused scheduler');
+  // The unprefixed route and empty browser credentials behave identically;
+  // discarded UI fields must not change durable request identity.
+  const duplicate = await requestJson(`${url}/prompt`, { ...body, extra_data: {
+    ...retained, comfy_usage_source: 'comfyui-frontend', auth_token_comfy_org: null, api_key_comfy_org: '',
+  } }, { cookie, 'idempotency-key': 'native-request' });
+  assert.equal(duplicate.status, 200);
+  assert.equal((await duplicate.json()).prompt_id, id);
+  assert.equal(service.media.store.list().length, 1);
+  const restored = new MediaStore(config.media);
+  await restored.init();
+  assert.deepEqual(restored.getInternal(id).extraData, retained);
+  const disk = fs.readFileSync(config.media.state_path, 'utf8');
+  for (const value of ['private-cloud-token', 'private-api-key', 'comfy_usage_source', 'preview_method']) {
+    assert.equal(disk.includes(value), false);
+    assert.equal(JSON.stringify(warnings).includes(value), false);
+  }
+  assert.equal(JSON.stringify(service.media.snapshot()).includes('private-graph-note'), false);
+  let sentMetadata;
+  const submit = comfy.submit.bind(comfy);
+  comfy.submit = async (value, options) => { sentMetadata = options.extraData; return submit(value, options); };
+  service.scheduler.resume();
+  await waitFor(() => comfy.submitted.includes(id));
+  assert.deepEqual(sentMetadata, retained, 'the existing strict host bridge requires extra_pnginfo only');
+  assert.deepEqual(comfy.submitted, [id]);
+  comfy.complete(id);
+  await waitFor(() => service.media.store.get(id).state === 'completed');
+});
+
+test('native metadata compatibility preserves rejections and reports safe actionable errors', async (t) => {
+  const { service, proxyUrl, comfy } = await setup(t);
+  service.scheduler.pause();
+  service.config.clients.media.queue_while_paused = true;
+  await service.startServer('127.0.0.1:0', 'media');
+  const url = `http://127.0.0.1:${service.addresses().find((entry) => entry.forcedClient === 'media').address.port}`;
+  const warnings = [];
+  service.logger.warn = (...args) => warnings.push(args);
+  const privateValue = 'private-value-that-must-not-appear';
+  const metadata = { comfy_usage_source: 'comfyui-frontend', api_key_comfy_org: privateValue };
+  const cases = [
+    [{ prompt: workflow, extra_data: { ...metadata, unknown_field: privateValue } }, 400, 'media_metadata_invalid'],
+    [{ prompt: workflow, extra_data: { ...metadata, extra_pnginfo: 'invalid' } }, 400, 'media_metadata_invalid'],
+    [{ prompt: workflow, extra_data: { ...metadata, auth_token_comfy_org: 'x'.repeat(1024 * 1024) } }, 413, 'media_metadata_too_large'],
+    [{ prompt: { '1': { class_type: 'UnapprovedLocalNode', inputs: {} } }, extra_data: metadata }, 422, 'node_not_allowed'],
+    [{ prompt: { '1': { class_type: 'CloudGenerate', inputs: {} } }, extra_data: metadata }, 422, 'cloud_node_forbidden'],
+    [{ prompt: { '1': { class_type: 'TestImage', inputs: { image: `https://example.invalid/${privateValue}` } } }, extra_data: metadata }, 422, 'remote_workflow_input'],
+    [null, 400, 'invalid_body'],
+  ];
+  for (const [body, status, code] of cases) {
+    const response = await requestJson(`${url}/api/prompt`, body, headers);
+    assert.equal(response.status, status);
+    const error = await response.json();
+    assert.equal(error.code, code);
+    assert.ok(error.error.includes(code));
+    assert.equal(JSON.stringify(error).includes(privateValue), false);
+  }
+  // The direct media API retains its strict metadata contract.
+  const direct = await requestJson(`${proxyUrl}/_intermediary/v1/media/jobs`, { workflow, extra_data: metadata }, headers);
+  assert.equal(direct.status, 400);
+  assert.equal((await direct.json()).code, 'media_metadata_invalid');
+  service.config.clients.media.queue_while_paused = false;
+  const paused = await requestJson(`${url}/prompt`, { prompt: workflow, extra_data: metadata }, headers);
+  assert.equal(paused.status, 503);
+  assert.equal((await paused.json()).code, 'maintenance_paused');
+  const originalSubmit = service.media.submit;
+  try {
+    service.media.submit = async () => { throw Object.assign(new Error(privateValue), { code: privateValue }); };
+    const unknown = await requestJson(`${url}/prompt`, { prompt: workflow, extra_data: metadata }, headers);
+    assert.equal(unknown.status, 503);
+    const error = await unknown.json();
+    assert.equal(error.code, 'media_request_failed');
+    assert.equal(JSON.stringify(error).includes(privateValue), false);
+  } finally { service.media.submit = originalSubmit; }
+  assert.equal(JSON.stringify(warnings).includes(privateValue), false);
+  assert.ok(warnings.some(([message, data]) => message === 'Media request rejected' && data.code === 'node_not_allowed'));
+  assert.deepEqual(service.media.store.list(), []);
+  assert.deepEqual(comfy.submitted, []);
+});
+
 test('gateway limits progress sockets and drops slow broadcast consumers', async (t) => {
   const { service } = await setup(t);
   const closed = [];

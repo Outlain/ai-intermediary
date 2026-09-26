@@ -272,6 +272,22 @@ checks. This rejection occurs before the password is checked. Keep the existing
 administrator password, settings, state mounts, and ComfyUI installation; do not
 disable origin checks or reinstall the backend.
 
+If **Run** immediately reports `Media request could not be completed` and no
+media job appears, check the node allowlist, then update the intermediary to
+v2.0.2 or newer. ComfyUI frontend 1.52.7 sends `comfy_usage_source` alongside
+the workflow; older intermediaries reject that metadata before creating a job.
+The compatibility fix is container-only: no ComfyUI/host-helper reinstall,
+model download, credential change or settings reset is required. Pause and drain
+inference before replacing the container, then resume and reload the media page.
+
+The native gateway discards known frontend usage tags, per-request preview
+preferences and top-level Comfy-Org credentials. Preview rendering uses the
+backend's default. Only bounded `extra_pnginfo` is stored and sent to the bridge;
+unknown metadata still fails closed. The direct media-job API remains strict.
+Rejections now show a specific safe code and explanation in ComfyUI; container
+logs record the code, HTTP status and request ID without request bodies or raw
+exception messages. A rejected submission is not a GPU execution failure.
+
 Resume inference only when ready to submit through the gateway. Run **one**
 image. Confirm the broker records completion and returns to verified GPU idle,
 then make one Odysseus chat request. Confirm that Ollama/Frigate resume normally.

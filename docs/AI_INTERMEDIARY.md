@@ -68,6 +68,15 @@ delete state to clear an uncertain job or recovery lock. The media state contain
 workflow inputs and should receive the same private storage/backup treatment as
 other application data; workflows are not included in public job summaries.
 
+The native ComfyUI gateway accepts normal full-workflow request metadata from
+frontend 1.52.7. It
+discards `comfy_usage_source`, `preview_method`, `auth_token_comfy_org` and
+`api_key_comfy_org` before durable admission or backend forwarding. Per-request
+preview overrides are not supported; backend preview defaults apply. Bounded
+`extra_pnginfo` is retained privately with the workflow. Other metadata is
+rejected, and the direct media-job API and host bridge still accept only
+`extra_pnginfo`. This does not permit cloud nodes or change queue priorities.
+
 ### 1. Prepare a managed local ComfyUI service
 
 Install ComfyUI in its own supported Python environment, following the official

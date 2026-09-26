@@ -4,6 +4,7 @@ import { Readable, Transform } from 'node:stream';
 import WebSocket, { WebSocketServer } from 'ws';
 import { authorized } from './observability.js';
 import { readBody, sendJson } from './http-utils.js';
+import { mediaRequestError, nativeComfyMetadata } from './media-request.js';
 
 const API = '/_intermediary/v1/media';
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -105,8 +106,9 @@ export class MediaGateway {
       if (route === '/jobs' || route.startsWith('/jobs/')) return this.nativeJobs(request, response, url, route, id, source, backend.name);
       if (route === '/prompt' && request.method === 'POST') {
         const body = JSON.parse((await readBody(request, this.service.config.media.max_workflow_bytes + 1024 * 1024 + 65_536)).toString());
+        const extraData = nativeComfyMetadata(body);
         const job = await this.service.media.submit({ source, backend: backend.name, workflow: body.prompt,
-          clientId: body.client_id, extraData: body.extra_data, idempotencyKey: request.headers['idempotency-key'] });
+          clientId: body.client_id, extraData, idempotencyKey: request.headers['idempotency-key'] });
         return sendJson(response, 200, { prompt_id: job.id, number: job.enqueuedAt, node_errors: {} }, id);
       }
       if (['/prompt', '/queue'].includes(route) && request.method === 'GET') {
@@ -167,8 +169,9 @@ export class MediaGateway {
       return sendJson(response, 404, { code: 'unsupported_media_endpoint', error: 'This endpoint is not permitted through the scheduled media gateway.' }, id);
     } catch (error) {
       if (response.headersSent) { response.destroy(); return; }
-      return sendJson(response, error.statusCode || error.status || (error instanceof SyntaxError ? 400 : 503),
-        { code: error.code || 'media_request_failed', error: 'Media request could not be completed. Check the job status and configuration.' }, id);
+      const failure = mediaRequestError(error);
+      this.service.logger.warn('Media request rejected', { code: failure.code, status: failure.status, request_id: id });
+      return sendJson(response, failure.status, { code: failure.code, error: failure.error }, id);
     }
   }
 
