@@ -264,6 +264,14 @@ password. Use a basic text-to-image workflow with the SDXL checkpoint, one
 model/input selection. Asset-hash uploads and arbitrary extensions are not
 supported by this first gateway release. Do not use a cloud template.
 
+If the media login reports `Cross-origin login rejected.` on v2.0.0, update
+the intermediary image to v2.0.1 or newer and reload the login page. The original
+login page's `no-referrer` policy causes native browser form submissions to send
+`Origin: null`; the fix uses `same-origin` on that page while retaining origin
+checks. This rejection occurs before the password is checked. Keep the existing
+administrator password, settings, state mounts, and ComfyUI installation; do not
+disable origin checks or reinstall the backend.
+
 Resume inference only when ready to submit through the gateway. Run **one**
 image. Confirm the broker records completion and returns to verified GPU idle,
 then make one Odysseus chat request. Confirm that Ollama/Frigate resume normally.

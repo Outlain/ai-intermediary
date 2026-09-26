@@ -26,13 +26,13 @@ The following creates a new installation from [Outlain/ai-intermediary releases]
 mkdir -p /tmp/ai-intermediary-install
 cd /tmp/ai-intermediary-install
 
-gh release download v2.0.0 \
+gh release download v2.0.1 \
   --repo Outlain/ai-intermediary \
-  --pattern 'ai-intermediary-v2.0.0-linux-amd64.tar.gz*'
+  --pattern 'ai-intermediary-v2.0.1-linux-amd64.tar.gz*'
 
-sha256sum -c ai-intermediary-v2.0.0-linux-amd64.tar.gz.sha256
-tar -xzf ai-intermediary-v2.0.0-linux-amd64.tar.gz
-sudo mv ai-intermediary-v2.0.0-linux-amd64 /opt/ai-intermediary
+sha256sum -c ai-intermediary-v2.0.1-linux-amd64.tar.gz.sha256
+tar -xzf ai-intermediary-v2.0.1-linux-amd64.tar.gz
+sudo mv ai-intermediary-v2.0.1-linux-amd64 /opt/ai-intermediary
 sudo chown -R "$USER":"$USER" /opt/ai-intermediary
 cd /opt/ai-intermediary
 

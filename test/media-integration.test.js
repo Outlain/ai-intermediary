@@ -86,6 +86,49 @@ test('invalid browser client ID is rejected before durable admission', async (t)
   assert.deepEqual(service.media.store.list(), []);
 });
 
+test('media login preserves the browser form origin without accepting null or foreign origins', async (t) => {
+  const { service } = await setup(t);
+  const admin = 'browser-form-test-password';
+  service.config.security = { auth_mode: 'single_admin', admin_token: admin };
+  await service.startServer('127.0.0.1:0', 'media');
+  const url = `http://127.0.0.1:${service.addresses().find((entry) => entry.forcedClient === 'media').address.port}`;
+  const page = await fetch(url);
+  // Node fetch does not apply document referrer policies. Native browser form
+  // POSTs under no-referrer send Origin: null, even back to the same host.
+  assert.equal(page.headers.get('referrer-policy'), 'same-origin');
+  assert.match(page.headers.get('content-security-policy'), /form-action 'self'/);
+  assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  assert.match(await page.text(), /method="post" action="\/media-login"/);
+  const submit = (origin, password = admin) => fetch(`${url}/media-login`, {
+    method: 'POST', body: new URLSearchParams({ token: password }), redirect: 'manual',
+    headers: { origin },
+  });
+  for (const origin of ['null', 'https://untrusted.invalid', 'http://127.0.0.1:1', 'not-an-origin']) {
+    const rejected = await submit(origin);
+    assert.equal(rejected.status, 403, `${origin} must remain rejected`);
+    assert.equal(rejected.headers.has('set-cookie'), false);
+    assert.equal((await rejected.json()).error, 'Cross-origin login rejected.');
+  }
+  const incorrect = await submit(url, 'incorrect-password');
+  assert.equal(incorrect.status, 401);
+  assert.equal(incorrect.headers.has('set-cookie'), false);
+  assert.equal((await incorrect.json()).error, 'Incorrect administrator password.');
+  const login = await submit(url);
+  assert.equal(login.status, 303);
+  assert.equal(login.headers.get('location'), '/');
+  const sessionCookie = login.headers.get('set-cookie');
+  assert.match(sessionCookie, /HttpOnly; SameSite=Strict/);
+  const cookie = sessionCookie.split(';')[0];
+  assert.equal((await fetch(`${url}/api/queue`, { headers: { cookie } })).status, 200);
+  for (const origin of ['null', 'https://untrusted.invalid']) {
+    const mutation = await fetch(`${url}/api/prompt`, {
+      method: 'POST', headers: { cookie, origin }, body: '{}',
+    });
+    assert.equal(mutation.status, 403, 'a valid session must not bypass mutation origin checks');
+    assert.equal((await mutation.json()).error, 'Cross-origin mutation rejected.');
+  }
+});
+
 test('single-admin media login uses the admin password, never the derived bridge credential', async (t) => {
   const { service, proxyUrl } = await setup(t);
   const admin = 'one-private-administrator-password';

@@ -88,6 +88,10 @@ export class MediaGateway {
       if (url.pathname === `${API}/acknowledge`) return this.acknowledge(request, response, id);
       if (!this.authenticated(request, source)) {
         if (native && request.method === 'GET' && url.pathname === '/') {
+          // Native form POSTs under no-referrer send Origin: null, including
+          // same-origin logins. Preserve their origin without allowing foreign
+          // or opaque origins through checkOrigin, or leaking cross-site refs.
+          response.setHeader('referrer-policy', 'same-origin');
           response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'" });
           return response.end(loginHtml);
         }
