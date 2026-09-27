@@ -98,6 +98,31 @@ Reachability alone does not establish free VRAM or successful model unloading.
 Do not enable media scheduling until the bridge, backend release checks, and
 physical host telemetry pass the intermediary's checks.
 
+## Verified cleanup and small residual allocations
+
+Update **both the intermediary and these two bridge files** to use bounded
+post-cleanup allocator allowances. An older bridge retains strict-zero allocator
+checks. No new Python dependency, administrator password or model download is
+needed. Preserve the old files, pause/drain inference and restart only ComfyUI
+at a verified safe service boundary; never discard saved intermediary state.
+
+The authenticated `POST /intermediary/release` accepts a `request_id` UUID and
+sets the same native worker flags as ComfyUI's `/free`. It does **not** perform
+GPU operations on the HTTP thread. `/intermediary/status` reports
+`release_proof: {supported, request_id, completed, loaded_models, error}`.
+The worker must consume both flags, return from model unloading, then return
+from cache cleanup on that same thread with an empty model registry and queue.
+Only then is that request complete. Nested cache calls during model unloading
+do not count. Same-ID retries are idempotent. Admitted work, changed observers,
+nonempty models/queue, exceptions or an incomplete sequence invalidate proof.
+
+This observes the native worker sequence verified against ComfyUI v0.37.0; it
+does not replace its execution or cleanup logic. Incompatible hooks fail closed.
+The broker binds the proof to the current bridge instance and request, combines
+it with bounded allocator readings and fresh stable physical GPU/process checks,
+and preserves the shared GPU lock until all checks pass. Small **active** torch
+allocations are not described as free cache or assumed safe in isolation.
+
 ## Supported workflows and output ownership
 
 Use ComfyUI **API-format** workflows with individually approved local node types

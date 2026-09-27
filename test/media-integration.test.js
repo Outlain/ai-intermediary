@@ -39,6 +39,51 @@ class FakeComfy {
   async interrupt(id) { this.interruptions.push(id); this.records.set(id, { state: 'interrupted', terminal: true, artifacts: [] }); }
 }
 
+test('completed media with bounded residual releases to waiting chat only after worker proof and physical checks', async (t) => {
+  const comfy = new FakeComfy();
+  let proof = { supported: true, request_id: null, completed: false, loaded_models: 0, error: null };
+  let failCleanup = false;
+  comfy.bridgeStatus = async () => ({ protocol: 'ai-intermediary-comfy-v1', local_only: true,
+    instance_id: 'test-worker-instance', release_proof: proof });
+  comfy.requestRelease = async ({ requestId }) => {
+    if (failCleanup) {
+      failCleanup = false;
+      throw Object.assign(new Error('cleanup transport timed out'), { code: 'backend_transport_error' });
+    }
+    proof = { ...proof, request_id: requestId, completed: true };
+  };
+  comfy.releaseEvidence = async ({ maxReservedBytes }) => ({
+    idle: !(await comfy.queue()).queue_running.length,
+    released: 76 * 1024 ** 2 <= maxReservedBytes,
+    memory: { valid: true, reserved_bytes: 76 * 1024 ** 2, active_bytes: 76 * 1024 ** 2, max_reserved_bytes: maxReservedBytes },
+  });
+  const { service, proxyUrl, mock } = await setup(t, { comfy });
+  service.media.settings.max_idle_vram_mb = 1024;
+  const snapshot = service.hostHelper.snapshot;
+  service.hostHelper.snapshot = () => ({ ...snapshot(), gpus: [{ id: '0', processes_known: true,
+    processes: [{ is_comfyui: true }], vram_used_bytes: 676 * 1024 ** 2, utilization_percent: 3 }] });
+  const job = await service.media.submit({ source: 'media', backend: 'comfy', workflow });
+  await waitFor(() => comfy.submitted.length === 1);
+  const chat = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'after-proven-release' });
+  await waitFor(() => service.scheduler.jobs.some((entry) => entry.state === 'queued' && entry.client === 'odysseus'));
+  failCleanup = true;
+  comfy.complete(job.id);
+  await waitFor(() => service.media.store.get(job.id).state === 'uncertain');
+  assert.equal(service.media.store.get(job.id).execution_state, 'completed');
+  assert.equal(service.media.store.get(job.id).outputsImported, true);
+  assert.deepEqual(mock.order, []);
+  assert.equal(service.media.snapshot().release.reason, 'backend_transport_error');
+  service.media.nextCleanupRetry = 0;
+  service.scheduler.wake();
+  await waitFor(() => service.media.store.get(job.id).state === 'completed');
+  const response = await chat;
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.deepEqual(comfy.submitted, [job.id], 'cleanup retry must never generate a second image/video');
+  assert.deepEqual(mock.order, ['after-proven-release']);
+  assert.equal(service.media.blocked, false);
+});
+
 test('a pause arriving during Comfy preflight requeues the durable job without POST or recovery lock', async (t) => {
   const { service, comfy } = await setup(t);
   comfy.beforeSubmit = async () => { service.scheduler.pause(); };

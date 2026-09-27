@@ -207,6 +207,7 @@ media:
   max_output_bytes: 1073741824
   max_storage_bytes: 10737418240
   max_idle_vram_mb: 512
+  max_idle_torch_vram_mb: 128
   max_idle_utilization_percent: 5
   stable_samples: 3
   allowed_node_types: [] # exact reviewed local node class names from your workflow
@@ -227,8 +228,28 @@ independent of the individual workflow and job-count limits. Admission stops
 when any limit is reached; it does not discard an already accepted workflow.
 
 The idle VRAM/utilization thresholds are release checks, not model size limits.
-Raising them to ignore unknown or still-running processes defeats their purpose.
-Three distinct fresh safe samples are required by default.
+`max_idle_vram_mb` limits total **physical** VRAM, including driver/context
+overhead. Its default remains 512 MiB; upgrades preserve existing operator
+choices rather than automatically increasing this ceiling.
+
+`max_idle_torch_vram_mb` separately limits residual memory reported by
+ComfyUI's PyTorch allocator after unloading. The default is 128 MiB, the allowed
+range is 0–256 MiB, and 0 restores the strict zero-residual check. A nonzero
+allowance requires the updated authenticated bridge to confirm model unloading
+and an empty queue. Older bridges without that proof still require zero
+residual memory. This allowance cannot establish that a workload stopped: the
+broker must still establish its completion or an explicitly verified recovery
+boundary, check known process ownership and obtain the configured number of
+distinct fresh safe physical GPU samples (three by default).
+
+Small allocator and driver/context allocations can survive a successful video.
+If inspection confirms, for example, 76 MiB of post-unload PyTorch residue and
+676 MiB of total physical VRAM, an **explicit** physical ceiling of 1024 MiB and
+the 128 MiB PyTorch ceiling can accommodate that measured baseline. These are
+not universal hardware values or permission to retain an active model. The two
+checks are independent: increasing only the physical ceiling cannot bypass a
+failed PyTorch/unload check. Never raise either limit to ignore unknown or
+still-running processes, stale telemetry, rising allocations or a busy queue.
 
 Validate/apply settings through the existing Settings workflow. Recreate the
 intermediary when publishing new ports or changing its injected environment.

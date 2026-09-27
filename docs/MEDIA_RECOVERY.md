@@ -120,3 +120,45 @@ This update prevents a cleanup failure from hiding an already-imported result.
 It does **not** prove that a large video workload fits system RAM or fix a ROCm
 driver fault. See the [controlled AMD memory test](COMFYUI_AMD.md#after-a-system-ram-oom).
 Keep model downloads, VM RAM sizing and backend tuning separate from recovery.
+
+### Completed video, but GPU release stays pending
+
+After a cleanup failure, the broker makes at most three automatic recovery
+passes per process incident, with waits of 5, 15 and 60 seconds following failed
+cleanup checks. These are earliest eligible times; the shared operation gate
+and each configured request/unload timeout still apply. It never regenerates
+the video, resets the GPU or restarts a service. The dashboard shows the latest
+release failure and when automatic attempts are exhausted, separately from the
+original incident. Read-only completion discovery and result import continue
+even when cleanup attempts are exhausted. Temporary history-read failures use
+a five-second backoff and do not consume the cleanup retry budget.
+
+Update both the intermediary image and the installed ComfyUI bridge at a
+paused, drained boundary. Updating only the image does not add worker cleanup
+proof to an already-running ComfyUI process. See the [bridge update notes](../integrations/comfyui/README.md#verified-cleanup-and-small-residual-allocations).
+
+A saved output does not require zero total physical GPU memory: driver/context
+overhead and small allocator residue may remain after model unloading. Before
+changing a limit, inspect the job's completion evidence, ComfyUI's queue and
+unload status, PyTorch reserved memory, and fresh physical/process telemetry.
+Do not interpret a transport error or an empty queue alone as proof of release.
+
+Settings → Media exposes two separate ceilings:
+
+- **Released-GPU VRAM ceiling** (`media.max_idle_vram_mb`) is the total physical
+  allocation limit. Its default remains 512 MiB and existing choices are not
+  silently raised on upgrade.
+- **ComfyUI residual PyTorch memory ceiling** (`media.max_idle_torch_vram_mb`)
+  defaults to 128 MiB and is bounded to 0–256 MiB; choose 0 for strict zero.
+  A nonzero allowance requires the updated authenticated ComfyUI bridge's model
+  unload/empty-queue proof. An older bridge without that proof still requires
+  zero residue. Stable physical readings, known process ownership and a verified
+  completion/recovery boundary remain mandatory.
+
+For a measured, fully unloaded baseline of 76 MiB PyTorch residue and 676 MiB
+physical VRAM, explicitly setting the physical ceiling to 1024 MiB while keeping
+the PyTorch ceiling at 128 MiB is a bounded example—not an automatic migration
+or general recommendation for every host. Raising only one limit cannot bypass
+the other. Do not raise thresholds to hide active work or unidentified memory.
+These settings do not change model capacity, prevent OOM, restart services or
+resume a manual pause. No new human password is required by the updated bridge.

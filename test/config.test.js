@@ -55,6 +55,8 @@ test('legacy upgrade synthesizes Ollama registry without changing source priorit
   assert.equal(config.clients.media, undefined);
   assert.equal(config.media.enabled, false);
   assert.equal(config.media.retentionMs, 168 * 60 * 60 * 1000);
+  assert.equal(config.media.max_idle_vram_mb, 512);
+  assert.equal(config.media.max_idle_torch_vram_mb, 128);
   assert.equal(config.media.max_idle_utilization_percent, 5);
 });
 
@@ -106,6 +108,20 @@ test('media storage and release thresholds are bounded, and its token is host-co
   }
   const raw = applyHostEnvironment(backendFixture(), { MEDIA_TOKEN: 'a separate secret' });
   assert.equal(normalizeConfig(raw).media.auth_token, 'a separate secret');
+});
+
+test('ComfyUI residual memory allowance is bounded without widening existing physical limits', () => {
+  const normalize = (media) => normalizeConfig({ ...backendFixture(), media }).media;
+  for (const value of [-1, 257, 1.5, '128', null, true, Number.NaN]) {
+    assert.throws(() => normalize({ max_idle_torch_vram_mb: value }), /media\.max_idle_torch_vram_mb/);
+  }
+  for (const value of [0, 76, 128, 256]) {
+    assert.equal(normalize({ max_idle_torch_vram_mb: value }).max_idle_torch_vram_mb, value);
+  }
+  assert.equal(normalize({}).max_idle_vram_mb, 512, 'omitting a prior setting does not silently widen it');
+  assert.equal(normalize({ max_idle_vram_mb: 256 }).max_idle_vram_mb, 256);
+  assert.equal(normalize({ max_idle_vram_mb: 512 }).max_idle_vram_mb, 512);
+  assert.equal(normalize({ max_idle_vram_mb: 1024 }).max_idle_vram_mb, 1024, 'explicit physical tuning remains possible');
 });
 
 test('host monitoring and automatic recovery remain disabled on an ordinary upgrade', () => {

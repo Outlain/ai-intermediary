@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -27,6 +28,48 @@ class Queue:
 
     def get_history(self, prompt_id):
         return {prompt_id: self.history[prompt_id]} if prompt_id in self.history else {}
+
+
+class ReleaseQueue(Queue):
+    def __init__(self):
+        super().__init__()
+        self.flags, self.flag_requests = {}, []
+
+    def set_flag(self, name, value):
+        self.flag_requests.append((name, value))
+        self.flags[name] = value
+
+    def get_flags(self, reset=True):
+        if reset:
+            flags, self.flags = self.flags, {}
+            return flags
+        return self.flags.copy()
+
+
+class MemoryManager:
+    def __init__(self):
+        self.models, self.calls = [], []
+        self.during_unload = None
+        self.unload_error = self.cache_error = self.models_error = None
+
+    def unload_all_models(self, *args, **kwargs):
+        self.calls.append(("unload", args, kwargs))
+        if self.during_unload:
+            self.during_unload()
+        if self.unload_error:
+            raise self.unload_error
+        return "unloaded-result"
+
+    def soft_empty_cache(self, *args, **kwargs):
+        self.calls.append(("cache", args, kwargs))
+        if self.cache_error:
+            raise self.cache_error
+        return "cache-result"
+
+    def loaded_models(self):
+        if self.models_error:
+            raise self.models_error
+        return self.models
 
 
 class Routes:
@@ -249,6 +292,260 @@ class Tests(unittest.IsolatedAsyncioTestCase):
             return Web.json_response({})
         response = await self.middleware(self.request("/api/prompt", payload()), handler)
         self.assertEqual(response.status, 200)
+
+
+class ReleaseTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="comfy-bridge-release-test-")
+        self.addCleanup(self.directory.cleanup)
+        self.server = SimpleNamespace(prompt_queue=ReleaseQueue(), routes=Routes(), app=SimpleNamespace(middlewares=[]))
+        self.manager = MemoryManager()
+        self.guard = bridge.install(self.server, {"KSampler": Node, "SaveImage": Output}, self.directory.name,
+                                    web=Web, token=TOKEN, disable_api_nodes=True, memory_manager=self.manager)
+        self.queue = self.server.prompt_queue
+
+    def proof(self):
+        return self.guard.status()["release_proof"]
+
+    def request_release(self, request_id=ID):
+        return self.guard.request_release({"request_id": request_id})
+
+    def finish(self):
+        self.queue.get_flags()
+        self.manager.unload_all_models()
+        self.manager.soft_empty_cache()
+
+    async def test_release_ack_is_not_proof_and_observers_forward_arguments_and_results(self):
+        self.assertEqual(self.proof(), {"supported": True, "request_id": None, "completed": False,
+                                        "loaded_models": 0, "error": None})
+        result = self.request_release()
+        self.assertTrue(result["requested"])
+        self.assertFalse(result["release_proof"]["completed"])
+        self.assertEqual(self.manager.calls, [], "HTTP request never directly invokes GPU cleanup")
+        self.assertEqual(self.queue.get_flags(reset=False), {"unload_models": True, "free_memory": True})
+        self.manager.unload_all_models()
+        self.manager.soft_empty_cache()
+        self.assertFalse(self.proof()["completed"], "Peeked flags are not consumed flags")
+        flags = self.queue.get_flags()
+        self.assertEqual(flags, {"unload_models": True, "free_memory": True})
+        self.assertEqual(self.manager.unload_all_models("arg", option=True), "unloaded-result")
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.manager.soft_empty_cache(force=True), "cache-result")
+        self.assertTrue(self.proof()["completed"])
+        self.assertEqual(self.manager.calls[-2:], [("unload", ("arg",), {"option": True}), ("cache", (), {"force": True})])
+
+    async def test_nested_empty_cache_during_unload_does_not_mark_completed(self):
+        self.request_release()
+        self.queue.get_flags()
+        proofs = []
+        def nested():
+            self.manager.soft_empty_cache()
+            proofs.append(self.proof()["completed"])
+        self.manager.during_unload = nested
+        self.manager.unload_all_models()
+        self.assertEqual(proofs, [False])
+        self.assertFalse(self.proof()["completed"])
+        self.manager.soft_empty_cache()
+        self.assertTrue(self.proof()["completed"])
+
+    async def test_idempotent_same_nonce_does_not_reset_pending_or_completed_proof(self):
+        self.request_release()
+        self.request_release()
+        self.assertEqual(len(self.queue.flag_requests), 2)
+        with self.assertRaisesRegex(bridge.BridgeError, "release_in_progress"):
+            self.request_release(OTHER)
+        self.finish()
+        self.assertTrue(self.request_release()["release_proof"]["completed"])
+        self.assertEqual(len(self.queue.flag_requests), 2)
+        self.assertFalse(self.request_release(OTHER)["release_proof"]["completed"])
+        self.assertEqual(len(self.queue.flag_requests), 4)
+
+    async def test_release_requires_empty_queue_and_strict_body(self):
+        for body in [None, {}, {"request_id": ID, "extra": True}, {"request_id": "invalid"}, {"request_id": 12}]:
+            with self.assertRaises(bridge.BridgeError):
+                self.guard.request_release(body)
+        for kind in ["running", "pending"]:
+            getattr(self.queue, kind).append((0, OTHER))
+            with self.assertRaisesRegex(bridge.BridgeError, "backend_busy"):
+                self.request_release()
+            getattr(self.queue, kind).clear()
+        self.assertEqual(self.queue.flag_requests, [])
+
+    async def test_release_http_route_authentication_and_readiness(self):
+        handler = self.server.routes.handlers[("POST", "/intermediary/release")]
+        middleware = self.server.app.middlewares[0]
+        data = json.dumps({"request_id": ID}).encode()
+        request = SimpleNamespace(path="/intermediary/release", method="POST", headers={},
+                                  content_length=len(data), _read_bytes=data)
+        self.assertEqual((await middleware(request, handler)).status, 401)
+        request.headers[bridge.HEADER] = TOKEN
+        result = await middleware(request, handler)
+        self.assertEqual(result.status, 200)
+        self.assertFalse(result.data["release_proof"]["completed"])
+        with patch.object(self.guard, "storage_error", True):
+            self.assertEqual((await middleware(request, handler)).status, 503)
+
+    async def test_missing_capabilities_and_replaced_observers_never_claim_support(self):
+        old = SimpleNamespace(prompt_queue=Queue(), routes=Routes(), app=SimpleNamespace(middlewares=[]))
+        guard = bridge.install(old, {}, self.directory.name, web=Web, token=TOKEN, disable_api_nodes=True)
+        self.assertFalse(guard.status()["release_proof"]["supported"])
+        with self.assertRaisesRegex(bridge.BridgeError, "release_proof_unsupported"):
+            guard.request_release({"request_id": ID})
+        self.request_release()
+        self.finish()
+        self.manager.soft_empty_cache = lambda: None
+        self.assertFalse(self.proof()["supported"])
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.proof()["error"], "release_evidence_changed")
+
+    async def test_async_cleanup_is_not_compatible_with_native_worker_observers(self):
+        async def asynchronous_cleanup():
+            return None
+        manager = MemoryManager()
+        manager.unload_all_models = asynchronous_cleanup
+        server = SimpleNamespace(prompt_queue=ReleaseQueue(), routes=Routes(), app=SimpleNamespace(middlewares=[]))
+        guard = bridge.install(server, {}, self.directory.name, web=Web, token=TOKEN, disable_api_nodes=True,
+                               memory_manager=manager)
+        self.assertFalse(guard.status()["release_proof"]["supported"])
+
+    async def test_flag_read_or_write_exception_never_yields_a_completed_proof(self):
+        error = RuntimeError("flag write failed")
+        with patch.object(self.queue, "set_flag", side_effect=error):
+            with self.assertRaisesRegex(bridge.BridgeError, "release_flag_request_failed"):
+                self.request_release()
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.proof()["error"], "release_flag_request_failed")
+        # Install an original failing reader, not a replacement after install.
+        server = SimpleNamespace(prompt_queue=ReleaseQueue(), routes=Routes(), app=SimpleNamespace(middlewares=[]))
+        def reader(*args, **kwargs):
+            raise error
+        server.prompt_queue.get_flags = reader
+        manager = MemoryManager()
+        guard = bridge.install(server, {}, self.directory.name, web=Web, token=TOKEN, disable_api_nodes=True,
+                               memory_manager=manager)
+        guard.request_release({"request_id": OTHER})
+        with self.assertRaises(RuntimeError) as raised:
+            server.prompt_queue.get_flags()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(guard.status()["release_proof"]["error"], "release_flag_read_failed")
+
+    async def test_new_work_admitted_during_unload_cannot_complete_the_old_nonce(self):
+        self.request_release()
+        self.queue.get_flags()
+        def admission():
+            token = bridge._submission.set({"prompt_id": OTHER, "enqueued": False})
+            try:
+                self.queue.put((0, OTHER, payload()["prompt"], {}))
+            finally:
+                bridge._submission.reset(token)
+        self.manager.during_unload = admission
+        self.manager.unload_all_models()
+        self.manager.soft_empty_cache()
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.proof()["error"], "release_invalidated_by_submission")
+        self.assertEqual(len(self.queue.pending), 1)
+
+    async def test_completed_proof_is_invalidated_when_queue_changes_outside_admission(self):
+        self.request_release()
+        self.finish()
+        self.queue.running.append((0, OTHER))
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.proof()["error"], "release_evidence_changed")
+        self.queue.running.clear()
+        self.assertFalse(self.proof()["completed"], "Removing new work does not resurrect old proof")
+
+    async def test_incomplete_flags_and_next_iteration_do_not_complete_old_sequence(self):
+        self.request_release()
+        self.queue.flags.pop("free_memory")
+        self.finish()
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.proof()["error"], "release_flags_incomplete")
+        self.request_release(OTHER)
+        self.queue.get_flags()
+        self.queue.get_flags()
+        self.manager.unload_all_models()
+        self.manager.soft_empty_cache()
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.proof()["error"], "release_sequence_incomplete")
+
+    async def test_wrong_thread_cannot_finish_worker_cleanup(self):
+        for stage in ["unload", "cache"]:
+            self.request_release(ID if stage == "unload" else OTHER)
+            self.queue.get_flags()
+            if stage == "cache":
+                self.manager.unload_all_models()
+            thread = threading.Thread(target=self.manager.unload_all_models if stage == "unload" else self.manager.soft_empty_cache)
+            thread.start()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.manager.soft_empty_cache()
+            self.assertFalse(self.proof()["completed"])
+            self.assertEqual(self.proof()["error"], "release_worker_mismatch")
+
+    async def test_native_cleanup_exceptions_propagate_and_poison_proof(self):
+        for stage, request_id in [("unload", ID), ("cache", OTHER)]:
+            error = RuntimeError(stage)
+            self.request_release(request_id)
+            self.queue.get_flags()
+            if stage == "cache":
+                self.manager.unload_all_models()
+            setattr(self.manager, stage + "_error", error)
+            with self.assertRaises(RuntimeError) as raised:
+                (self.manager.unload_all_models if stage == "unload" else self.manager.soft_empty_cache)()
+            self.assertIs(raised.exception, error)
+            setattr(self.manager, stage + "_error", None)
+            self.manager.soft_empty_cache()
+            self.assertFalse(self.proof()["completed"])
+            self.assertEqual(self.proof()["error"], "release_" + stage + "_failed")
+
+    async def test_empty_registry_and_empty_queue_required_at_completion_and_later(self):
+        for models in [[object()], None, (), {"models": []}]:
+            self.guard._release = None
+            self.manager.models = models
+            self.request_release()
+            self.finish()
+            self.assertFalse(self.proof()["completed"])
+        self.manager.models = []
+        self.guard._release = None
+        self.request_release()
+        self.queue.get_flags()
+        self.manager.unload_all_models()
+        self.queue.pending.append((0, OTHER))
+        self.manager.soft_empty_cache()
+        self.assertFalse(self.proof()["completed"])
+        self.queue.pending.clear()
+        self.request_release(OTHER)
+        self.finish()
+        self.assertTrue(self.proof()["completed"])
+        self.manager.models = [object()]
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.proof()["error"], "release_evidence_changed")
+
+    async def test_registry_read_failure_never_confirms_cleanup(self):
+        self.request_release()
+        self.manager.models_error = RuntimeError("cannot inspect registry")
+        self.finish()
+        self.assertFalse(self.proof()["completed"])
+        self.assertIsNone(self.proof()["loaded_models"])
+
+    async def test_admitted_submission_invalidates_proof_and_old_id_cannot_rearm_it(self):
+        self.request_release()
+        self.finish()
+        context = bridge._submission.set({"prompt_id": OTHER, "enqueued": False})
+        try:
+            graph = payload()["prompt"]
+            self.queue.put((0, OTHER, graph, {}))
+        finally:
+            bridge._submission.reset(context)
+        self.assertFalse(self.proof()["completed"])
+        self.assertEqual(self.proof()["error"], "release_invalidated_by_submission")
+        self.queue.pending.clear()
+        result = self.request_release()
+        self.assertFalse(result["release_proof"]["completed"])
+        self.assertEqual(len(self.queue.flag_requests), 2)
+        self.request_release(OTHER)
+        self.finish()
+        self.assertTrue(self.proof()["completed"])
 
 
 if __name__ == "__main__":

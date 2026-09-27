@@ -35,12 +35,12 @@ Tagged releases publish two artifacts:
 Once a version has actually been published on [GitHub Releases](https://github.com/Outlain/ai-intermediary/releases), use its tag below. The version in source code alone does not mean that an image or release exists yet.
 
 ```sh
-gh release download v2.0.3 \
+gh release download v2.0.4 \
   --repo Outlain/ai-intermediary \
-  --pattern 'ai-intermediary-v2.0.3-linux-amd64.tar.gz*'
-sha256sum -c ai-intermediary-v2.0.3-linux-amd64.tar.gz.sha256
-tar -xzf ai-intermediary-v2.0.3-linux-amd64.tar.gz
-cd ai-intermediary-v2.0.3-linux-amd64
+  --pattern 'ai-intermediary-v2.0.4-linux-amd64.tar.gz*'
+sha256sum -c ai-intermediary-v2.0.4-linux-amd64.tar.gz.sha256
+tar -xzf ai-intermediary-v2.0.4-linux-amd64.tar.gz
+cd ai-intermediary-v2.0.4-linux-amd64
 cp config.example.yml config.yml
 cp secrets.example.env secrets.env
 chmod 600 secrets.env

@@ -49,6 +49,7 @@ const DEFAULTS = {
     max_workflow_bytes: 2 * 1024 ** 2,
     max_output_bytes: 1024 ** 3,
     max_idle_vram_mb: 512,
+    max_idle_torch_vram_mb: 128,
     max_idle_utilization_percent: 5,
     stable_samples: 3,
     allowed_node_types: [],
@@ -602,7 +603,8 @@ function validateMedia(config) {
   for (const [field, min, max] of [
     ['max_storage_bytes', 1024 ** 2, Number.MAX_SAFE_INTEGER], ['max_jobs', 1, 10000],
     ['max_workflow_bytes', 1024, 2 * 1024 ** 2], ['max_output_bytes', 1024, 16 * 1024 ** 3],
-    ['max_idle_vram_mb', 64, 4096], ['max_idle_utilization_percent', 0, 10], ['stable_samples', 2, 10],
+    ['max_idle_vram_mb', 64, 4096], ['max_idle_torch_vram_mb', 0, 256],
+    ['max_idle_utilization_percent', 0, 10], ['stable_samples', 2, 10],
   ]) {
     if (!Number.isSafeInteger(media[field]) || media[field] < min || media[field] > max) throw new Error(`media.${field} must be an integer between ${min} and ${max}`);
   }

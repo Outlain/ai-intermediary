@@ -28,6 +28,22 @@ async function mock(t, handle, config = {}) {
 }
 function json(response, value) { response.end(JSON.stringify(value)); }
 
+test('Comfy cleanup nonce is authenticated and its request acknowledgment is not completion', async (t) => {
+  const proof = { supported: true, request_id: ID, completed: false, loaded_models: 0, error: null };
+  const { client, requests } = await mock(t, (req, response) => json(response,
+    req.url === '/intermediary/release' ? { requested: true, release_proof: proof }
+      : { protocol: 'ai-intermediary-comfy-v1', local_only: true, release_proof: proof }), { token: 'test-bridge-only' });
+  const accepted = await client.requestRelease({ requestId: ID });
+  assert.equal(accepted.release_proof.completed, false);
+  assert.equal(requests[0].url, '/intermediary/release');
+  assert.equal(requests[0].method, 'POST');
+  assert.deepEqual(requests[0].body, { request_id: ID });
+  assert.equal(requests[0].headers['x-ai-intermediary-token'], 'test-bridge-only');
+  assert.deepEqual((await client.bridgeStatus()).release_proof, proof);
+  await assert.rejects(client.requestRelease({ requestId: '../arbitrary' }), { code: 'invalid_prompt_id' });
+  assert.equal(requests.length, 2);
+});
+
 test('Comfy submits only explicit local allowlisted workflows with stable IDs and bridge authentication', async (t) => {
   const { client, requests } = await mock(t, (req, response) => {
     if (req.url === '/object_info') return json(response, { KSampler: { python_module: 'nodes' } });
@@ -137,23 +153,96 @@ test('Comfy interrupt requires exactly owned active workflow and does not claim 
 
 test('Comfy free acknowledgment is not proof; release checks idle queue and reserved torch memory', async (t) => {
   let queue = emptyQueue;
-  let devices = [{ type: 'cuda', torch_vram_total: 2_000_000 }];
+  let devices = [{ type: 'cuda', torch_vram_total: 2_000_000, torch_vram_free: 0 }];
   const { client } = await mock(t, (req, response) => {
     if (req.url === '/queue') return json(response, queue);
     if (req.url === '/system_stats') return json(response, { devices });
     response.end();
   });
   assert.deepEqual(await client.requestFree(), { requested: true, released: false });
-  assert.equal((await client.releaseEvidence()).released, false);
+  const blocked = await client.releaseEvidence();
+  assert.equal(blocked.released, false);
+  assert.equal(blocked.reason, 'comfy_reserved_memory_above_limit');
+  assert.deepEqual(blocked.memory, { valid: true, reserved_bytes: 2_000_000, active_bytes: 2_000_000, max_reserved_bytes: 0 });
   devices[0].torch_vram_total = 0;
-  assert.equal((await client.releaseEvidence()).released, true);
+  const released = await client.releaseEvidence();
+  assert.equal(released.released, true);
+  assert.equal(released.reason, null);
+  assert.deepEqual(released.memory, { valid: true, reserved_bytes: 0, active_bytes: 0, max_reserved_bytes: 0 });
   queue = { ...emptyQueue, queue_pending: [[0, ID]] };
-  assert.equal((await client.releaseEvidence()).released, false);
+  const busy = await client.releaseEvidence();
+  assert.equal(busy.released, false);
+  assert.equal(busy.reason, 'comfy_queue_busy');
   await assert.rejects(client.requestFree(), { code: 'backend_busy' });
   queue = emptyQueue;
   for (const invalid of [[], [{ type: 'cuda' }], [{ type: 'cpu', torch_vram_total: 0 }], [{ torch_vram_total: 0 }], [{ type: 'cuda', torch_vram_total: '0' }]]) {
     devices = invalid;
     assert.equal((await client.releaseEvidence()).released, false);
+  }
+});
+
+test('Comfy bounded release requires an explicit aggregate budget and reports active residual separately', async (t) => {
+  const MiB = 1024 * 1024;
+  let devices = [{ type: 'cuda', torch_vram_total: 76 * MiB, torch_vram_free: 12 * MiB }];
+  let queue = emptyQueue;
+  const { client } = await mock(t, (req, response) => json(response, req.url === '/queue' ? queue : { devices }));
+  assert.equal((await client.releaseEvidence()).released, false, 'Default stays exact-zero');
+  const result = await client.releaseEvidence({ maxReservedBytes: 128 * MiB });
+  assert.equal(result.released, true);
+  assert.deepEqual(result.memory, { valid: true, reserved_bytes: 76 * MiB, active_bytes: 64 * MiB, max_reserved_bytes: 128 * MiB });
+  assert.equal((await client.releaseEvidence({ maxReservedBytes: 76 * MiB })).released, true, 'Boundary is inclusive');
+  assert.equal((await client.releaseEvidence({ maxReservedBytes: 76 * MiB - 1 })).reason, 'comfy_reserved_memory_above_limit');
+  for (const field of ['queue_running', 'queue_pending']) {
+    queue = { ...emptyQueue, [field]: [[0, ID]] };
+    const busy = await client.releaseEvidence({ maxReservedBytes: 128 * MiB });
+    assert.equal(busy.idle, false);
+    assert.equal(busy.released, false);
+    assert.equal(busy.reason, 'comfy_queue_busy');
+  }
+  queue = emptyQueue;
+  devices = [
+    { type: 'hip', torch_vram_total: 76 * MiB, torch_vram_free: 0 },
+    { type: 'xpu', torch_vram_total: 76 * MiB, torch_vram_free: 76 * MiB },
+  ];
+  const multiple = await client.releaseEvidence({ maxReservedBytes: 128 * MiB });
+  assert.equal(multiple.released, false, 'Per-device allocations cannot multiply the budget');
+  assert.equal(multiple.reason, 'comfy_reserved_memory_above_limit');
+  assert.equal(multiple.memory.reserved_bytes, 152 * MiB);
+  assert.equal(multiple.memory.active_bytes, 76 * MiB);
+});
+
+test('Comfy release rejects unknown, malformed, contradictory and overflowed allocator evidence', async (t) => {
+  let devices;
+  const { client } = await mock(t, (req, response) => json(response, req.url === '/queue' ? emptyQueue : { devices }));
+  const device = { type: 'cuda', torch_vram_total: 76, torch_vram_free: 0 };
+  const invalid = [undefined, null, {}, [], [null], ['device'],
+    [{ ...device, type: 'cpu' }], [{ ...device, type: 'mps' }], [{ ...device, type: 'privateuseone' }],
+    [{ ...device, type: 'unknown' }], [{ torch_vram_total: 76, torch_vram_free: 0 }],
+    [{ ...device, torch_vram_total: undefined }], [{ ...device, torch_vram_free: undefined }],
+    [{ ...device, torch_vram_total: -1 }], [{ ...device, torch_vram_free: -1 }],
+    [{ ...device, torch_vram_total: '76' }], [{ ...device, torch_vram_free: '0' }],
+    [{ ...device, torch_vram_total: false }], [{ ...device, torch_vram_free: false }],
+    [{ ...device, torch_vram_total: NaN }], [{ ...device, torch_vram_free: Infinity }],
+    [{ ...device, torch_vram_total: 76.5 }], [{ ...device, torch_vram_free: 0.5 }],
+    [{ ...device, torch_vram_free: 77 }],
+    [{ ...device, torch_vram_total: 0, torch_vram_free: 1 }],
+    [{ ...device, torch_vram_total: Number.MAX_SAFE_INTEGER + 1 }],
+    [device, { ...device, torch_vram_total: Number.MAX_SAFE_INTEGER }],
+    [device, { ...device, torch_vram_free: undefined }],
+  ];
+  for (const value of invalid) {
+    devices = value;
+    const evidence = await client.releaseEvidence({ maxReservedBytes: Number.MAX_SAFE_INTEGER });
+    assert.equal(evidence.released, false, JSON.stringify(value));
+    assert.equal(evidence.reason, 'comfy_memory_evidence_invalid', JSON.stringify(value));
+    assert.deepEqual(evidence.memory, { valid: false, reserved_bytes: null, active_bytes: null, max_reserved_bytes: Number.MAX_SAFE_INTEGER });
+  }
+});
+
+test('Comfy release rejects invalid allowance before fetching and never coerces strings or null', async () => {
+  const client = new ComfyBackend({ url: 'http://localhost:8188' }, { fetchImpl: () => { throw new Error('must not fetch'); } });
+  for (const maxReservedBytes of [-1, 0.5, '0', null, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    await assert.rejects(client.releaseEvidence({ maxReservedBytes }), { code: 'invalid_release_limit' });
   }
 });
 

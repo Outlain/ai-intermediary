@@ -9,6 +9,11 @@ import { memoryBlock } from './memory-guard.js';
 
 const terminal = new Set(['completed', 'failed', 'interrupted']);
 const problem = (code, statusCode = 503) => Object.assign(new Error(code.replaceAll('_', ' ')), { code, statusCode });
+const MiB = 1024 * 1024;
+const cleanupRetryDelays = [5_000, 15_000, 60_000];
+const bridgeReleaseErrors = new Set(['release_evidence_changed', 'release_flag_request_failed', 'release_flag_read_failed',
+  'release_flags_incomplete', 'release_sequence_incomplete', 'release_worker_mismatch', 'release_unload_failed',
+  'release_unload_unconfirmed', 'release_cache_failed', 'release_cleanup_unverified', 'release_invalidated_by_submission']);
 
 /** Durable media uses the SAME scheduler and operation gate as Ollama. There
  * is deliberately no second worker that could race an LLM or maintenance. */
@@ -30,6 +35,11 @@ export class MediaBroker {
     this.scheduled = new Map();
     this.listeners = new Set();
     this.reconciling = null;
+    this.releaseProofs = new Map();
+    this.releaseStatus = null;
+    this.cleanupAttempts = 0;
+    this.nextCleanupRetry = 0;
+    this.nextObservationRetry = 0;
   }
 
   get enabled() { return this.settings.enabled; }
@@ -58,6 +68,9 @@ export class MediaBroker {
 
   snapshot() {
     return { enabled: this.enabled, blocked: this.blocked, error: this.fault,
+      release: this.releaseStatus ? { ...this.releaseStatus, attempts: this.cleanupAttempts,
+        automatic_retry_exhausted: this.cleanupAttempts >= cleanupRetryDelays.length,
+        next_retry_at: this.nextCleanupRetry ? new Date(this.nextCleanupRetry).toISOString() : null } : null,
       unresolved: this.loaded ? this.store.unresolved().map((job) => job.id) : [],
       jobs: this.loaded ? this.store.list() : [],
       recovery: 'Reconcile completed jobs, or pause and verify the ComfyUI service before manual acknowledgment. No automatic ComfyUI restart is enabled.' };
@@ -137,20 +150,69 @@ export class MediaBroker {
   }
 
   async releaseComfy(signal) {
-    for (const adapter of this.adapters.values()) {
-      await this.bridge(adapter, signal);
-      const queue = await adapter.queue({ signal });
-      if (queue.queue_running.length || queue.queue_pending.length) throw problem('comfy_external_or_unfinished_work');
-      await adapter.requestFree({ signal });
-      const deadline = Date.now() + this.config.gpu_safety.unloadTimeoutMs;
-      let released = false;
-      while (Date.now() < deadline && !signal?.aborted) {
-        const evidence = await adapter.releaseEvidence({ signal });
-        if (evidence.idle && evidence.released) { released = true; break; }
-        await delay(Math.min(500, this.settings.pollIntervalMs), undefined, { signal });
+    for (const [backend, adapter] of this.adapters) {
+      this.releaseProofs.delete(backend);
+      this.releaseStatus = { phase: 'comfy', backend, reason: 'comfy_unload_pending' };
+      try {
+        const initial = await this.bridge(adapter, signal);
+        const queue = await adapter.queue({ signal });
+        if (queue.queue_running.length || queue.queue_pending.length) throw problem('comfy_external_or_unfinished_work');
+        const supportsProof = initial.release_proof?.supported === true;
+        // Rejoin an in-flight native cleanup after a timeout instead of
+        // endlessly issuing new unloads (or abandoning its completion proof).
+        const pendingId = initial.release_proof?.request_id;
+        const requestId = supportsProof ? (!initial.release_proof.completed && !initial.release_proof.error
+          && typeof pendingId === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(pendingId)
+          ? pendingId : randomUUID()) : null;
+        // Old bridges never receive a relaxed allocator limit. HTTP /free
+        // acknowledgment, low utilization and an empty queue are not proof.
+        const maxReservedBytes = supportsProof ? (this.settings.max_idle_torch_vram_mb ?? 0) * MiB : 0;
+        if (supportsProof) await adapter.requestRelease({ requestId, signal });
+        else await adapter.requestFree({ signal });
+        const deadline = Date.now() + this.config.gpu_safety.unloadTimeoutMs;
+        while (Date.now() < deadline && !signal?.aborted) {
+          const evidence = await adapter.releaseEvidence({ maxReservedBytes, signal });
+          const current = supportsProof ? await this.bridge(adapter, signal) : null;
+          if (supportsProof && (current.instance_id !== initial.instance_id || current.release_proof?.supported !== true
+            || current.release_proof.request_id !== requestId)) throw problem('comfy_release_proof_changed');
+          if (current?.release_proof?.error) throw problem(bridgeReleaseErrors.has(current.release_proof.error)
+            ? current.release_proof.error : 'comfy_release_proof_invalid');
+          const proved = !supportsProof || this.validReleaseProof(current, { instanceId: initial.instance_id, requestId });
+          this.releaseStatus = { phase: 'comfy', backend,
+            reason: !proved ? 'comfy_unload_pending' : evidence.reason || (evidence.released ? null : 'comfy_release_unconfirmed'),
+            reserved_bytes: evidence.memory?.reserved_bytes ?? null,
+            active_bytes: evidence.memory?.active_bytes ?? null, max_reserved_bytes: maxReservedBytes };
+          if (evidence.idle && evidence.released && proved) {
+            this.releaseProofs.set(backend, supportsProof ? { instanceId: initial.instance_id, requestId } : null);
+            break;
+          }
+          await delay(Math.min(500, this.settings.pollIntervalMs), undefined, { signal });
+        }
+        if (!this.releaseProofs.has(backend)) throw problem(this.releaseStatus.reason || 'comfy_release_unconfirmed');
+      } catch (error) {
+        this.releaseStatus.reason = error.code || 'comfy_release_unconfirmed';
+        this.deferCleanupRetry();
+        throw error;
       }
-      if (!released) throw problem('comfy_release_unconfirmed');
     }
+  }
+
+  validReleaseProof(info, expected) {
+    const proof = info?.release_proof;
+    return typeof expected?.instanceId === 'string' && info?.instance_id === expected.instanceId
+      && proof?.supported === true && proof.request_id === expected.requestId
+      && proof.completed === true && proof.loaded_models === 0 && proof.error === null;
+  }
+
+  clearReleaseFailure() {
+    this.releaseStatus = null;
+    this.cleanupAttempts = 0;
+    this.nextCleanupRetry = 0;
+    this.nextObservationRetry = 0;
+  }
+
+  deferCleanupRetry() {
+    if (!this.cleanupAttempts && !this.nextCleanupRetry) this.nextCleanupRetry = Date.now() + cleanupRetryDelays[0];
   }
 
   async releaseOllama(signal) {
@@ -169,18 +231,26 @@ export class MediaBroker {
     while (Date.now() < deadline && !signal?.aborted) {
       await this.service.hostHelper.refresh();
       const host = this.service.hostHelper.snapshot();
-      const safe = host.available && host.bound && host.gpus.length === 1 && host.gpus.every((gpu) =>
-        gpu.processes_known && Number.isFinite(gpu.vram_used_bytes)
-        && gpu.vram_used_bytes <= this.settings.max_idle_vram_mb * 1024 * 1024
-        && Number.isFinite(gpu.utilization_percent) && gpu.utilization_percent <= this.settings.max_idle_utilization_percent
-        && gpu.processes.every((process) => process.is_ollama || process.is_comfyui));
+      let reason = null;
+      if (!host.available || !host.bound || host.stale || host.sampled_at == null || host.gpus.length !== 1) reason = 'host_gpu_evidence_unavailable';
+      else if (host.gpus.some((gpu) => !gpu.processes_known || !Array.isArray(gpu.processes)
+        || gpu.processes.some((process) => !process.is_ollama && !process.is_comfyui))) reason = 'gpu_process_ownership_unconfirmed';
+      else if (host.gpus.some((gpu) => !Number.isFinite(gpu.vram_used_bytes) || gpu.vram_used_bytes < 0
+        || gpu.vram_used_bytes > this.settings.max_idle_vram_mb * MiB)) reason = 'physical_vram_above_idle_limit';
+      else if (host.gpus.some((gpu) => !Number.isFinite(gpu.utilization_percent) || gpu.utilization_percent < 0
+        || gpu.utilization_percent > this.settings.max_idle_utilization_percent)) reason = 'gpu_activity_above_idle_limit';
+      const safe = reason === null;
+      this.releaseStatus = { ...this.releaseStatus, phase: 'physical', reason: reason || 'gpu_idle_samples_pending',
+        physical_vram_bytes: host.gpus[0]?.vram_used_bytes ?? null,
+        max_physical_vram_bytes: this.settings.max_idle_vram_mb * MiB, sampled_at: host.sampled_at };
       if (safe && host.sampled_at !== lastSample) samples += 1;
       if (!safe) samples = 0;
       lastSample = host.sampled_at;
       if (samples >= this.settings.stable_samples) return;
       await delay(Math.min(1000, this.settings.pollIntervalMs), undefined, { signal });
     }
-    throw problem('physical_gpu_release_unconfirmed');
+    this.deferCleanupRetry();
+    throw problem(this.releaseStatus?.reason || 'physical_gpu_release_unconfirmed');
   }
 
   async quiesce(signal) {
@@ -193,6 +263,7 @@ export class MediaBroker {
     await this.releaseComfy(signal);
     await this.verifyPhysicalRelease(signal);
     this.verified = true;
+    this.clearReleaseFailure();
   }
 
   async prepareOllama(signal) {
@@ -201,9 +272,12 @@ export class MediaBroker {
     if (!this.verified) await this.quiesce(signal);
     // A raw backend queue that appeared outside this broker is not ours to
     // clear or interrupt. Refuse dispatch instead of guessing it is harmless.
-    for (const adapter of this.adapters.values()) {
-      await this.bridge(adapter, signal);
-      const evidence = await adapter.releaseEvidence({ signal });
+    for (const [backend, adapter] of this.adapters) {
+      const info = await this.bridge(adapter, signal);
+      const proof = this.releaseProofs.get(backend);
+      if (proof && !this.validReleaseProof(info, proof)) throw problem('comfy_release_proof_changed');
+      const maxReservedBytes = proof ? (this.settings.max_idle_torch_vram_mb ?? 0) * MiB : 0;
+      const evidence = await adapter.releaseEvidence({ maxReservedBytes, signal });
       if (!evidence.idle || !evidence.released) throw problem('comfy_external_or_unfinished_work');
     }
   }
@@ -229,6 +303,7 @@ export class MediaBroker {
       dispatched = true;
       job.phase = 'media_running';
       this.verified = false;
+      this.releaseProofs.clear();
       await adapter.submit(record.workflow, { promptId: record.id, clientId: record.client_id || 'ai-intermediary',
         extraData: record.extraData || {}, signal: job.signal,
         beforeDispatch: () => {
@@ -299,7 +374,7 @@ export class MediaBroker {
     }
   }
 
-  async finish(record, result, signal, reconciled = false) {
+  async finish(record, result, signal, reconciled = false, { allowCleanup = true, beforeCleanup = () => {} } = {}) {
     const adapter = this.adapters.get(record.backend);
     // Persist terminal evidence and rescue output bytes BEFORE any unload.
     // Execution completion is not GPU release: the unresolved durable state
@@ -328,6 +403,11 @@ export class MediaBroker {
         copyFailed = true;
       }
     }
+    // Even when cleanup retries are exhausted, keep discovering and importing
+    // completed results. A read/transport problem must not consume the cleanup
+    // budget or leave a later successful video undiscoverable.
+    if (!allowCleanup) return;
+    beforeCleanup();
     // Neither an imported output nor a terminal execution record authorizes
     // another GPU dispatch. This verification is deliberately still mandatory.
     await this.releaseComfy(signal);
@@ -336,6 +416,7 @@ export class MediaBroker {
     if (copyFailed) {
       await this.store.update(record.id, { state: 'failed', error: 'media_output_copy_failed' }, { reconciled });
       this.emit('failed', record, { reason: 'media_output_copy_failed' });
+      if (!reconciled) this.clearReleaseFailure();
       return;
     }
     if (execution.state === 'completed') {
@@ -350,10 +431,14 @@ export class MediaBroker {
     }
     await this.store.cleanup();
     this.emit(execution.state, record);
+    if (!reconciled) this.clearReleaseFailure();
   }
 
-  async reconcile(signal) {
+  async reconcile(signal, { automatic = false } = {}) {
     if (!this.enabled || !this.loaded || this.reconciling) return;
+    if (automatic && Date.now() < this.nextObservationRetry) return;
+    const allowCleanup = !automatic || (this.cleanupAttempts < cleanupRetryDelays.length && Date.now() >= this.nextCleanupRetry);
+    let cleanupAttempted = false;
     this.reconciling = (async () => {
       for (const record of this.store.unresolved()) {
         const adapter = this.adapters.get(record.backend);
@@ -363,17 +448,36 @@ export class MediaBroker {
         const saved = this.store.getInternal(record.id);
         const result = saved.execution ? { ...saved.execution, terminal: true }
           : await adapter.inspect(record.id, { signal });
-        if (result.terminal && terminal.has(result.state)) await this.finish(record, result, signal, true);
+        if (result.terminal && terminal.has(result.state)) await this.finish(record, result, signal, true,
+          { allowCleanup, beforeCleanup: () => { cleanupAttempted = true; } });
       }
-      if (this.fault && this.fault !== 'media_state_unavailable' && !this.store.unresolved().length) {
+      if (allowCleanup && this.fault && this.fault !== 'media_state_unavailable' && !this.store.unresolved().length) {
         // Read-only/eviction verification is safe to retry; generation is not.
+        cleanupAttempted = true;
         await this.releaseOllama(signal);
         await this.releaseComfy(signal);
         await this.verifyPhysicalRelease(signal);
         this.fault = null;
         this.verified = true;
       }
-    })().finally(() => { this.reconciling = null; });
+      if (!this.blocked) this.clearReleaseFailure();
+    })().catch((error) => {
+      if (!signal?.aborted) {
+        if (cleanupAttempted) {
+          this.cleanupAttempts += 1;
+          this.nextCleanupRetry = this.cleanupAttempts < cleanupRetryDelays.length
+            ? Date.now() + cleanupRetryDelays[this.cleanupAttempts] : 0;
+          this.releaseStatus = { ...this.releaseStatus, phase: this.releaseStatus?.phase || 'comfy',
+            reason: error.code || 'media_reconciliation_unavailable' };
+        } else {
+          // Keep read-only completion observation alive after transient history
+          // failures; it never authorizes another generation or GPU handoff.
+          this.nextObservationRetry = Date.now() + 5_000;
+        }
+        this.service.scheduler.wake();
+      }
+      throw error;
+    }).finally(() => { this.reconciling = null; });
     return this.reconciling;
   }
 
@@ -416,5 +520,6 @@ export class MediaBroker {
     beforeAcknowledge();
     this.fault = null;
     this.verified = true;
+    this.clearReleaseFailure();
   }
 }

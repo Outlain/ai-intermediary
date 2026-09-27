@@ -140,7 +140,7 @@ export class ComfyBackend {
   async request(path, { body, maxBytes = this.maxResponseBytes, signal, raw = false, timeoutMs = this.timeoutMs, beforeDispatch } = {}) {
     // Paths originate only in adapter methods. Do not expose this method as an
     // arbitrary user-controlled proxy route.
-    if (typeof path !== 'string' || !/^\/(?:system_stats|queue|history\/[0-9a-f-]+|object_info|prompt|interrupt|free|intermediary\/(?:status|outputs\/delete)|view\?[^#]*)$/.test(path)) {
+    if (typeof path !== 'string' || !/^\/(?:system_stats|queue|history\/[0-9a-f-]+|object_info|prompt|interrupt|free|intermediary\/(?:status|release|outputs\/delete)|view\?[^#]*)$/.test(path)) {
       fail('invalid_route', 'Unsupported ComfyUI adapter route');
     }
     const payload = body === undefined ? undefined : plainJson(body, this.maxRequestBytes);
@@ -290,15 +290,36 @@ export class ComfyBackend {
     return { requested: true, released: false };
   }
 
+  async requestRelease({ requestId, signal } = {}) {
+    promptId(requestId);
+    // This endpoint schedules the SAME native worker cleanup as /free. The
+    // acknowledgment is not completion; only matching bridge evidence is.
+    return this.request('/intermediary/release', { body: { request_id: requestId }, signal });
+  }
+
   async releaseEvidence({ maxReservedBytes = 0, signal } = {}) {
     if (!Number.isSafeInteger(maxReservedBytes) || maxReservedBytes < 0) fail('invalid_release_limit', 'Invalid ComfyUI release threshold');
     const stats = await this.health({ signal });
     const queue = await this.queue({ signal });
     const idle = queue.queue_running.length === 0 && queue.queue_pending.length === 0;
     const devices = Array.isArray(stats.devices) ? stats.devices : [];
-    const valid = devices.length > 0 && devices.every((device) => isObject(device) && ['cuda', 'hip', 'xpu', 'mps', 'privateuseone'].includes(device.type)
-      && Number.isSafeInteger(device.torch_vram_total) && device.torch_vram_total >= 0);
-    return { idle, released: idle && valid && devices.every((device) => device.torch_vram_total <= maxReservedBytes), devices };
+    // ComfyUI's CUDA/ROCm/XPU stats expose reserved bytes as torch_vram_total
+    // and reserved minus active bytes as torch_vram_free. MPS/system memory
+    // and DirectML placeholder values are not comparable allocator evidence.
+    // A small residual is not, by itself, proof that its allocations are safe:
+    // callers must combine this bounded snapshot with terminal job evidence,
+    // an explicit unload request and fresh stable physical GPU verification.
+    let valid = devices.length > 0 && devices.every((device) => isObject(device) && ['cuda', 'hip', 'xpu'].includes(device.type)
+      && Number.isSafeInteger(device.torch_vram_total) && device.torch_vram_total >= 0
+      && Number.isSafeInteger(device.torch_vram_free) && device.torch_vram_free >= 0
+      && device.torch_vram_free <= device.torch_vram_total);
+    const reservedBytes = valid ? devices.reduce((sum, device) => sum + device.torch_vram_total, 0) : null;
+    const activeBytes = valid ? devices.reduce((sum, device) => sum + device.torch_vram_total - device.torch_vram_free, 0) : null;
+    valid = valid && Number.isSafeInteger(reservedBytes) && Number.isSafeInteger(activeBytes);
+    const reason = !idle ? 'comfy_queue_busy' : !valid ? 'comfy_memory_evidence_invalid'
+      : reservedBytes > maxReservedBytes ? 'comfy_reserved_memory_above_limit' : null;
+    return { idle, released: reason === null, reason, devices,
+      memory: { valid, reserved_bytes: valid ? reservedBytes : null, active_bytes: valid ? activeBytes : null, max_reserved_bytes: maxReservedBytes } };
   }
 
   async downloadArtifact(artifact, destination, { maxBytes = this.maxArtifactBytes, signal } = {}) {

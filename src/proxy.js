@@ -1336,7 +1336,7 @@ export class ProxyService {
       if (this.media.blocked) {
         if (!this.scheduler.active && !this.gate.active) {
           const release = await this.gate.acquire('maintenance', signal);
-          try { await this.media.reconcile(signal); } catch { /* uncertainty remains fenced */ }
+          try { await this.media.reconcile(signal, { automatic: true }); } catch { /* latest failure is visible; uncertainty remains fenced */ }
           finally { release(); }
         }
         await this.scheduler.waitForChange(Math.max(1000, this.config.media.pollIntervalMs), signal);

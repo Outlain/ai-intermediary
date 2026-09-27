@@ -193,6 +193,98 @@ test('media uncertainty overrides idle Ollama, blocks resume and cannot invoke O
   assert.equal(nodes.get('media-recovery-acknowledge').disabled, true, 'turning media off cannot clear an existing lock');
 });
 
+test('completed media awaiting release shows saved results, latest cleanup failure and bounded retry state', () => {
+  const { ui, nodes } = harness('dashboard');
+  const data = { backend: { reachable: true, state: 'healthy' }, scheduler: { state: 'idle' },
+    maintenance: { state: 'paused', paused: true, control_available: true },
+    media: { enabled: true, blocked: true, unresolved: ['job'], jobs: [{ id: 'job', source: 'media', backend: 'comfy',
+      state: 'uncertain', reason: 'backend_transport_error', execution_state: 'completed', outputsImported: true,
+      artifacts: [{ status: 'available', filename: 'saved.mp4' }] }],
+    release: { phase: 'comfy', backend: 'comfy', reason: 'comfy_torch_residual_exceeded',
+      reserved_bytes: 76 * 1024 ** 2, active_bytes: 0, max_reserved_bytes: 128 * 1024 ** 2,
+      sampled_at: new Date().toISOString(), attempts: 2, automatic_retry_exhausted: false,
+      next_retry_at: new Date(Date.now() + 60_000).toISOString(), token: 'must-not-render' } } };
+  ui.render(data); ui.setMaintenanceToken('private-admin');
+  assert.equal(nodes.get('overall-state').textContent, 'Media completed; GPU release pending');
+  assert.match(nodes.get('overall-detail').textContent, /output import succeeded/);
+  assert.equal(nodes.get('media-state').textContent, 'GPU release pending');
+  assert.equal(nodes.get('media-uncertain').textContent, '1', 'the durable lock is not presented as settled');
+  assert.equal(nodes.get('media-running').textContent, '0');
+  assert.match(nodes.get('media-jobs').textContent, /Media completed; GPU release pending/);
+  assert.match(nodes.get('media-jobs').textContent, /1 retained output/);
+  assert.match(nodes.get('media-jobs').textContent, /Latest release check: Comfy Torch Residual Exceeded/);
+  assert.match(nodes.get('media-jobs').textContent, /Original incident: Backend Transport Error/);
+  assert.match(nodes.get('media-error').textContent, /PyTorch reserved: 76 MiB \/ 128 MiB ceiling/);
+  assert.match(nodes.get('media-error').textContent, /PyTorch active: 0 MiB/);
+  assert.match(nodes.get('media-error').textContent, /Cleanup attempts: 2/);
+  assert.match(nodes.get('media-error').textContent, /Automatic cleanup recheck in/);
+  assert.match(nodes.get('media-error').textContent, /Generation is not resubmitted/);
+  assert.doesNotMatch(nodes.get('media-error').textContent, /must-not-render|private-admin/);
+  assert.match(nodes.get('media-recovery-detail').textContent, /Do not restart ComfyUI just because/);
+  assert.doesNotMatch(nodes.get('media-recovery-detail').textContent, /^Pause inference, stop/);
+  assert.equal(nodes.get('resume-button').disabled, true);
+  assert.equal(nodes.get('recovery-check').disabled, true);
+  assert.match(nodes.get('media-recovery-control-state').textContent, /Bounded automatic cleanup/);
+
+  data.media.release = { phase: 'physical', backend: 'comfy', reason: 'media_gpu_busy',
+    physical_vram_bytes: 676 * 1024 ** 2, max_physical_vram_bytes: 512 * 1024 ** 2,
+    attempts: 4, automatic_retry_exhausted: true, next_retry_at: null };
+  ui.render(data);
+  assert.match(nodes.get('media-error').textContent, /Latest release check: Media Gpu Busy/);
+  assert.match(nodes.get('media-error').textContent, /Physical VRAM: 676 MiB \/ 512 MiB ceiling/);
+  assert.doesNotMatch(nodes.get('media-error').textContent, /Torch Residual|Automatic cleanup recheck/);
+  assert.match(nodes.get('media-error').textContent, /retries exhausted.*Manual verification required/);
+  assert.match(nodes.get('media-recovery-detail').textContent, /automatic cleanup retries are exhausted/);
+  assert.match(nodes.get('media-recovery-detail').textContent, /For manual acknowledgment, pause inference/);
+  assert.equal(nodes.get('resume-button').disabled, true);
+});
+
+test('unknown execution, missing imports or unresolved IDs never inherit another job completion', () => {
+  const { ui, nodes } = harness('dashboard');
+  const complete = { id: 'complete', state: 'uncertain', execution_state: 'completed', outputsImported: true, artifacts: [] };
+  for (const jobs of [
+    [{ ...complete, execution_state: null }],
+    [{ ...complete, outputsImported: false }],
+    [{ ...complete, outputsImported: undefined }],
+    [{ ...complete, execution_state: 'failed' }],
+    [complete, { id: 'unknown', state: 'uncertain', reason: 'backend_transport_error', execution_state: null }],
+  ]) {
+    const data = { media: { enabled: true, blocked: true, unresolved: jobs.map((job) => job.id), jobs } };
+    ui.render(data);
+    assert.match(nodes.get('overall-state').textContent, /Shared GPU blocked/);
+    assert.equal(nodes.get('media-state').textContent, 'Recovery required');
+    assert.match(nodes.get('media-jobs').textContent, /Uncertain · recovery required/);
+    assert.match(nodes.get('media-recovery-detail').textContent, /^Pause inference, stop the old/);
+  }
+  ui.render({ media: { enabled: true, blocked: true, unresolved: ['complete', 'missing'], jobs: [complete] } });
+  assert.match(nodes.get('overall-state').textContent, /Shared GPU blocked/);
+  assert.equal(nodes.get('media-uncertain').textContent, '2');
+  ui.render({ media: { enabled: true, blocked: true, unresolved: [], jobs: [] } });
+  assert.match(nodes.get('overall-state').textContent, /Shared GPU blocked/, 'no evidence is not completed work');
+});
+
+test('media release diagnostics render bounded known fields as text and never coerce unknown memory to zero', () => {
+  const { ui, nodes } = harness('dashboard');
+  ui.render({ media: { enabled: true, blocked: true, jobs: [], release: {
+    phase: 'comfy', reason: '<img src=invalid>', reserved_bytes: null, active_bytes: '0', max_reserved_bytes: 128 * 1024 ** 2,
+    physical_vram_bytes: -1, attempts: null, automatic_retry_exhausted: false, next_retry_at: 'invalid',
+    token: 'hidden-token', request: { authorization: 'hidden-auth' },
+  } } });
+  assert.match(nodes.get('media-error').textContent, /Latest release check:/);
+  assert.equal(nodes.get('media-error').children.length, 0, 'untrusted diagnostic strings are never parsed as HTML');
+  assert.doesNotMatch(nodes.get('media-error').textContent, /0 MiB|Physical VRAM|Cleanup attempts|Automatic cleanup recheck|hidden-token|hidden-auth/);
+});
+
+test('settings exposes separate residual and physical memory limits and preserves explicit strict zero in the form', () => {
+  const { ui, inputs } = harness('settings');
+  ui.applyEnvelope({ settings: maskSettings(testConfig({ media: { max_idle_torch_vram_mb: 0, max_idle_vram_mb: 512 } })),
+    valid: true, revision: 'media-settings', infrastructure: { ui_can_apply: true } });
+  assert.equal(inputs.find((input) => input.dataset.path === 'media.max_idle_torch_vram_mb').value, '0');
+  assert.equal(inputs.find((input) => input.dataset.path === 'media.max_idle_vram_mb').value, '512');
+  assert.match(SETTINGS_DASHBOARD_HTML, /data-path="media\.max_idle_torch_vram_mb" type="number" min="0" max="256"/);
+  assert.match(SETTINGS_DASHBOARD_HTML, /Older bridges without that proof still require zero/);
+});
+
 test('media acknowledgment needs a maintenance token, pause and explicit stopped-service confirmation', async () => {
   const { ui, nodes, context } = harness('dashboard');
   const data = { media: { enabled: true, blocked: true, unresolved: ['job'], jobs: [] },

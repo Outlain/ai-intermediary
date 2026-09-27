@@ -145,6 +145,47 @@
   function recoveryIsActive(data) {
     return ollamaRecoveryIsActive(data) || Boolean(data && data.media && data.media.blocked);
   }
+  function mediaOutputCompleted(job) {
+    return Boolean(job && job.execution_state === 'completed' && job.outputsImported === true);
+  }
+  function mediaCleanupPending(media) {
+    if (!media || !media.blocked) return false;
+    var jobs = Array.isArray(media.jobs) ? media.jobs : [];
+    var unresolved = new Set(jobs.filter(function (job) { return job.state === 'uncertain'; }).map(function (job) { return job.id; }));
+    (Array.isArray(media.unresolved) ? media.unresolved : []).forEach(function (id) { unresolved.add(id); });
+    return unresolved.size > 0 && Array.from(unresolved).every(function (id) {
+      return mediaOutputCompleted(jobs.find(function (job) { return job.id === id; }));
+    });
+  }
+  function mediaReleaseDetail(release) {
+    if (!release || typeof release !== 'object') return '';
+    var details = [];
+    if (release.reason) details.push('Latest release check: ' + titleCase(release.reason));
+    if (release.phase === 'comfy') details.push('ComfyUI cleanup');
+    if (release.phase === 'physical') details.push('Physical GPU verification');
+    if (typeof release.backend === 'string') details.push('Backend: ' + release.backend);
+    function memory(value, ceiling, label) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return;
+      var text = label + ': ' + (value / 1024 / 1024).toFixed(1).replace(/\.0$/, '') + ' MiB';
+      if (typeof ceiling === 'number' && Number.isFinite(ceiling) && ceiling >= 0) {
+        text += ' / ' + (ceiling / 1024 / 1024).toFixed(1).replace(/\.0$/, '') + ' MiB ceiling';
+      }
+      details.push(text);
+    }
+    memory(release.reserved_bytes, release.max_reserved_bytes, 'PyTorch reserved');
+    memory(release.active_bytes, null, 'PyTorch active');
+    memory(release.physical_vram_bytes, release.max_physical_vram_bytes, 'Physical VRAM');
+    if (release.sampled_at) details.push('Sample: ' + formatRelativeDate(release.sampled_at));
+    if (typeof release.attempts === 'number' && Number.isSafeInteger(release.attempts) && release.attempts >= 0) {
+      details.push('Cleanup attempts: ' + formatInteger(release.attempts));
+    }
+    if (release.automatic_retry_exhausted === true) {
+      details.push('Automatic cleanup retries exhausted. Manual verification required; GPU remains blocked.');
+    } else if (release.next_retry_at && Number.isFinite(new Date(release.next_retry_at).getTime())) {
+      details.push('Automatic cleanup recheck ' + formatRelativeDate(release.next_retry_at) + ' (earliest eligible time). Generation is not resubmitted.');
+    }
+    return details.join(' · ');
+  }
 
   function setConnection(kind, label) {
     var badge = byId('connection-status');
@@ -179,6 +220,12 @@
     var maintenanceState = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
     var ready = typeof service.ready === 'boolean' ? service.ready : service.state === 'ready';
     if (data.media && data.media.blocked) {
+      if (mediaCleanupPending(data.media)) {
+        return { css: 'health-warning', title: 'Media completed; GPU release pending',
+          detail: 'Generation and output import succeeded. Shared GPU work stays blocked until cleanup and release are verified. '
+            + (data.media.release && data.media.release.reason ? 'Latest check: ' + titleCase(data.media.release.reason) + '. ' : '')
+            + 'See Media recovery below; do not regenerate the saved result.' };
+      }
       return { css: 'health-danger', title: 'Shared GPU blocked · media recovery required',
         detail: 'A ComfyUI operation or its GPU release is unverified. New GPU work is blocked; check Media recovery below. An idle Ollama API does not clear this lock.' };
     }
@@ -747,7 +794,9 @@
     badge.className = 'tag tag-neutral';
     if (recoveryIsActive(data)) {
       badge.className = 'tag tag-danger'; setText('gpu-owner-state', 'Ownership blocked');
-      setText('gpu-owner-detail', 'Previous GPU work or its release has not been verified. The scheduler must not hand the GPU to another engine yet.');
+      setText('gpu-owner-detail', mediaCleanupPending(media)
+        ? 'Media generation and output import completed. GPU release is still pending; another engine must wait for verified cleanup.'
+        : 'Previous GPU work or its release has not been verified. The scheduler must not hand the GPU to another engine yet.');
     } else if (executing.length) {
       badge.className = 'tag tag-good'; setText('gpu-owner-state', 'Media owns GPU');
       setText('gpu-owner-detail', executing.map(function (job) { return job.source + ' → ' + job.backend + ' · ' + titleCase(job.state) + ' · ' + compactId(job.id); }).join('; '));
@@ -764,27 +813,35 @@
 
   function renderMedia(data) {
     var media = data.media || {}, jobs = Array.isArray(media.jobs) ? media.jobs : [];
+    var cleanupPending = mediaCleanupPending(media), release = media.release || {};
     var uncertainIds = new Set(jobs.filter(function (job) { return job.state === 'uncertain'; }).map(function (job) { return job.id; }));
     if (media.blocked) (Array.isArray(media.unresolved) ? media.unresolved : []).forEach(function (id) { uncertainIds.add(id); });
     var queued = jobs.filter(function (job) { return job.state === 'queued'; });
     var running = jobs.filter(function (job) { return ['dispatching', 'running'].includes(job.state) && !uncertainIds.has(job.id); });
     var badge = byId('media-state');
     badge.className = media.blocked ? 'tag tag-danger' : media.enabled ? 'tag tag-good' : 'tag tag-neutral';
-    setText('media-state', media.blocked ? 'Recovery required' : media.enabled ? 'Enabled' : data.media ? 'Disabled' : 'Not reported');
-    setText('media-detail', media.blocked ? 'Media completion or GPU release is uncertain. No new shared GPU workload may start until recovery is verified.'
+    setText('media-state', cleanupPending ? 'GPU release pending' : media.blocked ? 'Recovery required' : media.enabled ? 'Enabled' : data.media ? 'Disabled' : 'Not reported');
+    setText('media-detail', cleanupPending ? 'Media completed; GPU release pending. Generation succeeded and outputs were imported. Saved results remain available while shared GPU work stays blocked.'
+      : media.blocked ? 'Media completion or GPU release is uncertain. No new shared GPU workload may start until recovery is verified.'
       : media.enabled ? 'Durable media jobs share the same source priorities and single GPU as Ollama.'
         : 'Media execution is disabled. Existing Ollama and Frigate behavior remains available unless a previous media operation still needs recovery.');
     setText('media-queued', formatInteger(queued.length)); setText('media-running', formatInteger(running.length));
     setText('media-uncertain', formatInteger(uncertainIds.size));
-    setHidden('media-error', !media.error); setText('media-error', media.error ? titleCase(media.error) : '');
+    var releaseDetail = media.blocked ? mediaReleaseDetail(release) : '';
+    setHidden('media-error', !media.error && !releaseDetail);
+    setText('media-error', [releaseDetail, media.error ? 'Media error: ' + titleCase(media.error) : ''].filter(Boolean).join(' · '));
     var list = byId('media-jobs'); list.replaceChildren();
     setHidden('media-jobs-empty', jobs.length > 0);
     jobs.slice(0, 20).forEach(function (job) {
-      var uncertain = uncertainIds.has(job.id), state = uncertain ? 'Uncertain · recovery required' : titleCase(job.state);
+      var uncertain = uncertainIds.has(job.id), completed = mediaOutputCompleted(job);
+      var state = uncertain ? completed ? 'Media completed; GPU release pending' : 'Uncertain · recovery required' : titleCase(job.state);
       var row = create('li', 'queue-item');
       row.appendChild(create('strong', '', compactId(job.id) + ' · ' + state));
       row.appendChild(create('p', 'muted', 'Source: ' + (job.source || 'Unknown') + ' → Backend: ' + (job.backend || 'Unknown')));
-      if (job.reason || job.error) row.appendChild(create('p', 'muted', titleCase(job.reason || job.error)));
+      if (uncertain && release.reason && (!release.backend || release.backend === job.backend)) {
+        row.appendChild(create('p', 'muted', 'Latest release check: ' + titleCase(release.reason)));
+      }
+      if (job.reason || job.error) row.appendChild(create('p', 'muted', (uncertain && release.reason ? 'Original incident: ' : '') + titleCase(job.reason || job.error)));
       var artifacts = Array.isArray(job.artifacts) ? job.artifacts : [];
       if (artifacts.length) {
         var available = artifacts.filter(function (artifact) { return artifact.status === 'available'; }).length;
@@ -795,8 +852,14 @@
     setHidden('media-jobs-limit', jobs.length <= 20);
     setText('media-jobs-limit', 'Showing the first 20 of ' + formatInteger(jobs.length) + ' retained media jobs. Use the media gateway for the full job list.');
     setHidden('media-recovery-panel', !media.blocked);
-    setText('media-recovery-detail', 'Pause inference, stop the old ComfyUI service and verify all of its previous workers have stopped. '
-      + (media.recovery || 'An idle GPU reading or closed browser alone is not proof.'));
+    setText('media-recovery-detail', cleanupPending
+      ? release.automatic_retry_exhausted === true
+        ? 'The output is saved, but automatic cleanup retries are exhausted. Inspect the latest release check and host before manual recovery. '
+          + 'For manual acknowledgment, pause inference, stop the old ComfyUI service and verify its previous workers have stopped. Never rerun the saved generation to clear this lock.'
+        : 'The output is saved; generation does not need to run again. Cleanup verification may retry automatically within its bounds. '
+          + 'Do not restart ComfyUI just because release is pending. If retries are exhausted, inspect the latest release check and verify the host before manual recovery. New GPU work remains blocked.'
+      : 'Pause inference, stop the old ComfyUI service and verify all of its previous workers have stopped. '
+        + (media.recovery || 'An idle GPU reading or closed browser alone is not proof.'));
     syncMediaRecoveryControls();
   }
 
@@ -810,7 +873,9 @@
       : !authorized ? 'Log in with your administrator password to acknowledge recovery.'
         : !paused ? 'Pause inference first and wait for any active GPU workload to finish.'
           : busy ? 'Another workload or control action is active. Wait before acknowledging.'
-            : 'Verify the old service and workers on the host, then check the confirmation. Acknowledgment never resumes a manual pause.');
+            : mediaCleanupPending(media) && media.release && media.release.automatic_retry_exhausted !== true && media.release.next_retry_at
+              ? 'Bounded automatic cleanup checks are pending. Manual acknowledgment is separate and still requires verified stopped workers. It never resumes a manual pause.'
+              : 'Verify the old service and workers on the host, then check the confirmation. Acknowledgment never resumes a manual pause.');
   }
 
   async function performMediaRecoveryAction() {

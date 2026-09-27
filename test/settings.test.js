@@ -120,14 +120,37 @@ test('media settings expose safe policies but never permit browser-managed secre
     assert.ok(result.diagnostics.some((item) => item.path === `media.${field}`));
   }
   const result = validateSettingsDraft({ ...options, draft: { media: { retention: '24h', max_jobs: 20,
-    max_idle_utilization_percent: 3, stable_samples: 4, allowed_node_types: ['KSampler'] } } });
+    max_idle_torch_vram_mb: 128, max_idle_utilization_percent: 3, stable_samples: 4, allowed_node_types: ['KSampler'] } } });
   assert.equal(result.valid, true);
   assert.equal(result.settings.media.retention, '24h');
+  assert.equal(result.settings.media.max_idle_torch_vram_mb, 128);
   assert.equal(result.settings.media.state_path, undefined);
   assert.equal(result.settings.media.auth_token, undefined);
   assert.equal(result.settings.media.pollIntervalMs, undefined);
   assert.deepEqual(maskSettings({ backends: { bad: { type: 'comfyui', url: 'http://user:secret@host:8188/?token=hidden' } } }).backends.bad,
     { type: 'comfyui', url: 'http://host:8188/' });
+});
+
+test('media residual memory setting validates and persists independently of physical and utilization ceilings', async (t) => {
+  const options = fixture(t);
+  options.baseRaw.media = { max_idle_vram_mb: 512, max_idle_utilization_percent: 3 };
+  const store = new SettingsStore(options); await store.load();
+  assert.equal(store.snapshot().settings.media.max_idle_torch_vram_mb, 128);
+  for (const value of [-1, 257, 1.5, '128', null, true]) {
+    const result = store.validate({ media: { max_idle_torch_vram_mb: value } });
+    assert.equal(result.valid, false, `reject ${JSON.stringify(value)}`);
+    assert.ok(result.diagnostics.some((item) => item.path === 'media.max_idle_torch_vram_mb'));
+  }
+  await store.save({ media: { max_idle_torch_vram_mb: 0 } });
+  let restored = new SettingsStore(options); await restored.load();
+  assert.equal(restored.getEffectiveConfig().media.max_idle_torch_vram_mb, 0, 'strict zero survives restart');
+  assert.equal(restored.getEffectiveConfig().media.max_idle_vram_mb, 512);
+  assert.equal(restored.getEffectiveConfig().media.max_idle_utilization_percent, 3);
+  await restored.save({ media: { max_idle_torch_vram_mb: 256, max_idle_vram_mb: 1024 } });
+  restored = new SettingsStore(options); await restored.load();
+  assert.equal(restored.snapshot().settings.media.max_idle_torch_vram_mb, 256);
+  assert.equal(restored.snapshot().settings.media.max_idle_vram_mb, 1024);
+  assert.equal(restored.snapshot().settings.media.max_idle_utilization_percent, 3);
 });
 
 test('source policies and weekly schedules round-trip without replacing legacy fallback or secrets', async (t) => {

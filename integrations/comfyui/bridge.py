@@ -8,6 +8,7 @@ import asyncio
 import contextvars
 import copy
 import hmac
+import inspect
 import json
 import os
 import re
@@ -79,7 +80,7 @@ def _safe_inputs(value, depth=0, key=""):
 
 
 class Guard:
-    def __init__(self, server, node_registry, output_root, *, token, disable_api_nodes):
+    def __init__(self, server, node_registry, output_root, *, token, disable_api_nodes, memory_manager=None):
         self.server = server
         self.node_registry = node_registry
         self.token = token if isinstance(token, str) and token.strip() and len(token) <= 4096 and not re.search(r"[\r\n]", token) else ""
@@ -90,6 +91,9 @@ class Guard:
         self.lock = threading.RLock()
         self.storage_error = False
         self.installed = False
+        self._memory_manager = memory_manager
+        self._release = None
+        self._release_observers = []
         self._original_put = server.prompt_queue.put
         # Install the queue fence before storage initialization. Initialization
         # failure must never leave the queue open to unscheduled raw requests.
@@ -98,6 +102,7 @@ class Guard:
             self._read_ledger()
         except (OSError, ValueError, BridgeError):
             self.storage_error = True
+        self._install_release_observers()
 
     def status(self):
         return {
@@ -110,7 +115,151 @@ class Guard:
             "owned_output_cleanup": True,
             "storage_healthy": not self.storage_error,
             "output_namespace": NAMESPACE,
+            "release_proof": self.release_proof(),
         }
+
+    def _queue_empty(self):
+        try:
+            current = self.server.prompt_queue.get_current_queue()
+            return (isinstance(current, (tuple, list)) and len(current) == 2
+                    and all(isinstance(items, list) and not items for items in current))
+        except Exception:
+            return False
+
+    def _loaded_model_count(self):
+        try:
+            models = self._memory_manager.loaded_models()
+            return len(models) if isinstance(models, list) else None
+        except Exception:
+            return None
+
+    def _observers_intact(self):
+        return bool(self._release_observers) and all(
+            getattr(owner, name, None) is observer for owner, name, observer in self._release_observers)
+
+    def release_proof(self):
+        with self.lock:
+            supported = self._observers_intact()
+            loaded = self._loaded_model_count() if supported else None
+            state = self._release
+            if state and state["phase"] == "completed" and (not supported or loaded != 0 or not self._queue_empty()):
+                state.update(phase="invalidated", error="release_evidence_changed")
+            return {"supported": supported, "request_id": state["request_id"] if state else None,
+                    "completed": bool(supported and state and state["phase"] == "completed"),
+                    "loaded_models": loaded, "error": state["error"] if state else None}
+
+    def request_release(self, payload):
+        if not isinstance(payload, dict) or set(payload) != {"request_id"}:
+            raise BridgeError("invalid_release_request")
+        request_id = valid_id(payload["request_id"])
+        with self.lock:
+            if not self.status()["local_only"]:
+                raise BridgeError("local_bridge_not_ready", 503)
+            if not self._observers_intact():
+                raise BridgeError("release_proof_unsupported", 503)
+            if not self._queue_empty():
+                raise BridgeError("backend_busy", 409)
+            if self._release and self._release["request_id"] == request_id:
+                return {"requested": True, "release_proof": self.release_proof()}
+            if self._release and self._release["phase"] in ("queued", "consumed", "unloading", "unloaded"):
+                raise BridgeError("release_in_progress", 409)
+            state = {"request_id": request_id, "phase": "queued", "worker": None, "error": None}
+            self._release = state
+            try:
+                # Request native worker cleanup, exactly as /free does. Never
+                # execute GPU operations concurrently on the HTTP thread.
+                self.server.prompt_queue.set_flag("unload_models", True)
+                self.server.prompt_queue.set_flag("free_memory", True)
+            except Exception:
+                state.update(phase="failed", error="release_flag_request_failed")
+                raise BridgeError("release_flag_request_failed", 503) from None
+            return {"requested": True, "release_proof": self.release_proof()}
+
+    def _fail_release(self, state, code):
+        with self.lock:
+            if state is not None and self._release is state:
+                state.update(phase="failed", error=code)
+
+    def _install_release_observers(self):
+        queue, manager = self.server.prompt_queue, self._memory_manager
+        methods = [getattr(queue, "get_flags", None), getattr(queue, "set_flag", None)] + [
+            getattr(manager, name, None) for name in ("unload_all_models", "soft_empty_cache", "loaded_models")]
+        if not all(callable(method) and not inspect.iscoroutinefunction(method) for method in methods):
+            return
+        original_flags, original_unload, original_cache = queue.get_flags, manager.unload_all_models, manager.soft_empty_cache
+
+        def observed_flags(*args, **kwargs):
+            # Serialize flag consumption with setting BOTH native flags; the
+            # original get_flags/reset semantics and returned object are intact.
+            with self.lock:
+                state = self._release
+                try:
+                    flags = original_flags(*args, **kwargs)
+                except BaseException:
+                    self._fail_release(state, "release_flag_read_failed")
+                    raise
+                reset = kwargs.get("reset", args[0] if args else True)
+                if state and state["phase"] == "queued" and reset is True:
+                    if isinstance(flags, dict) and flags.get("unload_models") is True and flags.get("free_memory") is True:
+                        state.update(phase="consumed", worker=threading.current_thread())
+                    else:
+                        state.update(phase="failed", error="release_flags_incomplete")
+                elif state and state["phase"] in ("consumed", "unloading", "unloaded") and reset is True:
+                    # A new worker iteration cannot finish an earlier partial
+                    # cleanup sequence and claim its old nonce was completed.
+                    state.update(phase="failed", error="release_sequence_incomplete")
+                return flags
+
+        def observed_unload(*args, **kwargs):
+            with self.lock:
+                state = self._release
+                observed = bool(state and state["phase"] == "consumed")
+                if observed and state["worker"] is not threading.current_thread():
+                    self._fail_release(state, "release_worker_mismatch")
+                    observed = False
+                if observed:
+                    state["phase"] = "unloading"
+            try:
+                result = original_unload(*args, **kwargs)
+            except BaseException:
+                self._fail_release(state if observed else None, "release_unload_failed")
+                raise
+            with self.lock:
+                if observed and self._release is state and state["phase"] == "unloading":
+                    if inspect.isawaitable(result):
+                        state.update(phase="failed", error="release_unload_unconfirmed")
+                    else:
+                        state["phase"] = "unloaded"
+            return result
+
+        def observed_cache(*args, **kwargs):
+            with self.lock:
+                state = self._release
+                observed = bool(state and state["phase"] == "unloaded")
+                if observed and state["worker"] is not threading.current_thread():
+                    self._fail_release(state, "release_worker_mismatch")
+                    observed = False
+            try:
+                # unload_all_models may itself invoke soft_empty_cache. Those
+                # nested calls occur before unload returns and are NOT proof.
+                result = original_cache(*args, **kwargs)
+            except BaseException:
+                self._fail_release(state if observed else None, "release_cache_failed")
+                raise
+            with self.lock:
+                if observed and self._release is state and state["phase"] == "unloaded":
+                    loaded = self._loaded_model_count()
+                    if not inspect.isawaitable(result) and self._observers_intact() and loaded == 0 and self._queue_empty():
+                        state.update(phase="completed", error=None)
+                    else:
+                        state.update(phase="failed", error="release_cleanup_unverified")
+            return result
+
+        queue.get_flags = observed_flags
+        manager.unload_all_models = observed_unload
+        manager.soft_empty_cache = observed_cache
+        self._release_observers = [(queue, "get_flags", observed_flags), (manager, "unload_all_models", observed_unload),
+                                   (manager, "soft_empty_cache", observed_cache)]
 
     def authenticate(self, supplied):
         if not self.token or not isinstance(supplied, str) or not hmac.compare_digest(supplied.encode(), self.token.encode()):
@@ -228,6 +377,8 @@ class Guard:
             copied = list(item)
             copied[2] = final["prompt"]
             context["enqueued"] = True
+            if self._release:
+                self._release.update(phase="invalidated", error="release_invalidated_by_submission")
             return self._original_put(tuple(copied))
 
     def _history_artifacts(self, prompt_id):
@@ -322,10 +473,10 @@ async def read_json(request):
         raise BridgeError("invalid_json") from None
 
 
-def install(server, node_registry, output_root, *, web, token=None, disable_api_nodes=False):
+def install(server, node_registry, output_root, *, web, token=None, disable_api_nodes=False, memory_manager=None):
     guard = Guard(server, node_registry, output_root,
                   token=token if token is not None else os.environ.get("AI_INTERMEDIARY_COMFY_TOKEN", ""),
-                  disable_api_nodes=disable_api_nodes)
+                  disable_api_nodes=disable_api_nodes, memory_manager=memory_manager)
 
     @web.middleware
     async def middleware(request, handler):
@@ -358,8 +509,14 @@ def install(server, node_registry, output_root, *, web, token=None, disable_api_
         payload = await asyncio.wait_for(read_json(request), 15)
         return web.json_response(guard.delete_artifacts(payload))
 
+    async def release_route(request):
+        guard.authenticate(request.headers.get(HEADER))
+        payload = await asyncio.wait_for(read_json(request), 15)
+        return web.json_response(guard.request_release(payload))
+
     server.app.middlewares.insert(0, middleware)
     server.routes.get("/intermediary/status")(status_route)
     server.routes.post("/intermediary/outputs/delete")(delete_route)
+    server.routes.post("/intermediary/release")(release_route)
     guard.installed = True
     return guard

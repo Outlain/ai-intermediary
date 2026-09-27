@@ -232,3 +232,10 @@ frigate:
 # authenticated ComfyUI bridge, a media source/port and trusted nodes are ready.
 media:
   enabled: false
+  # Release thresholds are not model size limits. Keep the physical default
+  # unless measured, fully unloaded driver/context overhead requires tuning.
+  max_idle_vram_mb: 512
+  # A nonzero PyTorch residue needs updated-bridge unload proof, an empty
+  # queue and stable physical/process checks. Older bridges still require zero.
+  # 0 restores strict zero; bounded to 0..256 MiB.
+  max_idle_torch_vram_mb: 128

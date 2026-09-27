@@ -76,6 +76,7 @@ const EDITABLE_TREE = Object.freeze({
     max_workflow_bytes: integer({ min: 1024, max: 2 * 1024 ** 2 }),
     max_output_bytes: integer({ min: 1024, max: 16 * 1024 ** 3 }),
     max_idle_vram_mb: integer({ min: 64, max: 4096 }),
+    max_idle_torch_vram_mb: integer({ min: 0, max: 256 }),
     max_idle_utilization_percent: integer({ min: 0, max: 10 }),
     stable_samples: integer({ min: 2, max: 10 }),
     allowed_node_types: stringArray({ maxItems: 1000, itemMaxLength: 256 }),
