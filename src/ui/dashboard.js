@@ -547,6 +547,7 @@
       manual_pause: 'Waiting for your manual pause. Check / recover now explicitly permits bounded recovery while remaining paused.',
       active_operation: 'Waiting for the current operation to release the exclusive inference gate.',
       service_stopping: 'The intermediary is stopping; no new recovery operation will start.',
+      media_recovery_required: 'ComfyUI recovery is required. Saved outputs may still be available. Ollama recovery cannot clear a media safety lock.',
       restarting_ollama_only: 'Restarting Ollama only; no host reboot or GPU reset.',
       checking_restart_outcome: 'Checking whether the Ollama service restart finished; it is not yet verified.',
       checking_gpu_and_ollama: 'Verifying consecutive fresh GPU samples and an empty, reachable Ollama backend after restart.',

@@ -48,11 +48,45 @@ function fixture(t) {
   } };
   f.make = () => new AutomaticRecovery(f.config, { clock: () => f.now,
     helper: f.helper, backend: f.backend, backendClient: f.backendClient, gate: f.gate,
-    scheduler: f.scheduler, catchup: f.catchup, maintenance: f.maintenance, isStopping: () => f.stopping });
+    scheduler: f.scheduler, catchup: f.catchup, maintenance: f.maintenance, isStopping: () => f.stopping,
+    mediaBlocked: () => f.mediaBlocked });
   f.engine = f.make();
   f.step = async (ms = 1000) => { f.now += ms; await f.engine.tick(); };
   return f;
 }
+
+test('media recovery is not service shutdown and never restarts Ollama or clears a lock', async (t) => {
+  const f = fixture(t);
+  f.mediaBlocked = true;
+  await f.step();
+  assert.equal(f.engine.reason, 'media_recovery_required');
+  assert.equal(f.engine.state, 'needs_attention');
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.cleared, 0);
+  f.stopping = true;
+  await f.step();
+  assert.equal(f.engine.reason, 'service_stopping');
+});
+
+test('media lock arriving during host checks prevents a restart', async (t) => {
+  const f = fixture(t);
+  f.helper.refresh = async () => { f.mediaBlocked = true; };
+  await f.step();
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.engine.reason, 'media_recovery_required');
+});
+
+test('media lock arriving during final probe prevents acknowledgment', async (t) => {
+  const f = fixture(t);
+  await f.step();
+  await f.step();
+  await f.step();
+  f.backend.probe = async () => { f.mediaBlocked = true; };
+  await f.step();
+  assert.equal(f.cleared, 0);
+  assert.equal(f.acknowledged, 0);
+  assert.equal(f.engine.reason, 'media_recovery_required');
+});
 
 test('replacement proof plus three independent samples clears recovery, not an empty GPU alone', async (t) => {
   const f = fixture(t);

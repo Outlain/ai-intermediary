@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { once } from 'node:events';
+import { createHash } from 'node:crypto';
 import { ProxyService } from '../src/proxy.js';
 import { MediaStore } from '../src/media-store.js';
 import { MockOllama, SilentLogger, requestJson, testConfig, waitFor } from './helpers.js';
@@ -358,6 +359,129 @@ test('media API authenticates separately and returns durable job metadata withou
   assert.equal(cancelled.status, 202);
   assert.equal(service.media.store.get(record.id).state, 'cancelled');
   assert.equal(service.scheduler.active, null);
+});
+
+test('saved video remains playable and listed when cleanup fails; restart reconciliation never regenerates it', async (t) => {
+  const { service, comfy, config, proxyUrl, mock } = await setup(t);
+  await service.startServer('127.0.0.1:0', 'media');
+  const url = `http://127.0.0.1:${service.addresses().find((entry) => entry.forcedClient === 'media').address.port}`;
+  const video = { filename: 'node-7_00001_.mp4', subfolder: 'owned', type: 'output' };
+  comfy.history = async (id) => ({ [id]: { outputs: { '7': { videos: [video] } } } });
+  comfy.artifactResponse = async () => new Response('0123456789', { headers: { 'content-type': 'video/mp4' } });
+  const job = await service.media.submit({ source: 'media', backend: 'comfy', workflow });
+  await waitFor(() => comfy.submitted.includes(job.id));
+  const release = service.media.releaseComfy.bind(service.media);
+  service.media.releaseComfy = async () => {
+    assert.equal(service.media.store.get(job.id).outputsImported, true, 'copy must finish before unload');
+    throw Object.assign(new Error('lost backend during unload'), { code: 'comfy_release_unconfirmed' });
+  };
+  comfy.complete(job.id, [video]);
+  await waitFor(() => service.media.store.get(job.id).state === 'uncertain' && !service.scheduler.active);
+  assert.equal(service.media.blocked, true);
+  assert.deepEqual(comfy.deleted, []);
+  assert.deepEqual(service.mediaGateway.queue('media', 'comfy').queue_running, []);
+  const list = await (await fetch(`${url}/api/jobs?status=completed`, { headers })).json();
+  assert.equal(list.jobs[0].status, 'completed');
+  assert.ok(list.jobs[0].preview_output);
+  assert.equal(list.jobs[0].intermediary.recovery_required, true);
+  const assets = await (await fetch(`${url}/api/assets?include_tags=output&limit=1`, { headers })).json();
+  assert.equal(assets.assets.length, 1);
+  const view = `${url}${assets.assets[0].preview_url}`;
+  const get = (extra = {}, method = 'GET') => fetch(view, { method, headers: { ...headers, ...extra } });
+  assert.equal(await (await get()).text(), '0123456789');
+  for (const [range, expected, value] of [['bytes=0-1', 'bytes 0-1/10', '01'], ['bytes=-3', 'bytes 7-9/10', '789'], ['bytes=8-', 'bytes 8-9/10', '89']]) {
+    const response = await get({ range });
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get('content-range'), expected);
+    assert.equal(response.headers.get('content-type'), 'video/mp4');
+    assert.equal(await response.text(), value);
+  }
+  const head = await get({}, 'HEAD');
+  assert.equal(head.headers.get('content-length'), '10');
+  assert.equal(await head.text(), '');
+  for (const range of ['bytes=10-', 'bytes=0-1,3-4', 'bytes=-0', 'broken']) {
+    const response = await get({ range });
+    assert.equal(response.status, 416);
+    assert.equal(response.headers.get('content-range'), 'bytes */10');
+    await response.text();
+  }
+  assert.equal((await get({ range: 'bytes=0-1', 'if-range': '"wrong"' })).status, 200);
+  const refused = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'must-not-run' });
+  assert.equal(refused.status, 503);
+  await refused.text();
+  assert.deepEqual(mock.order, []);
+  // Simulate broker restart and complete loss of ComfyUI's RAM-only history.
+  const restored = new MediaStore(config.media);
+  await restored.init();
+  service.media.store = restored;
+  comfy.inspect = async () => { throw new Error('History is gone; persisted proof must be used'); };
+  comfy.artifactResponse = async () => { throw new Error('Imported bytes must not be fetched again'); };
+  service.media.releaseComfy = release;
+  await service.media.reconcile(new AbortController().signal);
+  assert.equal(restored.get(job.id).state, 'completed');
+  assert.equal(service.media.blocked, false);
+  assert.deepEqual(comfy.submitted, [job.id]);
+  restored.clock = () => Date.now() + config.media.retentionMs + 1000;
+  await restored.cleanup();
+  const expired = await get({ range: 'bytes=0-1' });
+  assert.equal(expired.status, 410);
+  assert.equal((await expired.json()).code, 'media_artifact_expired');
+  const expiredAssets = await (await fetch(`${url}/api/assets`, { headers })).json();
+  assert.equal(expiredAssets.total, 0);
+});
+
+test('manual MP4 recovery requires paused admin confirmation and never clears uncertain execution', async (t) => {
+  const { service, comfy, proxyUrl } = await setup(t);
+  // Single administrator mode matches deployed authentication.
+  service.config.security = { auth_mode: 'single_admin', admin_token: 'test-maintenance-token' };
+  const job = await service.media.submit({ source: 'media', backend: 'comfy', workflow });
+  await waitFor(() => comfy.submitted.includes(job.id));
+  comfy.inspectError = true;
+  await waitFor(() => service.media.store.get(job.id).state === 'uncertain' && !service.scheduler.active);
+  assert.equal(service.mediaGateway.nativeJob(service.media.store.get(job.id)).status, 'failed');
+  assert.deepEqual(service.mediaGateway.queue('media', 'comfy').queue_running, []);
+  const endpoint = `${proxyUrl}/_intermediary/v1/media/jobs/${job.id}/recover-output?filename=node-7_00001_.mp4&node_id=7`;
+  const bytes = Buffer.from('operator-validated-mp4');
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const admin = { authorization: 'Bearer test-maintenance-token', 'content-type': 'video/mp4',
+    'x-confirm-output-validated': 'true', 'x-output-sha256': digest };
+  const upload = (changes = {}) => fetch(endpoint, { method: 'POST', headers: { ...admin, ...changes }, body: bytes });
+  assert.equal((await upload()).status, 409);
+  await service.maintenance.begin({ reason: 'Test recovery import' });
+  assert.equal((await upload({ authorization: 'Bearer wrong' })).status, 401);
+  assert.equal((await upload({ 'x-confirm-output-validated': 'false' })).status, 400);
+  const wrong = await upload({ 'x-output-sha256': '0'.repeat(64) });
+  assert.equal(wrong.status, 400);
+  assert.equal((await wrong.json()).code, 'media_checksum_mismatch');
+  assert.deepEqual(service.media.store.get(job.id).artifacts, []);
+  const imported = await upload();
+  assert.equal(imported.status, 200);
+  const result = await imported.json();
+  assert.equal(result.recovery_required, true);
+  const repeated = await (await upload()).json();
+  assert.equal(repeated.artifact_id, result.artifact_id);
+  const saved = service.media.store.get(job.id);
+  assert.equal(saved.artifacts.length, 1);
+  assert.equal(saved.state, 'uncertain');
+  assert.equal(saved.execution_state, null);
+  assert.equal(saved.outputsImported, undefined, 'one MP4 cannot stand in for all workflow outputs');
+  assert.equal(saved.recoveredOutputs, true);
+  assert.equal(service.media.blocked, true);
+  const native = service.mediaGateway.nativeJob(saved, true);
+  assert.equal(native.status, 'completed');
+  assert.equal(native.intermediary.outputs_recovered, true);
+  assert.equal(native.intermediary.recovery_required, true);
+  assert.deepEqual(comfy.deleted, []);
+  assert.deepEqual(comfy.submitted, [job.id]);
+  // Explicit host verification retires uncertainty without inventing terminal
+  // execution evidence. Recovered results remain available in native history.
+  comfy.records.clear();
+  await service.media.acknowledge(new AbortController().signal);
+  const acknowledged = service.media.store.get(job.id);
+  assert.equal(acknowledged.state, 'failed');
+  assert.equal(acknowledged.execution_state, null);
+  assert.equal(service.media.blocked, false);
+  assert.equal(service.mediaGateway.nativeJob(acknowledged).intermediary.recovery_required, false);
 });
 
 test('completed ComfyUI node outputs use broker paths and correct image/video fields', async (t) => {

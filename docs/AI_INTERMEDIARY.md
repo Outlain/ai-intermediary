@@ -306,9 +306,11 @@ The broker persists `queued → dispatching → running → completed/failed/can
 An interrupted `dispatching` or `running` record restores as `uncertain`, holding
 the safety lock. It never automatically sends that workflow a second time.
 
-Reconciliation inspects prompt-specific backend history. If terminal execution
-and safe release can be verified, it imports results and settles the job. Missing
-history, lost connectivity, an unavailable bridge, unmanaged GPU processes or
+Reconciliation inspects prompt-specific backend history, or terminal evidence
+already persisted by the broker. Results are durably imported **before** model
+unloading, independently of the later GPU-release verification. Imported results
+remain readable during recovery; only verified release settles the GPU ownership.
+Missing history without persisted evidence, lost connectivity, an unavailable bridge, unmanaged GPU processes or
 unconfirmed memory release keep inference blocked. A blank Ollama model list,
 empty browser queue or low instantaneous GPU utilization is not sufficient proof.
 
@@ -318,13 +320,17 @@ broker still performs backend/host release checks. Do not use acknowledgment to
 skip investigating an active or unaccounted-for workflow. There is no automatic
 ComfyUI restart, GPU reset or VM reboot hidden behind this control.
 
+See [media result recovery](MEDIA_RECOVERY.md) for the native gallery behavior,
+video downloads/seeking and validated recovery of an older unimported MP4. A
+recovered file does not itself prove execution completion or GPU release.
+
 ## Output retention and privacy
 
 Successful outputs are copied with streaming byte bounds into private per-job
 directories under `media.storage_path`, using generated artifact IDs. Repeated
 reconciliation does not duplicate already-imported artifacts. Backend copies
 are deleted only through the bridge's owned-output mechanism after successful
-import; files not registered as belonging to that broker prompt are not removed.
+import and verified GPU release; files not registered as belonging to that broker prompt are not removed.
 
 By default the broker expires completed output copies after seven days and can
 remove oldest completed output copies sooner to remain within the 10 GiB output
@@ -344,7 +350,9 @@ idempotency retention window. Failed jobs with retained artifacts require
 operator investigation before their protected records can be retired.
 
 Cleanup does not remove model weights, arbitrary backend files, external paths,
-queued/active inputs or files from failed/uncertain jobs. Symlinks and traversal
+queued/active inputs or files from uncertain jobs. Failed-job files are protected,
+except explicitly recovered outputs after the operator verifies recovery; those
+copies then join normal retention. Symlinks and traversal
 paths are rejected. Unknown files in the output directory are not automatically
 deleted and are not counted as broker-owned output quota; monitor actual host
 disk space too. Partial imported outputs attached to a failed job may require

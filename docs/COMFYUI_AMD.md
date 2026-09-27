@@ -337,6 +337,40 @@ switching to a cloud service. No local Wan2.7 weights were verified in the
 [official Wan repositories](https://github.com/Wan-Video) when this guide was
 prepared; a marketing/API version number is not a downloadable local model.
 
+## After a system RAM OOM
+
+System RAM and GPU VRAM are separate budgets. A video can fit VRAM but still
+exhaust the VM's RAM during loading, offloading or cleanup. RAM becoming free
+after the kernel kills ComfyUI does not show its earlier peak. Preserve the
+kernel/service logs and any saved results; follow [media recovery](MEDIA_RECOVERY.md)
+before another generation. A saved MP4 does not authorize a GPU-lock reset.
+
+One controlled experiment for the pinned v0.37.0 installation is the native
+`--disable-pinned-memory` launch option. Its availability can be checked without
+starting ComfyUI:
+
+```sh
+rg -- '--disable-pinned-memory' /opt/ComfyUI/comfy/cli_args.py
+systemctl cat comfyui.service
+```
+
+While inference is paused and the old ComfyUI service is confirmed stopped,
+use `sudo systemctl edit comfyui.service`. In a `[Service]` drop-in, clear
+`ExecStart=` and then copy the **entire existing ExecStart command**, appending
+`--disable-pinned-memory`. Preserve the private binding, bridge whitelist,
+local-only flags and environment file. Run `sudo systemctl daemon-reload`,
+inspect `systemctl cat comfyui.service`, then start that service deliberately.
+Do not change drivers, kernels, quantization or several memory flags at once.
+
+This flag disables pinned-host-memory use; it is not a guarantee against OOM
+and can change transfer speed. After verified recovery, test one smaller clip
+with batch size 1. Watch available RAM, swap activity (`vmstat 2`), GPU VRAM and
+the service/kernel logs throughout generation **and unloading**. Stop increasing
+the workload if pressure or SVM mapping failures return. More assigned RAM or a
+smaller model/workflow may still be necessary; existing logs do not establish
+an exact minimum. The release service example is not silently retuned by this
+experiment, and the intermediary never resets the GPU or reboots the VM.
+
 ## Updating this installation later
 
 Pause/drain first. Preserve the working venv, ComfyUI commit and model files;

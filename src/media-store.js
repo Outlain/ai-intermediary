@@ -54,8 +54,10 @@ async function safeFile(filename, allowMissing = false) {
 }
 
 function publicJob(job) {
-  const { workflow, extraData, client_id, idempotencyHash, bodyHash, comfyHistory, ...publicFields } = job;
-  return clone({ ...publicFields, artifacts: publicFields.artifacts.map(({ sourceHash, ...artifact }) => artifact) });
+  const { workflow, extraData, client_id, idempotencyHash, bodyHash, comfyHistory, execution, ...publicFields } = job;
+  return clone({ ...publicFields, execution_state: execution?.state ?? null,
+    execution_completed_at: execution?.observedAt ?? null,
+    artifacts: publicFields.artifacts.map(({ sourceHash, ...artifact }) => artifact) });
 }
 
 /** Durable metadata/workflows. Never treat an interrupted dispatch as safe to replay. */
@@ -127,7 +129,17 @@ export class MediaStore {
     if (!TERMINAL.has(job.state) && (!job.workflow || typeof job.workflow !== 'object' || Array.isArray(job.workflow))) invalid();
     for (const artifact of job.artifacts) {
       if (!artifact || !UUID.test(artifact.id) || !Number.isSafeInteger(artifact.bytes) || artifact.bytes < 0
-        || !['available', 'expired'].includes(artifact.status)) invalid();
+        || !['available', 'expired'].includes(artifact.status)
+        || (artifact.sha256 !== undefined && !HASH.test(artifact.sha256))) invalid();
+    }
+    if (job.execution && (!['completed', 'failed', 'interrupted'].includes(job.execution.state)
+      || !Number.isFinite(job.execution.observedAt) || !Array.isArray(job.execution.artifacts)
+      || job.execution.artifacts.length > 1024)) invalid();
+    for (const descriptor of job.execution?.artifacts ?? []) {
+      try { sanitizeComfyArtifact(descriptor); } catch { invalid(); }
+    }
+    for (const key of ['outputsImported', 'recoveredOutputs']) {
+      if (job[key] !== undefined && typeof job[key] !== 'boolean') invalid();
     }
   }
 
@@ -150,7 +162,7 @@ export class MediaStore {
       .map(includeWorkflow ? clone : publicJob);
   }
 
-  setComfyHistory(id, history) {
+  setComfyHistory(id, history, execution = null) {
     return this.serial(async () => {
       this.assertReady();
       const job = this.jobs.get(id);
@@ -179,9 +191,20 @@ export class MediaStore {
         if (Array.isArray(node.animated)) normalized.animated = node.animated.slice(0, 1024).map(Boolean);
         if (Object.keys(normalized).length) outputs[nodeId] = normalized;
       }
-      const previous = job.comfyHistory;
+      let evidence;
+      if (execution) {
+        if (!['completed', 'failed', 'interrupted'].includes(execution.state)
+          || !Array.isArray(execution.artifacts) || execution.artifacts.length > 1024) {
+          throw new MediaStoreError('media_invalid_execution', 400);
+        }
+        evidence = { state: execution.state, observedAt: this.clock(),
+          artifacts: execution.artifacts.map(sanitizeComfyArtifact) };
+        if (job.execution) throw new MediaStoreError('media_invalid_execution', 409);
+      }
+      const previous = clone(job);
       job.comfyHistory = { outputs };
-      try { await this.persist(); } catch (error) { job.comfyHistory = previous; throw error; }
+      if (evidence) job.execution = evidence;
+      try { await this.persist(); } catch (error) { this.jobs.set(id, previous); throw error; }
     });
   }
 
@@ -288,6 +311,12 @@ export class MediaStore {
         if (!Number.isFinite(value) || value < 0 || value > 1) throw new MediaStoreError('media_progress_invalid', 400);
         next.progress = value;
       }
+      for (const key of ['outputsImported', 'recoveredOutputs']) {
+        if (Object.hasOwn(patch, key)) {
+          if (typeof patch[key] !== 'boolean') throw new MediaStoreError('media_invalid_transition', 400);
+          next[key] = patch[key];
+        }
+      }
       next.updatedAt = this.clock();
       if (next.state === 'running') next.startedAt ??= this.clock();
       if (TERMINAL.has(next.state)) {
@@ -333,16 +362,28 @@ export class MediaStore {
 
   usedBytes() { return [...this.jobs.values()].flatMap((job) => job.artifacts).filter((artifact) => artifact.status === 'available').reduce((sum, artifact) => sum + artifact.bytes, 0); }
 
-  saveArtifact(id, { name = 'output', contentType = 'application/octet-stream', stream, data, key } = {}) {
+  saveArtifact(id, { name = 'output', contentType = 'application/octet-stream', stream, data, key, expectedSha256 } = {}) {
     return this.serial(async () => {
       this.assertReady();
       const job = this.jobs.get(id);
       if (!job) throw new MediaStoreError('media_job_not_found', 404);
       if (!['running', 'dispatching', 'completed', 'uncertain'].includes(job.state)) throw new MediaStoreError('media_invalid_transition');
       if (key !== undefined && (typeof key !== 'string' || !key.length || key.length > 4096)) throw new MediaStoreError('media_artifact_key_invalid', 400);
+      if (expectedSha256 !== undefined && !HASH.test(expectedSha256)) throw new MediaStoreError('media_artifact_invalid', 400);
       const sourceHash = key ? digest(key) : null;
       const existing = sourceHash && job.artifacts.find((artifact) => artifact.sourceHash === sourceHash && artifact.status === 'available');
-      if (existing) return clone(existing);
+      if (existing) {
+        const stat = await safeFile(this.artifactPath(id, existing.id));
+        if (stat.size !== existing.bytes) throw new MediaStoreError('media_artifact_unavailable', 503);
+        if (expectedSha256 && existing.sha256 && existing.sha256 !== expectedSha256) throw new MediaStoreError('media_checksum_mismatch', 400);
+        if (expectedSha256) {
+          const { stream: saved } = await this.openArtifact(id, existing.id);
+          const hash = createHash('sha256');
+          for await (const chunk of saved) hash.update(chunk);
+          if (hash.digest('hex') !== expectedSha256) throw new MediaStoreError('media_checksum_mismatch', 400);
+        }
+        return clone(existing);
+      }
       if (data !== undefined && !Buffer.isBuffer(data)) throw new MediaStoreError('media_artifact_invalid', 400);
       const source = data !== undefined ? [data] : stream;
       if (!source || (!source[Symbol.asyncIterator] && !source[Symbol.iterator])) throw new MediaStoreError('media_artifact_invalid', 400);
@@ -351,18 +392,28 @@ export class MediaStore {
       await safeDirectory(path.dirname(filename), true);
       const handle = await fsp.open(filename, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600);
       let bytes = 0;
+      const hash = createHash('sha256');
       try {
         for await (const chunk of source) {
           const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           bytes += buffer.length;
+          hash.update(buffer);
           if (bytes > this.config.max_output_bytes) throw new MediaStoreError('media_output_too_large', 413);
           await this.cleanupInternal(bytes, id);
           if (this.usedBytes() + bytes > this.config.max_storage_bytes) throw new MediaStoreError('media_storage_full', 507);
           await handle.writeFile(buffer);
         }
+        const sha256 = hash.digest('hex');
+        if (expectedSha256 && sha256 !== expectedSha256) throw new MediaStoreError('media_checksum_mismatch', 400);
         await handle.sync();
         await handle.close();
-        const artifact = { id: artifactId, name: text(path.basename(name), 160), contentType: text(contentType, 120), bytes, status: 'available', createdAt: this.clock(), sourceHash };
+        // Persist the directory entries as well as the bytes before metadata
+        // can claim ownership or the backend's original can be removed.
+        for (const directory of [path.dirname(filename), this.storage]) {
+          const fd = await fsp.open(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+          try { await fd.sync(); } finally { await fd.close(); }
+        }
+        const artifact = { id: artifactId, name: text(path.basename(name), 160), contentType: text(contentType, 120), bytes, status: 'available', createdAt: this.clock(), sourceHash, sha256 };
         job.artifacts.push(artifact);
         try { await this.persist(); } catch (error) { job.artifacts.pop(); throw error; }
         return clone(artifact);
@@ -374,22 +425,29 @@ export class MediaStore {
     });
   }
 
-  async openArtifact(id, artifactId) {
+  async openArtifact(id, artifactId, range = null) {
     this.assertReady();
     const job = this.jobs.get(id);
     const artifact = job?.artifacts.find((item) => item.id === artifactId);
     if (!artifact) throw new MediaStoreError('media_artifact_not_found', 404);
     if (artifact.status !== 'available') throw new MediaStoreError('media_artifact_expired', 410);
     const filename = this.artifactPath(id, artifactId);
-    await safeFile(filename);
+    const stat = await safeFile(filename).catch((error) => {
+      if (error.code === 'ENOENT') throw new MediaStoreError('media_artifact_unavailable', 503);
+      throw error;
+    });
+    if (stat.size !== artifact.bytes) throw new MediaStoreError('media_artifact_unavailable', 503);
     const handle = await fsp.open(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    return { artifact: clone(artifact), stream: handle.createReadStream({ autoClose: true }) };
+    return { artifact: clone(artifact), stream: handle.createReadStream({ autoClose: true, ...range }) };
   }
 
   cleanup() { return this.serial(() => this.cleanupInternal(0)); }
 
   async cleanupInternal(reserve = 0, excludeId = null, reserveHistory = 0) {
-    const candidates = [...this.jobs.values()].filter((job) => job.state === 'completed' && job.id !== excludeId)
+    // Recovered outputs join normal retention only after the operator has
+    // verified GPU recovery and the uncertain job has become terminal.
+    const candidates = [...this.jobs.values()].filter((job) => (job.state === 'completed'
+      || (TERMINAL.has(job.state) && job.recoveredOutputs === true)) && job.id !== excludeId)
       .sort((a, b) => a.completedAt - b.completedAt);
     let deleted = 0;
     for (const job of candidates) {

@@ -36,8 +36,8 @@ jobs:
       - name: Test isolated ComfyUI execution bridge
         run: python3 -m unittest discover -s integrations/comfyui -p 'test_*.py' -v
 
-      - name: Test machine-credential tooling with mocked Docker
-        run: python3 -m unittest discover -s test -p 'test_configure_comfy_auth.py' -v
+      - name: Test administrator tooling with mocked Docker and video decoding
+        run: python3 -m unittest discover -s test -p 'test_*.py' -v
 
       - name: Fetch exact Frigate bridge test sources
         shell: bash

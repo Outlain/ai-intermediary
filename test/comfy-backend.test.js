@@ -114,7 +114,7 @@ test('Comfy tracks running and pending work and requires explicit successful ter
   record = { status: { status_str: 'success', completed: false } };
   assert.equal((await client.inspect(ID)).terminal, false);
   record = { status: { status_str: 'success', completed: true }, outputs: { a: { videos: [artifact], images: [{ filename: '../../escape.png', type: 'output' }, { filename: 'temp.png', type: 'temp' }] } } };
-  assert.deepEqual(await client.inspect(ID), { state: 'completed', terminal: true, artifacts: [artifact] });
+  assert.deepEqual(await client.inspect(ID), { state: 'completed', terminal: true, artifacts: [artifact], history: record });
   record = { status: { status_str: 'error', completed: false, messages: [['execution_error', {}]] } };
   assert.equal((await client.inspect(ID)).state, 'failed');
   record.status.messages = [['execution_interrupted', {}]];

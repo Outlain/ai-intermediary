@@ -31,7 +31,7 @@ jobs:
           npm test
           python3 -m unittest discover -s integrations/host -p 'test_*.py' -v
           python3 -m unittest discover -s integrations/comfyui -p 'test_*.py' -v
-          python3 -m unittest discover -s test -p 'test_configure_comfy_auth.py' -v
+          python3 -m unittest discover -s test -p 'test_*.py' -v
 
       - name: Compute image name
         id: image

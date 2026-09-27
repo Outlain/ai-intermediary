@@ -8,6 +8,7 @@ See [the AI/ComfyUI setup guide](docs/AI_INTERMEDIARY.md) and
 [sources, dedicated ports and pause schedules](docs/SOURCES_AND_SCHEDULES.md).
 For an Ubuntu AMD host, the [ComfyUI installation recipe](docs/COMFYUI_AMD.md)
 covers the isolated Python environment, protected service and first local image workflow.
+For saved videos missing after a backend crash, see [media result recovery](docs/MEDIA_RECOVERY.md).
 
 **AI Intermediary 2.0:** media is disabled by default. ComfyUI requires the
 bundled execution bridge, read-only host ownership telemetry, private networking and tested local
@@ -34,12 +35,12 @@ Tagged releases publish two artifacts:
 Once a version has actually been published on [GitHub Releases](https://github.com/Outlain/ai-intermediary/releases), use its tag below. The version in source code alone does not mean that an image or release exists yet.
 
 ```sh
-gh release download v2.0.2 \
+gh release download v2.0.3 \
   --repo Outlain/ai-intermediary \
-  --pattern 'ai-intermediary-v2.0.2-linux-amd64.tar.gz*'
-sha256sum -c ai-intermediary-v2.0.2-linux-amd64.tar.gz.sha256
-tar -xzf ai-intermediary-v2.0.2-linux-amd64.tar.gz
-cd ai-intermediary-v2.0.2-linux-amd64
+  --pattern 'ai-intermediary-v2.0.3-linux-amd64.tar.gz*'
+sha256sum -c ai-intermediary-v2.0.3-linux-amd64.tar.gz.sha256
+tar -xzf ai-intermediary-v2.0.3-linux-amd64.tar.gz
+cd ai-intermediary-v2.0.3-linux-amd64
 cp config.example.yml config.yml
 cp secrets.example.env secrets.env
 chmod 600 secrets.env

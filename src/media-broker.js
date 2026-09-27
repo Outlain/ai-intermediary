@@ -301,39 +301,55 @@ export class MediaBroker {
 
   async finish(record, result, signal, reconciled = false) {
     const adapter = this.adapters.get(record.backend);
-    // Terminal history proves this workflow ended; now evict its models and
-    // prove physical release before allowing any other GPU work.
-    await this.releaseComfy(signal);
-    await this.verifyPhysicalRelease(signal);
-    this.verified = true;
-    if (result.state === 'completed') {
+    // Persist terminal evidence and rescue output bytes BEFORE any unload.
+    // Execution completion is not GPU release: the unresolved durable state
+    // and shared operation gate remain in place throughout this work.
+    let saved = this.store.getInternal(record.id);
+    if (!saved.execution) {
+      const history = result.history ?? (await adapter.history(record.id, { signal }))[record.id];
+      await this.store.setComfyHistory(record.id, history, {
+        state: result.state, artifacts: result.artifacts || [],
+      });
+      saved = this.store.getInternal(record.id);
+    }
+    const execution = saved.execution;
+    let copyFailed = false;
+    if (execution.state === 'completed' && !saved.outputsImported) {
       try {
-        const history = (await adapter.history(record.id, { signal }))[record.id];
-        if (this.store.setComfyHistory) await this.store.setComfyHistory(record.id, history);
-        for (const artifact of result.artifacts || []) {
+        for (const artifact of execution.artifacts) {
           const response = await adapter.artifactResponse(artifact, { maxBytes: this.settings.max_output_bytes, signal });
           try { await this.store.saveArtifact(record.id, { name: artifact.filename, key: JSON.stringify(artifact),
             contentType: response.headers.get('content-type'), stream: Readable.fromWeb(response.body) }); }
           finally { response.cleanup?.(); }
         }
+        await this.store.update(record.id, { outputsImported: true });
+        this.emit('outputs_ready', this.store.get(record.id));
       } catch {
-        // GPU work is certainly complete even if disk/download fails. Never
-        // repeat a costly generation just because copying its result failed.
-        await this.store.update(record.id, { state: 'failed', error: 'media_output_copy_failed' }, { reconciled });
-        this.emit('failed', record, { reason: 'media_output_copy_failed' });
-        return;
+        copyFailed = true;
       }
-      await this.store.update(record.id, { state: 'completed' }, { reconciled });
+    }
+    // Neither an imported output nor a terminal execution record authorizes
+    // another GPU dispatch. This verification is deliberately still mandatory.
+    await this.releaseComfy(signal);
+    await this.verifyPhysicalRelease(signal);
+    this.verified = true;
+    if (copyFailed) {
+      await this.store.update(record.id, { state: 'failed', error: 'media_output_copy_failed' }, { reconciled });
+      this.emit('failed', record, { reason: 'media_output_copy_failed' });
+      return;
+    }
+    if (execution.state === 'completed') {
+      await this.store.update(record.id, { state: 'completed', error: null }, { reconciled });
       // Delete ONLY bridge-registered, owned output copies after successful
       // import. The broker copy is retained according to its disk policy.
-      try { await adapter.deleteArtifacts(record.id, result.artifacts || []); }
+      try { await adapter.deleteArtifacts(record.id, execution.artifacts); }
       catch { this.emit('cleanup_deferred', record); }
     } else {
-      await this.store.update(record.id, { state: result.state === 'interrupted' ? 'cancelled' : 'failed',
-        error: result.state === 'interrupted' ? 'media_interrupted' : 'media_workflow_failed' }, { reconciled });
+      await this.store.update(record.id, { state: execution.state === 'interrupted' ? 'cancelled' : 'failed',
+        error: execution.state === 'interrupted' ? 'media_interrupted' : 'media_workflow_failed' }, { reconciled });
     }
     await this.store.cleanup();
-    this.emit(result.state, record);
+    this.emit(execution.state, record);
   }
 
   async reconcile(signal) {
@@ -342,7 +358,11 @@ export class MediaBroker {
       for (const record of this.store.unresolved()) {
         const adapter = this.adapters.get(record.backend);
         if (!adapter) continue;
-        const result = await adapter.inspect(record.id, { signal });
+        // ComfyUI's in-memory history may be gone after an OOM/restart. Use
+        // only previously persisted terminal evidence, never an empty queue.
+        const saved = this.store.getInternal(record.id);
+        const result = saved.execution ? { ...saved.execution, terminal: true }
+          : await adapter.inspect(record.id, { signal });
         if (result.terminal && terminal.has(result.state)) await this.finish(record, result, signal, true);
       }
       if (this.fault && this.fault !== 'media_state_unavailable' && !this.store.unresolved().length) {
@@ -389,7 +409,9 @@ export class MediaBroker {
     beforeAcknowledge();
     for (const record of this.store.unresolved()) {
       beforeAcknowledge();
-      await this.store.update(record.id, { state: 'failed', error: 'operator_verified_service_stopped' }, { reconciled: true });
+      const completed = record.execution_state === 'completed' && record.outputsImported;
+      await this.store.update(record.id, { state: completed ? 'completed' : 'failed',
+        error: completed ? null : 'operator_verified_service_stopped' }, { reconciled: true });
     }
     beforeAcknowledge();
     this.fault = null;

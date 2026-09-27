@@ -145,7 +145,7 @@ export class AutomaticRecovery {
     if (this.manualRequested && !this.manualAuthorized()) this.manualRequested = false;
     if (this.storageError) { this.transition('needs_attention', this.storageError); return; }
     if (this.backend.recoveryStorageError) { this.transition('needs_attention', 'recovery_state_error'); return; }
-    if (this.isStopping()) { this.transition('waiting', 'service_stopping'); return; }
+    if (this.blockedByServiceOrMedia()) return;
     if (!this.backend.recoveryRequired) {
       this.manualRequested = false;
       if (this.saved.current || this.saved.episode) {
@@ -176,7 +176,7 @@ export class AutomaticRecovery {
     }
     const release = await this.gate.acquire('maintenance', this.controller.signal);
     try {
-      if (this.isStopping() || this.scheduler.active || !this.backend.recoveryRequired || this.episodeKey() !== key) return;
+      if (this.blockedByServiceOrMedia() || this.scheduler.active || !this.backend.recoveryRequired || this.episodeKey() !== key) return;
       if (['verifying', 'completed'].includes(current?.phase)) return await this.verify(current, key);
       if (current && ['pending', 'uncertain'].includes(current.phase)) {
         if (current.recheckable === true) return await this.reconcileRestart(current);
@@ -209,7 +209,7 @@ export class AutomaticRecovery {
       }
       // Recheck immediately before asking for a host mutation. A manual pause
       // that arrived during telemetry collection must not trigger a restart.
-      if (this.isStopping() || !this.backend.recoveryRequired || this.episodeKey() !== key
+      if (this.blockedByServiceOrMedia() || !this.backend.recoveryRequired || this.episodeKey() !== key
         || (this.maintenance.paused && !this.manualAuthorized())) return;
       const operation = { id: randomUUID(), episode: key, before: host.service.invocation_id,
         phase: 'pending', started_at: this.clock(), samples: 0, last_sample_at: null,
@@ -231,7 +231,8 @@ export class AutomaticRecovery {
     if (!host.bound || !host.available) {
       this.transition('needs_attention', host.error || 'host_telemetry_unavailable'); return;
     }
-    if (this.isStopping() || (this.maintenance.paused && !this.manualAuthorized())) {
+    if (this.blockedByServiceOrMedia()) return;
+    if (this.maintenance.paused && !this.manualAuthorized()) {
       this.transition('waiting', 'manual_pause'); return;
     }
     this.transition('restarting', 'restarting_ollama_only');
@@ -317,7 +318,7 @@ export class AutomaticRecovery {
       // verification window. A different service epoch may still qualify.
       if (this.saved.episode.failed_replacement === proof.after_invocation_id
         || (this.saved.current?.phase === 'failed' && this.saved.current.after === proof.after_invocation_id)) return false;
-      if (this.isStopping() || this.episodeKey() !== key || !this.backend.recoveryRequired) return true;
+      if (this.blockedByServiceOrMedia() || this.episodeKey() !== key || !this.backend.recoveryRequired) return true;
       this.saved.current = { id: randomUUID(), episode: key, source: 'external', phase: 'verifying',
         before: proof.before_invocation_id, after: proof.after_invocation_id,
         started_at: this.backend.recoverySince, deadline: this.clock() + this.settings.verificationTimeoutMs,
@@ -368,10 +369,10 @@ export class AutomaticRecovery {
     }
     if (this.clock() >= operation.deadline) return this.verificationFailed(operation, 'verification_timeout');
     if (operation.samples >= this.settings.stable_samples) {
-      if (this.isStopping() || !this.backend.recoveryRequired || this.episodeKey() !== key) return;
+      if (this.blockedByServiceOrMedia() || !this.backend.recoveryRequired || this.episodeKey() !== key) return;
       // Recovery state is not a substitute for a healthy backend API.
       await this.backend.probe();
-      if (!this.backend.reachable || this.isStopping() || this.episodeKey() !== key) return;
+      if (this.blockedByServiceOrMedia() || !this.backend.reachable || this.episodeKey() !== key) return;
       operation.phase = 'completed';
       this.persist();
       if (this.catchup.requiresRecovery) this.catchup.acknowledgeRecovery();
@@ -383,6 +384,12 @@ export class AutomaticRecovery {
       this.transition('recovered', this.maintenance.paused ? 'manual_pause_preserved' : 'inference_reenabled');
       this.scheduler.wake();
     }
+  }
+
+  blockedByServiceOrMedia() {
+    if (this.isStopping()) { this.transition('waiting', 'service_stopping'); return true; }
+    if (this.mediaBlocked?.()) { this.transition('needs_attention', 'media_recovery_required'); return true; }
+    return false;
   }
 
   verificationFailed(operation, reason) {

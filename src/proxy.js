@@ -145,7 +145,8 @@ export class ProxyService {
     this.automaticRecovery = new AutomaticRecovery(config, {
       clock: this.clock, helper: this.hostHelper, backend: this.backend, backendClient: this.backendClient,
       gate: this.gate, scheduler: this.scheduler, catchup: this.catchup, maintenance: recoveryPause,
-      isStopping: () => !this.running || this.settingsRestartPending || this.media?.blocked,
+      isStopping: () => !this.running || this.settingsRestartPending,
+      mediaBlocked: () => Boolean(this.media?.blocked),
       onChange: () => this.scheduler.wake(),
       onEvent: (event, fields) => this.observability.record(event, fields),
     });

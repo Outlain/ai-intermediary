@@ -55,6 +55,12 @@ const ERRORS = {
   media_idempotency_key_invalid: [400, 'The request idempotency key is invalid'],
   media_job_not_found: [404, 'The media job was not found'],
   media_job_not_cancellable: [409, 'This media job cannot currently be cancelled; check its status'],
+  media_artifact_expired: [410, 'This output expired under the configured retention policy'],
+  media_artifact_not_found: [404, 'This output is not registered'],
+  media_artifact_unavailable: [503, 'The saved output is unavailable or changed; preserve storage and investigate'],
+  media_asset_query_invalid: [400, 'The asset list query is invalid'],
+  media_checksum_mismatch: [400, 'Recovered output checksum did not match; no output was registered'],
+  media_recovery_import_blocked: [409, 'Pause inference and wait for active operations before recovering an output'],
   media_request_failed: [503, 'Media request could not be completed; check the job status and configuration'],
 };
 

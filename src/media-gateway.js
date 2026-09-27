@@ -5,6 +5,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { authorized } from './observability.js';
 import { readBody, sendJson } from './http-utils.js';
 import { mediaRequestError, nativeComfyMetadata } from './media-request.js';
+import { outputAssets, assetPage, byteRange } from './media-assets.js';
 
 const API = '/_intermediary/v1/media';
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -41,7 +42,7 @@ export class MediaGateway {
     this.wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
     service.media.listeners.add((type, job) => {
       this.broadcastStatus();
-      if (['completed', 'failed', 'cancelled', 'interrupted'].includes(type)) this.broadcastTerminal(job.id);
+      if (['completed', 'failed', 'cancelled', 'interrupted', 'outputs_ready', 'blocked'].includes(type)) this.broadcastTerminal(job.id);
     });
   }
 
@@ -103,6 +104,9 @@ export class MediaGateway {
       if (url.pathname.startsWith(`${API}/`)) return await this.api(request, response, url, id, source);
       const backend = this.service.registry.resolve(source, null, 'comfyui');
       const route = url.pathname.replace(/^\/api(?=\/)/, '');
+      if (route === '/assets' || /^\/assets\/[a-f0-9-]+(?:\/content)?$/.test(route)) {
+        return await this.assets(request, response, url, route, id, source, backend.name);
+      }
       if (route === '/jobs' || route.startsWith('/jobs/')) return this.nativeJobs(request, response, url, route, id, source, backend.name);
       if (route === '/prompt' && request.method === 'POST') {
         const body = JSON.parse((await readBody(request, this.service.config.media.max_workflow_bytes + 1024 * 1024 + 65_536)).toString());
@@ -138,11 +142,11 @@ export class MediaGateway {
           .map((job) => [job.id, this.history(job)]));
         return sendJson(response, 200, history, id);
       }
-      if (route === '/view' && request.method === 'GET') {
+      if (route === '/view' && ['GET', 'HEAD'].includes(request.method)) {
         const jobId = url.searchParams.get('subfolder');
         const artifactId = url.searchParams.get('filename');
         if (UUID.test(jobId || '') && UUID.test(artifactId || '') && this.jobs(source, backend.name).some((job) => job.id === jobId)) {
-          return this.artifact(response, jobId, artifactId);
+          return await this.artifact(response, jobId, artifactId, request);
         }
         // Preview/input requests are delegated to ComfyUI; output requests are
         // restricted to paths registered by this broker, never arbitrary files.
@@ -180,20 +184,23 @@ export class MediaGateway {
   queue(source, backend) {
     const tuple = (job) => [job.enqueuedAt, job.id, {}, { client_id: 'ai-intermediary' }, []];
     const jobs = this.jobs(source, backend);
-    return { queue_running: jobs.filter((job) => ['dispatching', 'running', 'uncertain'].includes(job.state)).map(tuple),
+    return { queue_running: jobs.filter((job) => ['dispatching', 'running'].includes(job.state)
+        && !(job.execution_state === 'completed' && job.outputsImported)).map(tuple),
       queue_pending: jobs.filter((job) => job.state === 'queued').map(tuple) };
   }
 
   history(job) {
+    const completed = job.state === 'completed' || (job.execution_state === 'completed' && job.outputsImported) || job.recoveredOutputs === true;
     return { prompt: [job.enqueuedAt, job.id, {}, {}, []],
-      status: { completed: ['completed', 'failed', 'cancelled'].includes(job.state),
-        status_str: job.state === 'completed' ? 'success' : job.state === 'uncertain' ? 'running' : 'error', messages: [] },
+      status: { completed: completed || ['failed', 'cancelled', 'uncertain'].includes(job.state),
+        status_str: completed ? 'success' : 'error', messages: [] },
       outputs: this.service.media.store.nativeOutputs(job.id),
       intermediary: { state: job.state, reason: job.reason } };
   }
 
   nativeJob(job, detail = false) {
-    const status = { queued: 'pending', dispatching: 'in_progress', running: 'in_progress', uncertain: 'in_progress',
+    const outputReady = (job.execution_state === 'completed' && job.outputsImported) || job.recoveredOutputs === true;
+    const status = outputReady ? 'completed' : { queued: 'pending', dispatching: 'in_progress', running: 'in_progress', uncertain: 'failed',
       completed: 'completed', failed: 'failed', cancelled: 'cancelled' }[job.state];
     const outputs = this.service.media.store.nativeOutputs(job.id);
     const descriptors = Object.entries(outputs).flatMap(([nodeId, node]) => Object.entries(node)
@@ -202,11 +209,13 @@ export class MediaGateway {
     const result = { id: job.id, status, priority: this.service.config.clients[job.source]?.priority ?? 0,
       create_time: job.enqueuedAt, outputs_count: descriptors.length, previewable_outputs_count: descriptors.length,
       ...(job.startedAt ? { execution_start_time: job.startedAt } : {}),
-      ...(job.completedAt ? { execution_end_time: job.completedAt } : {}),
+      ...(job.completedAt || job.execution_completed_at ? { execution_end_time: job.execution_completed_at ?? job.completedAt } : {}),
       ...(job.workflowId ? { workflow_id: job.workflowId } : {}),
       ...(descriptors.length ? { preview_output: descriptors[0] } : {}),
-      intermediary: { state: job.state, reason: job.reason, workflow_retained: false } };
-    if (detail && ['completed', 'failed', 'cancelled', 'uncertain'].includes(job.state)) {
+      intermediary: { state: job.state, reason: job.reason, workflow_retained: false,
+        recovery_required: job.state === 'uncertain' || (outputReady && ['dispatching', 'running'].includes(job.state)),
+        outputs_recovered: job.recoveredOutputs === true } };
+    if (detail && (outputReady || ['completed', 'failed', 'cancelled', 'uncertain'].includes(job.state))) {
       result.outputs = outputs;
       result.execution_status = this.history(job).status;
       result.workflow = { prompt: {}, extra_data: {} };
@@ -263,6 +272,8 @@ export class MediaGateway {
   }
 
   async api(request, response, url, id, source) {
+    const recovery = url.pathname.match(/^\/_intermediary\/v1\/media\/jobs\/([a-f0-9-]+)\/recover-output$/);
+    if (recovery && UUID.test(recovery[1])) return this.recoverOutput(request, response, url, id, recovery[1]);
     if (url.pathname === `${API}/jobs` && request.method === 'POST') {
       const body = JSON.parse((await readBody(request, this.service.config.media.max_workflow_bytes + 1024 * 1024 + 65_536)).toString());
       const backend = this.service.registry.resolve(source, body.backend, 'comfyui');
@@ -280,19 +291,102 @@ export class MediaGateway {
         await this.service.media.cancel(job.id);
         return sendJson(response, 202, { accepted: true, message: 'Cancellation requested. Active GPU work remains fenced until verified stopped.' }, id);
       }
-      if (request.method === 'GET' && match[2] === 'artifacts' && UUID.test(match[3] || '')) return this.artifact(response, job.id, match[3]);
+      if (['GET', 'HEAD'].includes(request.method) && match[2] === 'artifacts' && UUID.test(match[3] || '')) return this.artifact(response, job.id, match[3], request);
     }
     return sendJson(response, 404, { error: 'Unknown media operation.' }, id);
   }
 
-  async artifact(response, id, artifactId) {
-    const { stream, artifact } = await this.service.media.store.openArtifact(id, artifactId);
+  async assets(request, response, url, route, id, source, backend) {
+    if (!['GET', 'HEAD'].includes(request.method)) return sendJson(response, 405, { error: 'Generated assets are read-only; retention is managed in Media settings.' }, id);
+    const items = outputAssets(this, source, backend);
+    if (route === '/assets') return sendJson(response, 200, assetPage(items, url.searchParams), id);
+    const asset = items.find((item) => item.id === route.split('/')[2]);
+    if (!asset) return sendJson(response, 404, { error: 'Asset not found or expired.' }, id);
+    if (route.endsWith('/content')) return this.artifact(response, asset.user_metadata.jobId, asset.id, request);
+    return sendJson(response, 200, asset, id);
+  }
+
+  async recoverOutput(request, response, url, id, jobId) {
+    // Explicit administrator recovery, not a browser arbitrary-file proxy.
+    // Importing a playable output NEVER clears/relabels the GPU recovery latch.
+    if (request.method !== 'POST') return sendJson(response, 405, { error: 'Use POST.' }, id);
+    if (!authorized(request, this.service.config.maintenance.auth_token)) return sendJson(response, 401, { error: 'Administrator authorization required.' }, id);
+    const job = this.service.media.store.get(jobId);
+    const validPause = () => this.service.maintenance.paused && !this.service.scheduler.active
+      && !this.service.settingsRestartPending && this.service.running;
+    if (!job || job.state !== 'uncertain' || !validPause()) {
+      return sendJson(response, 409, { error: 'Pause inference and recover only an unresolved job with no active operation.', code: 'media_recovery_import_blocked' }, id);
+    }
+    const filename = url.searchParams.get('filename') ?? '';
+    const node = url.searchParams.get('node_id') ?? '';
+    const digest = request.headers['x-output-sha256'];
+    if (request.headers['content-type'] !== 'video/mp4' || request.headers['x-confirm-output-validated'] !== 'true'
+      || !/^[a-zA-Z0-9_.:-]{1,128}$/.test(node) || ['__proto__', 'prototype', 'constructor'].includes(node)
+      || !/^node-[A-Za-z0-9_.-]+_\d+_?\.mp4$/.test(filename)
+      || !filename.startsWith(`node-${node.replaceAll(':', '-')}_`)
+      || typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)) {
+      return sendJson(response, 400, { error: 'Use the validated MP4 recovery tool; filename, node, checksum and validation confirmation are required.' }, id);
+    }
+    const revision = this.service.maintenance.revision;
+    // A read-only background reconciliation may briefly own the gate. Queue
+    // behind it, with a bounded wait, then recheck state rather than racing it.
+    let release;
+    try {
+      release = await this.service.gate.acquire('maintenance', AbortSignal.any([
+        this.service.workerController.signal, AbortSignal.timeout(10000),
+      ]));
+      if (!validPause() || revision !== this.service.maintenance.revision || request.destroyed
+        || this.service.media.store.get(jobId)?.state !== 'uncertain') throw Object.assign(new Error('Recovery boundary changed'), { code: 'media_recovery_import_blocked', statusCode: 409 });
+      const descriptor = { filename, subfolder: `ai-intermediary/${jobId}`, type: 'output' };
+      const artifact = await this.service.media.store.saveArtifact(jobId, {
+        name: filename, contentType: 'video/mp4', stream: request, expectedSha256: digest,
+        key: JSON.stringify(descriptor),
+      });
+      // Idempotent imports may not consume the body; drain the bounded request
+      // so keep-alive clients can receive the response without a stalled upload.
+      request.resume();
+      // Merge rather than erase already recovered outputs. No raw history or
+      // path supplied by the caller is trusted, and originals are not deleted.
+      const history = this.service.media.store.getInternal(jobId).comfyHistory ?? { outputs: {} };
+      const outputs = history.outputs;
+      outputs[node] ??= {};
+      outputs[node].videos ??= [];
+      if (!outputs[node].videos.some((entry) => entry.filename === filename && entry.subfolder === descriptor.subfolder)) {
+        outputs[node].videos.push({ ...descriptor, format: 'video/mp4' });
+      }
+      await this.service.media.store.setComfyHistory(jobId, { outputs });
+      // One recovered MP4 does not prove that every output of a multi-output
+      // workflow was imported, or that the original execution completed.
+      await this.service.media.store.update(jobId, { recoveredOutputs: true });
+      this.service.media.emit('outputs_ready', this.service.media.store.get(jobId));
+      return sendJson(response, 200, { recovered: true, artifact_id: artifact.id, recovery_required: true,
+        message: 'Validated output imported. Original preserved. GPU recovery remains required; no generation was submitted.' }, id);
+    } finally { release?.(); }
+  }
+
+  async artifact(response, id, artifactId, request = {}) {
+    const metadata = this.service.media.store.get(id)?.artifacts.find((item) => item.id === artifactId);
+    if (!metadata) throw Object.assign(new Error('Output not found'), { code: 'media_artifact_not_found', statusCode: 404 });
+    if (metadata.status !== 'available') throw Object.assign(new Error('Output expired'), { code: 'media_artifact_expired', statusCode: 410 });
+    const etag = `"${artifactId}"`;
+    let range;
+    try { range = byteRange(!request.headers?.['if-range'] || request.headers['if-range'] === etag
+      ? request.headers?.range : undefined, metadata?.bytes ?? 0); }
+    catch {
+      response.writeHead(416, { 'content-range': `bytes */${metadata?.bytes ?? 0}`, 'accept-ranges': 'bytes' });
+      response.end(); return;
+    }
+    const { stream, artifact } = await this.service.media.store.openArtifact(id, artifactId, range);
     // Never serve executable HTML/SVG under the application origin.
     const type = /^(?:image\/(?:png|jpeg|webp|gif)|video\/(?:mp4|webm))$/.test(artifact.contentType) ? artifact.contentType : 'application/octet-stream';
-    response.writeHead(200, { 'content-type': type, 'content-length': artifact.bytes,
+    response.writeHead(range ? 206 : 200, { 'content-type': type,
+      'content-length': range ? range.end - range.start + 1 : artifact.bytes,
+      'accept-ranges': 'bytes', etag,
+      ...(range ? { 'content-range': `bytes ${range.start}-${range.end}/${artifact.bytes}` } : {}),
       'content-disposition': `${type === 'application/octet-stream' ? 'attachment' : 'inline'}; filename="${artifact.name.replace(/[^A-Za-z0-9_.-]/g, '_')}"`,
       'content-security-policy': "default-src 'none'; sandbox" });
-    await pipeline(stream, response);
+    if (request.method === 'HEAD') { stream.destroy(); response.end(); }
+    else await pipeline(stream, response);
   }
 
   async login(request, response, source, requestId) {
@@ -482,7 +576,8 @@ export class MediaGateway {
 
   broadcastTerminal(id) {
     const job = this.service.media.store.get(id);
-    if (!job || !['completed', 'failed', 'cancelled'].includes(job.state)) return;
+    const outputReady = (job?.execution_state === 'completed' && job.outputsImported) || job?.recoveredOutputs === true;
+    if (!job || (!outputReady && !['completed', 'failed', 'cancelled', 'uncertain'].includes(job.state))) return;
     for (const { client, source, backend, pendingPrompts } of this.sockets) {
       if (client.readyState !== WebSocket.OPEN || source !== job.source || backend !== job.backend || !pendingPrompts.has(id)) continue;
       if (client.bufferedAmount > MAX_BUFFERED) { client.close(1013, 'Progress consumer is too slow.'); continue; }
@@ -492,11 +587,11 @@ export class MediaGateway {
         if (client.bufferedAmount > MAX_BUFFERED) { client.close(1013, 'Progress consumer is too slow.'); return; }
         client.send(JSON.stringify({ type, data: { prompt_id: id, ...data } }));
       };
-      if (job.state === 'completed') {
+      if (job.state === 'completed' || outputReady) {
         for (const [node, output] of Object.entries(this.service.media.store.nativeOutputs(id))) {
           send('executed', { node, display_node: node, output });
         }
-        send('execution_success', { timestamp: job.completedAt });
+        send('execution_success', { timestamp: job.execution_completed_at ?? job.completedAt });
       } else if (job.state === 'cancelled') {
         send('execution_interrupted', { node_id: null, node_type: null, executed: [] });
       } else {

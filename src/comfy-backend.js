@@ -261,7 +261,7 @@ export class ComfyBackend {
     if (queue.queue_pending.some((item) => item[1] === id)) return { state: 'queued', terminal: false, artifacts: [] };
     if (record && isObject(record.status)) {
       const { completed, status_str: status, messages } = record.status;
-      if (status === 'success' && completed === true) return { state: 'completed', terminal: true, artifacts: artifactsFromHistory(record) };
+      if (status === 'success' && completed === true) return { state: 'completed', terminal: true, artifacts: artifactsFromHistory(record), history: record };
       if (status === 'error' && typeof completed === 'boolean') {
         const interrupted = Array.isArray(messages) && messages.some((entry) => Array.isArray(entry) && entry[0] === 'execution_interrupted');
         return { state: interrupted ? 'interrupted' : 'failed', terminal: true, artifacts: [] };

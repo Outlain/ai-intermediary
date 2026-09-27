@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { MediaStore } from '../src/media-store.js';
 
 async function setup(t, overrides = {}) {
@@ -24,6 +24,68 @@ async function running(store) {
   await store.update(job.id, { state: 'running', upstreamPromptId: 'comfy-prompt-1' });
   return job.id;
 }
+
+test('terminal execution and output bytes survive restart independently of GPU release', async (t) => {
+  const { store, config } = await setup(t);
+  const id = await running(store);
+  const descriptor = { filename: 'node-7_00001_.mp4', subfolder: `ai-intermediary/${id}`, type: 'output' };
+  const history = { outputs: { '7': { videos: [descriptor] } }, secret: 'not retained' };
+  await store.setComfyHistory(id, history, { state: 'completed', artifacts: [descriptor] });
+  const data = Buffer.from('saved movie');
+  const sha256 = createHash('sha256').update(data).digest('hex');
+  const artifact = await store.saveArtifact(id, { data, key: JSON.stringify(descriptor), expectedSha256: sha256 });
+  await store.update(id, { outputsImported: true });
+  const restarted = new MediaStore(config);
+  await restarted.init();
+  assert.equal(restarted.get(id).state, 'uncertain');
+  assert.equal(restarted.get(id).execution_state, 'completed');
+  assert.equal(restarted.get(id).outputsImported, true);
+  assert.equal(restarted.get(id).execution, undefined);
+  assert.equal(restarted.getInternal(id).comfyHistory.secret, undefined);
+  assert.equal(restarted.nativeOutputs(id)['7'].videos[0].filename, artifact.id);
+  const { stream } = await restarted.openArtifact(id, artifact.id, { start: 1, end: 4 });
+  let bytes = Buffer.alloc(0);
+  for await (const chunk of stream) bytes = Buffer.concat([bytes, chunk]);
+  assert.equal(bytes.toString(), 'aved');
+});
+
+test('checksum failures preserve originals and idempotent recovery rejects changed bytes', async (t) => {
+  const { store } = await setup(t);
+  const id = await running(store);
+  const data = Buffer.from('movie');
+  const sha256 = createHash('sha256').update(data).digest('hex');
+  await assert.rejects(store.saveArtifact(id, { data, key: 'same', expectedSha256: '0'.repeat(64) }), { code: 'media_checksum_mismatch' });
+  assert.deepEqual(store.get(id).artifacts, []);
+  const artifact = await store.saveArtifact(id, { data, key: 'same', expectedSha256: sha256 });
+  assert.equal((await store.saveArtifact(id, { data, key: 'same', expectedSha256: sha256 })).id, artifact.id);
+  await assert.rejects(store.saveArtifact(id, { data, key: 'same', expectedSha256: '0'.repeat(64) }), { code: 'media_checksum_mismatch' });
+  assert.equal(store.get(id).artifacts.length, 1);
+});
+
+test('invalid execution evidence cannot partially change stored history', async (t) => {
+  const { store } = await setup(t);
+  const id = await running(store);
+  await store.setComfyHistory(id, { outputs: {} });
+  const before = store.getInternal(id);
+  await assert.rejects(store.setComfyHistory(id, { outputs: { '1': { images: [] } } }, {
+    state: 'completed', artifacts: [{ filename: '../escape', type: 'output' }],
+  }));
+  assert.deepEqual(store.getInternal(id), before);
+});
+
+test('recovered outputs expire only after explicit recovery retires uncertainty', async (t) => {
+  const { store, time } = await setup(t, { retentionMs: 100 });
+  const id = await running(store);
+  await store.saveArtifact(id, { data: Buffer.from('movie') });
+  await store.update(id, { state: 'uncertain', recoveredOutputs: true });
+  time.now += 1000;
+  await store.cleanup();
+  assert.equal(store.get(id).artifacts[0].status, 'available');
+  await store.update(id, { state: 'failed', reason: 'operator_verified_service_stopped' }, { reconciled: true });
+  time.now += 101;
+  await store.cleanup();
+  assert.equal(store.get(id).artifacts[0].status, 'expired');
+});
 
 test('durable create redacts workflows and client identifiers from every public view', async (t) => {
   const { store, config } = await setup(t);
