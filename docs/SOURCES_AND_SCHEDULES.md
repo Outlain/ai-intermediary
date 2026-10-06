@@ -146,10 +146,28 @@ failure, start a failure timer, or consume the enlarged attempt. A previous real
 failure can still have an attention flag. Native handoff counts can increase
 even when no GPU inference was sent.
 
-Rescue can reread telemetry up to three times, with 350ms settling gaps, for counters
-to settle, under the same inference gate. Sustained nonzero activity, unknown
-process ownership and missing telemetry still defer; there is no arbitrary
-utilization threshold. RAM, VRAM headroom, tested context cap and one-enlarged-
-dispatch-per-retained-job guards remain. Idle telemetry never clears a recovery
-lock. Temporary refusals appear amber as **Request deferred**, not an Ollama
-generation failure. Settings changes do not automatically increase a tested cap.
+Rescue uses bounded telemetry probes with 350ms settling gaps under the same
+inference gate. Ollama-only operation still requires zero GPU activity. An idle
+ComfyUI service may keep its small driver allocation only when the host helper
+confirms its ownership and the media broker revalidates its completed unload
+proof, empty queue and allocator ceiling. This path requires
+`media.stable_samples` distinct, stable physical samples and uses the existing
+`media.max_idle_utilization_percent` and `media.max_idle_vram_mb` limits; no new
+threshold or blanket Python-process exemption is added. Known Ollama process
+VRAM is subtracted from physical usage when measuring the residual, so an idle
+cached Ollama model need not be unloaded for this check. Missing or inconsistent
+memory accounting, unknown owners, changed worker proofs, old bridges and
+unavailable telemetry do not receive this allowance.
+
+The bounded window has at least four probes, or `media.stable_samples + 1` if
+larger. Insufficient fresh samples defer the job; eligible live work can end the
+settling wait early. RAM, free-VRAM headroom, tested context cap and the
+one-enlarged-dispatch-per-retained-job guards remain. Idle telemetry never clears
+a recovery lock. Temporary refusals appear amber as **Request deferred**, not an
+Ollama generation failure. Settings changes do not automatically increase a
+tested cap.
+
+The timeline calls scheduler admission **Request selected** (the stored event
+type remains `request_dispatched` for compatibility). Safety checks still precede
+the actual backend request. **Model state refreshed** reconciles scheduler
+bookkeeping with Ollama; it does not itself load or unload a model.

@@ -99,6 +99,48 @@ test('busy backend is not unloaded and changing bridge proof blocks the next Oll
   await assert.rejects(broker.prepareOllama(), { code: 'comfy_release_proof_changed' });
 });
 
+test('rescue allowance reuses current proven release without unloading again', async () => {
+  const { broker, adapter } = fixture();
+  assert.equal(await broker.contextRescueIdleAllowance(), null, 'initialization is not proof');
+  await broker.quiesce();
+  assert.deepEqual(await broker.contextRescueIdleAllowance(), {
+    max_utilization_percent: 5, max_residual_vram_bytes: 1024 * MiB,
+  });
+  assert.equal(adapter.requests.length, 1);
+  broker.settings.enabled = false;
+  assert.equal(await broker.contextRescueIdleAllowance(), null);
+  broker.settings.enabled = true;
+  broker.fault = 'media_recovery_required';
+  await assert.rejects(broker.contextRescueIdleAllowance(), { code: 'media_recovery_required' });
+  broker.fault = null;
+  broker.releaseProofs.set('comfy', null);
+  adapter.reserved = 0;
+  assert.equal(await broker.contextRescueIdleAllowance(), null, 'legacy bridge gets no relaxed rescue');
+  broker.adapters.clear();
+  assert.equal(await broker.contextRescueIdleAllowance(), null, 'no adapters cannot grant an allowance');
+});
+
+test('rescue refuses changed queue, allocator, or worker proof including a change during evidence reads', async () => {
+  for (const scenario of ['queue', 'memory', 'proof', 'during-read', 'transport']) {
+    const { broker, adapter } = fixture();
+    await broker.quiesce();
+    if (scenario === 'queue') adapter.queueBusy = true;
+    if (scenario === 'memory') adapter.reserved = 129 * MiB;
+    if (scenario === 'proof') adapter.proof.completed = false;
+    if (scenario === 'transport') adapter.bridgeStatus = async () => { throw new Error('disconnected'); };
+    if (scenario === 'during-read') {
+      const read = adapter.releaseEvidence.bind(adapter);
+      adapter.releaseEvidence = async (options) => {
+        const evidence = await read(options);
+        adapter.proof.completed = false;
+        return evidence;
+      };
+    }
+    await assert.rejects(broker.contextRescueIdleAllowance(), undefined, scenario);
+    assert.equal(adapter.requests.length, 1, scenario);
+  }
+});
+
 test('a timed-out cleanup is rejoined with the same id rather than submitted again under a new id', async () => {
   const { broker, adapter } = fixture();
   const pending = '24336f85-ef91-4c97-8b90-91819e8c9c47';

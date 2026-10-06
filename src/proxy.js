@@ -1267,18 +1267,45 @@ export class ProxyService {
     if (!modelLimit) block('rescue_model_unknown');
     if (plan.context > modelLimit) block('rescue_model_limit');
     let host;
-    try { host = await this.hostHelper.refresh(); }
-    catch { block('rescue_telemetry_unavailable'); }
-    // GPU counters can lag a just-finished request. Allow a bounded settling
-    // window under the same gate; never reinterpret nonzero/unknown as idle.
-    for (let probe = 0; probe < 3 && rescueHardwareBlock(host) === 'rescue_gpu_busy'; probe++) {
+    let hardwareBlock = 'rescue_gpu_busy';
+    let samples = 0, lastSample = null, lastOwners = null;
+    const stableSamples = this.config.media.stable_samples;
+    // Strict Ollama-only checks keep their existing semantics. A proven idle
+    // ComfyUI worker may retain its bounded driver context, but needs fresh,
+    // stable physical samples and a current release proof on every probe.
+    const maxProbes = Math.max(4, stableSamples + 1);
+    for (let probe = 0; probe < maxProbes; probe++) {
       this.assertRescueDispatchAllowed(job);
-      if (this.scheduler.jobs.some((queued) => queued.trafficClass !== 'catchup' && !this.scheduler.pauseReason(queued))) break;
-      await delay(350, undefined, { signal: job.signal });
+      if (probe) {
+        if (this.scheduler.jobs.some((queued) => queued.trafficClass !== 'catchup' && !this.scheduler.pauseReason(queued))) break;
+        await delay(350, undefined, { signal: job.signal });
+      }
       try { host = await this.hostHelper.refresh(); }
       catch { block('rescue_telemetry_unavailable'); }
+      let allowance;
+      try { allowance = await this.media.contextRescueIdleAllowance(job.signal); }
+      catch { block('rescue_gpu_busy'); }
+      // Backend proof reads may be slow. Re-evaluate telemetry freshness, not
+      // the stale flag captured before those asynchronous reads.
+      host = this.hostHelper.snapshot();
+      const strictBlock = rescueHardwareBlock(host);
+      if (!strictBlock) { hardwareBlock = null; break; }
+      if (strictBlock !== 'rescue_gpu_busy') { hardwareBlock = strictBlock; break; }
+      hardwareBlock = rescueHardwareBlock(host, allowance);
+      if (hardwareBlock) {
+        samples = 0;
+        if (hardwareBlock !== 'rescue_gpu_busy') break;
+        continue;
+      }
+      const owners = JSON.stringify(host.gpus.map((gpu) => [gpu.id,
+        gpu.processes.map((process) => [process.pid, process.is_ollama, process.is_comfyui])]));
+      if (owners !== lastOwners) { samples = 0; lastOwners = owners; }
+      const sampledAt = typeof host.sampled_at === 'string' ? Date.parse(host.sampled_at) : NaN;
+      if (!Number.isFinite(sampledAt) || (lastSample !== null && sampledAt < lastSample)) block('rescue_telemetry_unavailable');
+      if (sampledAt !== lastSample) { samples++; lastSample = sampledAt; }
+      if (samples >= stableSamples) break;
+      hardwareBlock = 'rescue_gpu_busy';
     }
-    const hardwareBlock = rescueHardwareBlock(host);
     if (hardwareBlock) block(hardwareBlock);
     // Rescue always requires system RAM evidence, even if the ordinary
     // catch-up guard is explicitly disabled. More VRAM is not more host RAM.
@@ -1308,7 +1335,7 @@ export class ProxyService {
   assertRescueDispatchAllowed(job) {
     if (job.signal.aborted) throw job.signal.reason;
     if (this.scheduler.pauseReason(job) || !this.running || !this.scheduler.accepting || this.settingsRestartPending
-      || !this.backend.canDispatch()) {
+      || !this.backend.canDispatch() || this.media.blocked) {
       const error = new Error('Context rescue stopped before dispatch because inference admission changed.');
       error.code = 'context_rescue_interrupted';
       throw error;

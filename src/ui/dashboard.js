@@ -743,7 +743,9 @@
     return '';
   }
   function eventTitle(event) {
-    var title = titleCase(event.type || event.status || 'Activity');
+    var title = event.type === 'request_dispatched' ? 'Request selected'
+      : event.type === 'model_reconciled' ? 'Model state refreshed'
+        : titleCase(event.type || event.status || 'Activity');
     if (event.client) title += ' · ' + titleCase(event.client);
     return title;
   }
@@ -757,6 +759,8 @@
     if (response.output_tokens != null) values.push(formatInteger(response.output_tokens) + ' output tok');
     if (response.output_tokens_per_second != null) values.push(safeNumber(response.output_tokens_per_second, 0).toFixed(1) + ' tok/s');
     if (event.reason) values.push(titleCase(event.reason));
+    if (event.type === 'request_dispatched') values.push('Backend safety checks precede inference');
+    if (event.type === 'model_reconciled') values.push('Scheduler state matched to Ollama; not a model load/unload');
     return values.join(' · ') || 'Intermediary event';
   }
   function eventItem(event) {

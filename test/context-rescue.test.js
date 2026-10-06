@@ -94,3 +94,39 @@ test('rescue configuration upgrades default off and require an explicit model, t
   assert.throws(() => testConfig({ ...overlay, host_helper: { enabled: false } }), /context_rescue/);
   assert.throws(() => testConfig({ ...overlay, frigate: { ...overlay.frigate, enabled: false } }), /context_rescue/);
 });
+
+test('proven idle ComfyUI uses existing media limits without exempting unknown processes or memory', () => {
+  const MiB = 1024 ** 2;
+  const allowance = { max_utilization_percent: 5, max_residual_vram_bytes: 1024 * MiB };
+  const snapshot = () => ({ ...host(), capabilities: { comfyui_ownership: true }, gpus: [{
+    id: '0', processes_known: true, processes: [{ pid: 2343, is_comfyui: true, vram_bytes: 145 * MiB }],
+    utilization_percent: 4, vram_used_bytes: 264 * MiB, vram_free_bytes: 32360 * MiB,
+  }] });
+  assert.equal(rescueHardwareBlock(snapshot()), 'rescue_gpu_busy', 'ownership alone is insufficient');
+  assert.equal(rescueHardwareBlock(snapshot(), allowance), null);
+  const warm = snapshot();
+  warm.gpus[0].processes.push({ pid: 100, is_ollama: true, vram_bytes: 8 * 1024 ** 3 });
+  warm.gpus[0].vram_used_bytes += 8 * 1024 ** 3;
+  warm.gpus[0].vram_free_bytes -= 8 * 1024 ** 3;
+  assert.equal(rescueHardwareBlock(warm, allowance), null, 'a known warm Ollama model is not Comfy residual memory');
+  for (const [name, change, expected] of [
+    ['old host helper', (s) => { s.capabilities = {}; }, 'rescue_gpu_busy'],
+    ['unknown owner', (s) => { s.gpus[0].processes.push({ pid: 99, name: 'python' }); }, 'rescue_gpu_busy'],
+    ['high activity', (s) => { s.gpus[0].utilization_percent = 6; }, 'rescue_gpu_busy'],
+    ['residual over cap', (s) => { s.gpus[0].vram_used_bytes = 1025 * MiB; }, 'rescue_gpu_busy'],
+    ['unknown physical memory', (s) => { s.gpus[0].vram_used_bytes = null; }, 'rescue_telemetry_unavailable'],
+    ['unknown Ollama allocation', (s) => { s.gpus[0].processes.push({ pid: 99, is_ollama: true }); }, 'rescue_telemetry_unavailable'],
+    ['inconsistent accounting', (s) => { s.gpus[0].processes.push({ pid: 99, is_ollama: true, vram_bytes: 1000 * MiB }); }, 'rescue_telemetry_unavailable'],
+    ['duplicate PID', (s) => { s.gpus[0].processes.push({ ...s.gpus[0].processes[0] }); }, 'rescue_telemetry_unavailable'],
+    ['low headroom', (s) => { s.gpus[0].vram_free_bytes = MiB; }, 'rescue_vram_headroom'],
+    ['stale', (s) => { s.stale = true; }, 'rescue_telemetry_unavailable'],
+    ['multiple GPUs', (s) => { s.gpus.push({ ...s.gpus[0], id: '1' }); }, 'rescue_gpu_busy'],
+  ]) {
+    const value = snapshot(); change(value);
+    assert.equal(rescueHardwareBlock(value, allowance), expected, name);
+  }
+  assert.equal(rescueHardwareBlock(snapshot(), { ...allowance, max_utilization_percent: 0 }), 'rescue_gpu_busy');
+  assert.equal(rescueHardwareBlock(snapshot(), { ...allowance, max_utilization_percent: 100 }), 'rescue_gpu_busy');
+  assert.equal(rescueHardwareBlock({ ...host(), gpus: [{ ...host().gpus[0], utilization_percent: 4 }] }, allowance),
+    'rescue_gpu_busy', 'no blanket activity exemption for Ollama-only workloads');
+});

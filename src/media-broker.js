@@ -282,6 +282,24 @@ export class MediaBroker {
     }
   }
 
+  async contextRescueIdleAllowance(signal) {
+    // Never borrow stale success or the weaker legacy bridge path. This is a
+    // read-only recheck, not a new unload, service restart or recovery bypass.
+    if (this.blocked) throw problem('media_recovery_required');
+    if (!this.enabled || !this.verified || !this.adapters.size) return null;
+    await this.prepareOllama(signal);
+    if ([...this.adapters.keys()].some((backend) => !this.releaseProofs.get(backend))) return null;
+    // Check the worker proof again after reading allocator/queue evidence so a
+    // submission or service replacement during those reads fails closed too.
+    for (const [backend, adapter] of this.adapters) {
+      if (!this.validReleaseProof(await this.bridge(adapter, signal), this.releaseProofs.get(backend))) {
+        throw problem('comfy_release_proof_changed');
+      }
+    }
+    return { max_utilization_percent: this.settings.max_idle_utilization_percent,
+      max_residual_vram_bytes: this.settings.max_idle_vram_mb * MiB };
+  }
+
   async run(job) {
     const record = this.store.getInternal(job.mediaId);
     const adapter = this.adapters.get(record.backend);

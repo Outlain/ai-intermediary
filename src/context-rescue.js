@@ -65,11 +65,38 @@ export function rescueTarget(evidence, request, settings) {
   return { context: Math.min(Math.ceil(target / 4096) * 4096, settings.max_context), required };
 }
 
-export function rescueHardwareBlock(host) {
+// idleComfy is supplied only after MediaBroker has revalidated its completed
+// unload proof, empty queue and allocator limit under the shared inference gate.
+// A process name (or even host ownership alone) cannot grant this allowance.
+export function rescueHardwareBlock(host, idleComfy = null) {
   if (!host?.available || host.stale !== false || host.bound !== true || !host.gpus?.length
     || host.gpus.some((gpu) => !gpu.processes_known || !Array.isArray(gpu.processes)
-      || !Number.isFinite(gpu.vram_free_bytes) || !Number.isFinite(gpu.utilization_percent))) return 'rescue_telemetry_unavailable';
-  if (host.gpus.some((gpu) => gpu.utilization_percent > 0 || gpu.processes.some((process) => process.is_ollama !== true))) return 'rescue_gpu_busy';
+      || !Number.isFinite(gpu.vram_free_bytes) || gpu.vram_free_bytes < 0
+      || !Number.isFinite(gpu.utilization_percent) || gpu.utilization_percent < 0)) return 'rescue_telemetry_unavailable';
+  const allowComfy = host.capabilities?.comfyui_ownership === true && host.gpus.length === 1
+    && Number.isFinite(idleComfy?.max_utilization_percent) && idleComfy.max_utilization_percent >= 0
+    && idleComfy.max_utilization_percent <= 10
+    && Number.isSafeInteger(idleComfy?.max_residual_vram_bytes) && idleComfy.max_residual_vram_bytes >= 0;
+  for (const gpu of host.gpus) {
+    const hasComfy = allowComfy && gpu.processes.some((process) => process.is_comfyui === true && process.is_ollama !== true);
+    if (gpu.processes.some((process) => process.is_ollama !== true && !(hasComfy && process.is_comfyui === true))) return 'rescue_gpu_busy';
+    if (!hasComfy) {
+      if (gpu.utilization_percent > 0) return 'rescue_gpu_busy';
+      continue;
+    }
+    // Keep an already loaded Ollama model warm. Bound everything else,
+    // including unattributed driver allocations, by the existing media ceiling.
+    // Unknown Ollama allocation sizes cannot be subtracted from physical use.
+    const ollama = gpu.processes.filter((process) => process.is_ollama === true);
+    if (!Number.isSafeInteger(gpu.vram_used_bytes) || gpu.vram_used_bytes < 0
+      || gpu.processes.some((process) => !Number.isSafeInteger(process.pid) || process.pid <= 0)
+      || new Set(gpu.processes.map((process) => process.pid)).size !== gpu.processes.length
+      || ollama.some((process) => !Number.isSafeInteger(process.vram_bytes) || process.vram_bytes < 0)) return 'rescue_telemetry_unavailable';
+    const residual = gpu.vram_used_bytes - ollama.reduce((sum, process) => sum + process.vram_bytes, 0);
+    if (!Number.isSafeInteger(residual) || residual < 0) return 'rescue_telemetry_unavailable';
+    if (residual > idleComfy.max_residual_vram_bytes
+      || gpu.utilization_percent > idleComfy.max_utilization_percent) return 'rescue_gpu_busy';
+  }
   // Additional guardrail, NOT a prediction that the larger KV cache fits.
   // The operator's independently tested per-model cap remains mandatory.
   if (host.gpus.some((gpu) => gpu.vram_free_bytes < 2048 * 1024 * 1024)) return 'rescue_vram_headroom';

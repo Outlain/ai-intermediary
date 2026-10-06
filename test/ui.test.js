@@ -74,13 +74,21 @@ function harness(kind, storage = new Map()) {
   });
   const marker = kind === 'dashboard' ? "  byId('token-form').addEventListener" : '  bindEvents();';
   const names = kind === 'dashboard'
-    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage, changeCatchupView, refreshCatchupPage, unlockCatchup, performCatchupAction, render, renderHostGpu, setMaintenanceToken, syncRecoveryControls, performRecoveryAction, performMaintenanceAction, renderAIBackends, renderMedia, syncMediaRecoveryControls, performMediaRecoveryAction, getToken, setToken, getMaintenanceToken, syncCatchupControls'
+    ? 'eventSeverity, eventTitle, eventDetail, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage, changeCatchupView, refreshCatchupPage, unlockCatchup, performCatchupAction, render, renderHostGpu, setMaintenanceToken, syncRecoveryControls, performRecoveryAction, performMaintenanceAction, renderAIBackends, renderMedia, syncMediaRecoveryControls, performMediaRecoveryAction, getToken, setToken, getMaintenanceToken, syncCatchupControls'
     : 'restartInfo, applyEnvelope, updateDirtyState, useWarmModel, collectPatch, refreshCatchup, showAuth, startCatchupRefresh, stopCatchupRefresh, getToken, setToken';
   const boundary = source.indexOf(marker);
   assert.ok(boundary > 0, 'UI bootstrap marker must remain identifiable');
   vm.runInContext(`${source.slice(0, boundary)}\n globalThis.ui = { ${names} };\n})();`, context);
   return { context, ui: context.ui, nodes, fields, inputs, intervals, timeouts };
 }
+
+test('scheduler selection and reconciliation labels do not claim a GPU run or model reload', () => {
+  const { ui } = harness('dashboard');
+  assert.equal(ui.eventTitle({ type: 'request_dispatched', client: 'frigate' }), 'Request selected · Frigate');
+  assert.match(ui.eventDetail({ type: 'request_dispatched' }), /safety checks precede inference/);
+  assert.equal(ui.eventTitle({ type: 'model_reconciled' }), 'Model state refreshed');
+  assert.match(ui.eventDetail({ type: 'model_reconciled' }), /not a model load\/unload/);
+});
 
 test('UI wrappers load their independent assets and all literal element references exist', () => {
   for (const [kind, html, css, js] of [['dashboard', DASHBOARD_HTML, DASHBOARD_CSS, DASHBOARD_JS], ['settings', SETTINGS_DASHBOARD_HTML, SETTINGS_DASHBOARD_CSS, SETTINGS_DASHBOARD_JS]]) {

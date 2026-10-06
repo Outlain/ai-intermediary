@@ -102,6 +102,167 @@ async function setup(t, rescue = {}) {
   return { config, service, worker, helper, mock, state, calls, job, row, tickets, proxyUrl, report, send, retry };
 }
 
+function attachIdleComfy(f) {
+  const MiB = 1024 ** 2;
+  const comfy = { busy: false, reserved: 76 * MiB, instance: 'verified-worker', reads: 0,
+    proof: { supported: true, completed: true, loaded_models: 0, error: null, request_id: 'verified-cleanup' },
+    async bridgeStatus() { return { protocol: 'ai-intermediary-comfy-v1', local_only: true,
+      instance_id: this.instance, release_proof: { ...this.proof } }; },
+    async releaseEvidence({ maxReservedBytes }) {
+      this.reads++;
+      return { idle: !this.busy, released: !this.busy && this.reserved <= maxReservedBytes };
+    },
+  };
+  f.service.media.settings.enabled = true;
+  f.service.media.settings.max_idle_vram_mb = 1024;
+  f.service.media.verified = true;
+  f.service.media.adapters.set('comfy', comfy);
+  f.service.media.releaseProofs.set('comfy', { instanceId: comfy.instance, requestId: comfy.proof.request_id });
+  f.state.host.capabilities = { comfyui_ownership: true };
+  f.state.host.gpus[0] = { id: '0', processes_known: true,
+    processes: [{ pid: 2343, is_comfyui: true, vram_bytes: 145 * MiB }],
+    vram_used_bytes: 264 * MiB, vram_free_bytes: 32360 * MiB, utilization_percent: 4 };
+  let samples = 0;
+  f.helper.refresh = async () => {
+    f.state.host.sampled_at = new Date(Date.now() + ++samples).toISOString();
+    return f.state.host;
+  };
+  return comfy;
+}
+
+test('idle ComfyUI and 4% baseline allow one rescue after fresh proof and stable samples, without unloading', async (t) => {
+  const f = await setup(t);
+  await f.send(); await f.retry();
+  const comfy = attachIdleComfy(f);
+  // A cached Ollama model can coexist with the verified idle Comfy context.
+  f.state.host.gpus[0].processes.push({ pid: 100, is_ollama: true, vram_bytes: 8 * 1024 ** 3 });
+  f.state.host.gpus[0].vram_used_bytes += 8 * 1024 ** 3;
+  f.state.host.gpus[0].vram_free_bytes -= 8 * 1024 ** 3;
+  f.service.backendClient.unloadModel = async () => assert.fail('rescue must not unload a warm model for the idle check');
+  assert.equal(await f.send(), 200);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1].options.num_ctx, 20480);
+  assert.ok(comfy.reads >= 1 + f.config.media.stable_samples);
+  assert.equal(f.job.context_rescue.attempted, true);
+  assert.equal(f.mock.maxActive, 1);
+  assert.equal(f.service.media.blocked, false);
+});
+
+for (const [name, change, reason] of [
+  ['unknown process', (f) => f.state.host.gpus[0].processes.push({ pid: 88, name: 'python' }), 'rescue_gpu_busy'],
+  ['activity above existing limit', (f) => { f.state.host.gpus[0].utilization_percent = 6; }, 'rescue_gpu_busy'],
+  ['physical residual above existing limit', (f) => { f.state.host.gpus[0].vram_used_bytes = 1025 * 1024 ** 2; }, 'rescue_gpu_busy'],
+  ['missing ownership capability', (f) => { f.state.host.capabilities = {}; }, 'rescue_gpu_busy'],
+  ['stale samples', (f) => { f.state.host.stale = true; }, 'rescue_telemetry_unavailable'],
+  ['repeated sample', (f) => { f.state.host.sampled_at = new Date().toISOString(); f.helper.refresh = async () => f.state.host; }, 'rescue_gpu_busy'],
+  ['missing sample time', (f) => { f.helper.refresh = async () => f.state.host; }, 'rescue_telemetry_unavailable'],
+  ['unproven worker', (f) => { f.service.media.releaseProofs.set('comfy', null); f.comfy.reserved = 0; }, 'rescue_gpu_busy'],
+]) test(`Comfy rescue still defers ${name} without consuming the enlarged attempt`, async (t) => {
+  const f = await setup(t);
+  await f.send(); await f.retry();
+  f.comfy = attachIdleComfy(f);
+  change(f);
+  const failures = f.job.failures;
+  assert.equal(await f.send(), 422);
+  assert.equal(f.job.reason, reason);
+  assert.equal(f.job.context_rescue.attempted, false);
+  assert.equal(f.job.failures, failures);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.service.backend.recoveryRequired, false);
+});
+
+for (const scenario of ['queue', 'allocator', 'proof', 'restart', 'connection']) {
+  test(`Comfy ${scenario} changing during rescue checks prevents Ollama dispatch`, async (t) => {
+    const f = await setup(t);
+    await f.send(); await f.retry();
+    const comfy = attachIdleComfy(f);
+    const refresh = f.helper.refresh;
+    f.helper.refresh = async () => {
+      const host = await refresh();
+      if (scenario === 'queue') comfy.busy = true;
+      if (scenario === 'allocator') comfy.reserved = 129 * 1024 ** 2;
+      if (scenario === 'proof') comfy.proof.completed = false;
+      if (scenario === 'restart') comfy.instance = 'new-worker';
+      if (scenario === 'connection') comfy.bridgeStatus = async () => { throw new Error('disconnected'); };
+      return host;
+    };
+    assert.equal(await f.send(), 422);
+    assert.equal(f.job.context_rescue.attempted, false);
+    assert.equal(f.calls.length, 1);
+  });
+}
+
+test('manual pause during verified Comfy rescue prevents dispatch without consuming the attempt', async (t) => {
+  const f = await setup(t);
+  await f.send(); await f.retry();
+  attachIdleComfy(f);
+  const refresh = f.helper.refresh;
+  f.helper.refresh = async () => {
+    const host = await refresh();
+    await f.service.pauseMaintenance({}, 'test');
+    return host;
+  };
+  assert.equal(await f.send(), 503);
+  assert.equal(f.job.context_rescue.attempted, false);
+  assert.equal(f.calls.length, 1);
+});
+
+test('rescue cannot count a backwards sample or changing GPU process ownership as stable', async (t) => {
+  for (const mode of ['clock', 'owners']) {
+    const f = await setup(t);
+    await f.send(); await f.retry();
+    attachIdleComfy(f);
+    let sample = 0;
+    f.helper.refresh = async () => {
+      sample++;
+      f.state.host.sampled_at = new Date(Date.now() - (mode === 'clock' ? sample * 1000 : 0)).toISOString();
+      if (mode === 'owners') f.state.host.gpus[0].processes[0].pid++;
+      return f.state.host;
+    };
+    assert.equal(await f.send(), 422);
+    assert.equal(f.job.context_rescue.attempted, false);
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test('telemetry that expires during Comfy release reads is not accepted', async (t) => {
+  const f = await setup(t);
+  await f.send(); await f.retry();
+  const comfy = attachIdleComfy(f);
+  const read = comfy.releaseEvidence.bind(comfy);
+  comfy.releaseEvidence = async (options) => {
+    const result = await read(options);
+    if (comfy.reads > 1) f.helper.snapshot = () => ({ ...f.state.host, available: false, stale: true });
+    return result;
+  };
+  assert.equal(await f.send(), 422);
+  assert.equal(f.job.reason, 'rescue_telemetry_unavailable');
+  assert.equal(f.calls.length, 1);
+});
+
+test('live chat arriving during Comfy rescue samples ends the wait and keeps exclusive GPU priority', async (t) => {
+  const f = await setup(t);
+  await f.send(); await f.retry();
+  attachIdleComfy(f);
+  f.state.mode = 'success';
+  let live;
+  const refresh = f.helper.refresh;
+  f.helper.refresh = async () => {
+    if (!live) {
+      live = requestJson(f.proxyUrl + '/api/generate', { model: 'od-model', id: 'live', prompt: 'chat' }, { 'x-ollama-client': 'odysseus' });
+      await waitFor(() => f.service.scheduler.jobs.some((job) => job.client === 'odysseus'));
+    }
+    return refresh();
+  };
+  assert.equal(await f.send(), 422);
+  const response = await live;
+  assert.equal(response.status, 200); await response.text();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1].id, 'live');
+  assert.equal(f.job.context_rescue.attempted, false);
+  assert.equal(f.mock.maxActive, 1);
+});
+
 test('catch-up RAM pressure pauses admission and pre-dispatch while live requests keep their normal path', async (t) => {
   const f = await setup(t);
   f.config.host_helper.memory_guard.enabled = true;
