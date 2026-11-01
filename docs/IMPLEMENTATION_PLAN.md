@@ -5,7 +5,7 @@ It generalizes the original defaults below to numeric priorities, configurable
 catch-up order, per-source identification/pauses and recurring windows. The
 single-inference gate, durable attempt correlation and recovery boundaries remain.
 
-Implementation target: Frigate `0.19.0-bb6c2e9`, with an optional version-pinned
+Implementation target: Frigate `0.18.2` ROCm with backported review regeneration and an optional version-pinned
 completion bridge and capability checks rather than assuming a version number
 guarantees an API. Existing operator config,
 credentials, media, and Docker overrides must not be replaced.

@@ -1,10 +1,42 @@
-# Optional native Frigate completion bridge
+# Frigate 0.18.2 ROCm with native completion bridge
 
 This is a **custom, derived Frigate image**, not an official Frigate release.
-It supports the exact Python sources at Frigate commit
-[`bb6c2e9`](https://github.com/blakeblackshear/frigate/tree/bb6c2e9).
-It does not change camera settings, prompts, model options, recordings, or the
-Frigate database schema. Keep your original image for rollback.
+The image is based on the official **0.18.2 ROCm release for linux/amd64**, pinned
+by digest, including the dependencies and security fixes shipped in that release.
+The exact upstream source revision is
+[`cfa08c56b23d23280c3d0a218e5a43182c97445b`](https://github.com/blakeblackshear/frigate/tree/v0.18.2).
+It adds the completion bridge and backports individual review regeneration from
+the earlier development integration. The patch does not change camera settings,
+prompts, model options, recordings, authentication rules, or database schema.
+
+Published image: `ghcr.io/outlain/frigate-intermediary:0.18.2-rocm-v1`.
+The Frigate-specific GitHub release includes `image-digest.txt` for immutable
+deployment. This is a separate image from AI Intermediary; do not replace the
+intermediary service with it.
+
+## Existing development-image installations
+
+**Do not replace `bb6c2e9-v1` by changing only the image tag.** That image used a
+0.19 development base, which can already have rewritten configuration and the
+database. Stable 0.18.2 has no reverse migration. In particular, 0.19's `models`
+list replaces the older `detectors`/`model` configuration, and Birdseye `modes`
+replaces `mode`. Changing the configuration version number alone does not
+convert these fields.
+
+Before deploying, stop Frigate at a planned boundary and make a complete backup
+of `/config` including `frigate.db` and any SQLite sidecars. Keep the original
+image digest. Convert and validate a **copy** of the configuration, and check a
+copy of the database. The development base added migrations 036–039; their
+presence does not alone prevent stable startup, but stable ignores recording
+stream types and later migrations may need separate reconciliation. Do not
+delete migration records or rebuild the live database to hide the difference.
+The automatic `/config/backup_config.yaml` file is not a guaranteed complete
+pre-development backup and contains no database backup.
+
+Use a matched pre-development configuration/database backup only if losing
+newer metadata is acceptable. Otherwise, plan an explicit migration of the
+current data. This image does **not** perform that migration automatically.
+See [official backup and rollback guidance](https://docs.frigate.video/frigate/updating/).
 
 ## Why this is needed
 
@@ -27,45 +59,27 @@ The intermediary remains responsible for queue priority, GPU serialization,
 pause/drain, retries, and bounded pending confirmations. Merely installing this
 image does not increase Ollama concurrency or fix a context-size HTTP 400.
 
-## Build without changing your running Frigate
+## Pull or build without changing your running Frigate
 
-Do this on the **Frigate Docker host**, using a checkout of this repository that
-contains this folder. The intermediary host does not need to build Frigate.
+On the **Frigate Docker host**:
 
-1. Record your current image and its immutable digest:
+```bash
+docker pull ghcr.io/outlain/frigate-intermediary:0.18.2-rocm-v1
+```
 
-   ```bash
-   docker inspect frigate --format '{{.Config.Image}}'
-   docker inspect frigate --format '{{.Image}}'
-   ```
+Pulling downloads the image without restarting Frigate. For a local build from
+this repository:
 
-   Run this using the image ID printed by the second command:
+```bash
+docker build --platform linux/amd64 \
+  -t frigate-intermediary:0.18.2-rocm-v1 integrations/frigate
+```
 
-   ```bash
-   docker image inspect IMAGE_ID_FROM_ABOVE --format '{{json .RepoDigests}}'
-   ```
-
-2. Use the appropriate `repository@sha256:...` digest from that output as the
-   base. Preserve your existing hardware variant. **Do not substitute a moving
-   `dev` or `stable` tag, or invent a tag from the version shown in the UI.**
-
-   From the intermediary repository root:
-
-   ```bash
-   docker build \
-     --build-arg FRIGATE_BASE_IMAGE='YOUR_EXISTING_REPOSITORY@sha256:YOUR_DIGEST' \
-     -t frigate-intermediary:bb6c2e9-v1 \
-     integrations/frigate
-   ```
-
-   The build verifies SHA-256 hashes of **all seven affected upstream files**
-   before changing any of them. Another build, an already patched image, or a
-   mismatched source refuses to build. Do not bypass this check: a newer Frigate
-   source requires a reviewed, separately tested bridge revision.
-
-3. The image is prepared but your running container has not changed. Back up
-   Frigate's configuration and database using your normal procedure before
-   scheduling a restart. Do not remove media/configuration volumes.
+The Dockerfile pins the official ROCm image to
+`sha256:5c852fb2cda16fc7d642128df0d4cbdba67477282480f83d6f3ba188c3ae5728`.
+The build verifies SHA-256 hashes of **all eight affected upstream files** before
+changing any of them. Mismatched or previously patched sources refuse to build.
+Do not bypass this check for another release or substitute a moving tag.
 
 ## Enable during a deliberate Frigate update
 
@@ -81,7 +95,7 @@ Compose file:
 ```yaml
 services:
   frigate:
-    image: frigate-intermediary:bb6c2e9-v1
+    image: ghcr.io/outlain/frigate-intermediary:0.18.2-rocm-v1
     environment:
       FRIGATE_INTERMEDIARY_BRIDGE: "1"
 ```
@@ -154,12 +168,12 @@ callback can reach it.
 
 ## Rollback
 
-Restore the original Frigate image reference recorded above, remove/disable
-`FRIGATE_INTERMEDIARY_BRIDGE`, and recreate only Frigate during a planned restart.
-Do not delete volumes. The intermediary must detect native capabilities afresh
-and use its conservative stock-Frigate path. Outstanding attempts may need their
-normal reconciliation timeout after a restart; never force them complete just
-because the image changed.
+Restore the original Frigate image and its matched configuration/database backup
+during a planned restart. Preserve media volumes. Keep the bridge environment
+enabled when returning to a compatible custom image; disable it for stock
+Frigate. The intermediary must detect native capabilities afresh. Outstanding
+attempts may need their normal reconciliation timeout after a restart; never
+force them complete just because the image changed.
 
 ## Development tests
 
@@ -170,12 +184,13 @@ for the standalone bridge tests:
 python3 -m unittest discover -s integrations/frigate -p 'test_*.py' -v
 ```
 
-For exact-source integration tests, download the seven files listed in
-`apply_bridge.HASHES` from the official `bb6c2e9` source into an isolated folder
-as `0.py` through `6.py` in that dictionary's order, then run:
+For exact-source integration tests, download and verify the eight files listed
+in `apply_bridge.HASHES` from the pinned official release source, then run:
 
 ```bash
-FRIGATE_BRIDGE_SOURCE_FIXTURES=/path/to/isolated/source-fixtures \
+fixture_dir=$(mktemp -d)
+python3 integrations/frigate/fetch_test_sources.py "$fixture_dir"
+FRIGATE_BRIDGE_SOURCE_FIXTURES="$fixture_dir" \
   python3 -m unittest discover -s integrations/frigate -p 'test_*.py' -v
 ```
 
@@ -183,4 +198,8 @@ These tests compile every transformed file and execute the transformed native
 object/review API, IPC, media, thread, provider, and save paths with controlled
 stubs. They verify identity propagation, premature-completion prevention,
 invalid-output/media failures, thread isolation, callback limits, and safety.
-They are not a substitute for a staged smoke test with the actual derived image.
+The image workflow also verifies the installed patch byte-for-byte, imports the
+actual Frigate modules with the image's dependencies, and reruns these tests
+inside the built container before publishing. No camera or GPU is used in CI;
+these checks are not a substitute for testing the deployment's AMD hardware and
+validated configuration.

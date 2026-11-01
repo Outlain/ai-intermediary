@@ -1,0 +1,88 @@
+name: Frigate bridge image
+
+on:
+  push:
+    branches: ["codex/frigate-0.18.2-rocm"]
+    tags: ["frigate-0.18.2-rocm-v*"]
+  pull_request:
+    paths:
+      - "integrations/frigate/**"
+      - ".github/workflows/frigate-image.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify publication safety
+        run: node scripts/publication-check.js
+
+      - name: Verify exact upstream sources and integration tests
+        run: |
+          fixture_dir="$RUNNER_TEMP/frigate-source-fixtures"
+          python3 integrations/frigate/fetch_test_sources.py "$fixture_dir"
+          echo "FRIGATE_BRIDGE_SOURCE_FIXTURES=$fixture_dir" >> "$GITHUB_ENV"
+          FRIGATE_BRIDGE_SOURCE_FIXTURES="$fixture_dir" \
+            python3 -m unittest discover -s integrations/frigate -p 'test_*.py' -v
+
+      - name: Select image reference
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/frigate-intermediary"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^frigate-0\.18\.2-rocm-v[1-9][0-9]*$ ]]
+            version="${GITHUB_REF_NAME#frigate-}"
+          else
+            version="ci-${GITHUB_SHA}"
+          fi
+          echo "FRIGATE_IMAGE=$image:$version" >> "$GITHUB_ENV"
+
+      - name: Build AMD ROCm image from pinned official release
+        run: |
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+            --tag "$FRIGATE_IMAGE" integrations/frigate
+
+      - name: Verify installed code and real Frigate imports without cameras or GPU
+        run: |
+          docker run --rm --network none --entrypoint python3 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/integrations/frigate,dst=/bridge-tests,readonly" \
+            --mount "type=bind,src=$FRIGATE_BRIDGE_SOURCE_FIXTURES,dst=/bridge-fixtures,readonly" \
+            -e FRIGATE_BRIDGE_SOURCE_FIXTURES=/bridge-fixtures \
+            -e PYTHONPATH=/opt/frigate \
+            "$FRIGATE_IMAGE" /bridge-tests/verify_image.py
+          docker run --rm --network none --entrypoint python3 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/integrations/frigate,dst=/bridge-tests,readonly" \
+            --mount "type=bind,src=$FRIGATE_BRIDGE_SOURCE_FIXTURES,dst=/bridge-fixtures,readonly" \
+            -e FRIGATE_BRIDGE_SOURCE_FIXTURES=/bridge-fixtures \
+            "$FRIGATE_IMAGE" -m unittest discover -s /bridge-tests -p 'test_*.py' -v
+
+      - name: Publish tested image
+        if: startsWith(github.ref, 'refs/tags/frigate-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$FRIGATE_IMAGE"
+          docker image inspect "$FRIGATE_IMAGE" --format '{{index .RepoDigests 0}}' > image-digest.txt
+          cat image-digest.txt
+
+      - name: Publish Frigate-specific release and digest
+        if: startsWith(github.ref, 'refs/tags/frigate-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" image-digest.txt \
+            --verify-tag --latest=false \
+            --title "Frigate ${GITHUB_REF_NAME#frigate-} with AI Intermediary bridge" \
+            --notes-file integrations/frigate/RELEASE.md
