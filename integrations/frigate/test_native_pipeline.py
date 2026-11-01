@@ -1,7 +1,7 @@
 """Execute transformed native functions with controlled media/IPC/model stubs.
 
 Optional exact-source fixtures are downloaded from the pinned public source;
-set FRIGATE_BRIDGE_SOURCE_FIXTURES to a folder containing 0.py through 6.py in
+set FRIGATE_BRIDGE_SOURCE_FIXTURES to a folder containing numbered .py files in
 apply_bridge.HASHES order. No camera, network, model, or Frigate DB is accessed.
 """
 
@@ -20,6 +20,12 @@ from unittest.mock import Mock, patch
 from test_bridge import bridge, client, installer, TICKET
 
 NS = types.SimpleNamespace
+
+
+class HTTPException(Exception):
+    def __init__(self, status_code, detail):
+        self.status_code = status_code
+        super().__init__(detail)
 
 
 def function(source, name, namespace):
@@ -60,7 +66,8 @@ class NativePipelineTests(unittest.TestCase):
                                preferred_language=None, activity_context_prompt="", response_style="default")
         self.camera = NS(objects=NS(genai=NS(enabled=True)), review=NS(genai=self.genai_config),
                          zones={}, get_formatted_name=lambda: "Front")
-        self.config = NS(cameras={"front": self.camera}, all_labels=[], all_attributes=[],
+        self.config = NS(cameras={"front": self.camera},
+                         model=NS(merged_labelmap={0: "person"}, all_attributes=[]),
                          semantic_search=NS(enabled=False))
         self.manager = NS(description_client=self.provider)
         self.namespace = {
@@ -75,10 +82,17 @@ class NativePipelineTests(unittest.TestCase):
             "TrackedObjectUpdateTypesEnum": NS(description="description"),
             "get_event_thumbnail_bytes": lambda event: self.media[0] if self.media else None,
             "ensure_jpeg_bytes": lambda image: image,
-            "get_recording_buffer_extension": lambda duration: 1,
             "UPDATE_EVENT_DESCRIPTION": "event-description", "UPDATE_REVIEW_DESCRIPTION": "review-description",
             "JSONResponse": lambda **kwargs: NS(**kwargs),
         }
+        review_tree = ast.parse(self.sources["frigate/data_processing/post/review_descriptions.py"])
+        for node in review_tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in (
+                        "RECORDING_BUFFER_EXTENSION_PERCENT", "MIN_RECORDING_DURATION",
+                    ):
+                        self.namespace[target.id] = ast.literal_eval(node.value)
         async def camera_access(*args, **kwargs):
             return None
         self.namespace["require_camera_access"] = camera_access
@@ -110,7 +124,7 @@ class NativePipelineTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {"FRIGATE_INTERMEDIARY_BRIDGE": "1"})
         self.environment.start()
         self.addCleanup(self.environment.stop)
-        self.fastapi = patch.dict(sys.modules, {"fastapi": NS(HTTPException=RuntimeError)})
+        self.fastapi = patch.dict(sys.modules, {"fastapi": NS(HTTPException=HTTPException)})
         self.fastapi.start()
         self.addCleanup(self.fastapi.stop)
 
@@ -118,10 +132,10 @@ class NativePipelineTests(unittest.TestCase):
         method = function(self.sources[source], name, self.namespace)
         setattr(self.processor, name, types.MethodType(method, self.processor))
 
-    def review_pipeline(self):
+    def prepare_review_pipeline(self):
         path = "frigate/data_processing/post/review_descriptions.py"
         function(self.sources[path], "run_analysis", self.namespace)
-        for name in ("handle_request", "regenerate_description", "start_analysis"):
+        for name in ("handle_request", "regenerate_description"):
             self.attach(path, name)
         context = NS(requestor=NS(send_data=lambda topic, data: self.processor.handle_request(topic, data)))
         native_ipc = function(self.sources["frigate/embeddings/__init__.py"], "regenerate_review_description", self.namespace)
@@ -129,6 +143,10 @@ class NativePipelineTests(unittest.TestCase):
         api = function(self.sources["frigate/api/review.py"], "regenerate_review_description", self.namespace)
         request = NS(headers={bridge.HEADER: TICKET}, app=NS(genai_manager=self.manager,
                      frigate_config=self.config, embeddings=context))
+        return api, request
+
+    def review_pipeline(self):
+        api, request = self.prepare_review_pipeline()
         response = asyncio.run(api(request, self.event.id))
         self.assertEqual(response.status_code, 202)
         self.assertTrue(self.completed.wait(5), "Native generation never reported a terminal outcome")
@@ -168,6 +186,77 @@ class NativePipelineTests(unittest.TestCase):
         self.media = []
         self.review_pipeline()
         self.assertEqual(self.events, [("completion", "failed", TICKET)])
+
+    def test_review_camera_access_denied_does_not_dispatch(self):
+        async def denied(*args, **kwargs):
+            raise PermissionError("camera access denied")
+        self.namespace["require_camera_access"] = denied
+        api, request = self.prepare_review_pipeline()
+        request.app.embeddings.regenerate_review_description = Mock()
+        with self.assertRaises(PermissionError):
+            asyncio.run(api(request, self.event.id))
+        request.app.embeddings.regenerate_review_description.assert_not_called()
+        self.assertEqual(self.events, [])
+
+    def test_review_invalid_ticket_does_not_dispatch(self):
+        api, request = self.prepare_review_pipeline()
+        request.headers[bridge.HEADER] = "invalid"
+        request.app.embeddings.regenerate_review_description = Mock()
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(api(request, self.event.id))
+        self.assertEqual(caught.exception.status_code, 400)
+        request.app.embeddings.regenerate_review_description.assert_not_called()
+        self.assertEqual(self.events, [])
+
+    def test_review_unavailable_bridge_does_not_dispatch(self):
+        api, request = self.prepare_review_pipeline()
+        request.app.embeddings.regenerate_review_description = Mock()
+        with patch.dict(os.environ, {"FRIGATE_INTERMEDIARY_BRIDGE": "0"}):
+            with self.assertRaises(HTTPException) as caught:
+                asyncio.run(api(request, self.event.id))
+        self.assertEqual(caught.exception.status_code, 409)
+        request.app.embeddings.regenerate_review_description.assert_not_called()
+        self.assertEqual(self.events, [])
+
+    def test_review_rejected_ipc_request_is_not_reported_as_accepted(self):
+        api, request = self.prepare_review_pipeline()
+        # Stable Frigate's socket lock returns an empty response when another
+        # request owns the channel. No native worker was started in that case.
+        request.app.embeddings.requestor.send_data = Mock(return_value="")
+        response = asyncio.run(api(request, self.event.id))
+        self.assertEqual(response.status_code, 503)
+        request.app.embeddings.requestor.send_data.assert_called_once()
+        self.assertEqual(self.events, [])
+
+    def test_review_unfinished_or_disabled_camera_does_not_dispatch(self):
+        api, request = self.prepare_review_pipeline()
+        request.app.embeddings.regenerate_review_description = Mock()
+        self.event.end_time = None
+        self.assertEqual(asyncio.run(api(request, self.event.id)).status_code, 400)
+        self.event.end_time = 200
+        self.genai_config.enabled = False
+        self.assertEqual(asyncio.run(api(request, self.event.id)).status_code, 400)
+        self.config.cameras.clear()
+        self.assertEqual(asyncio.run(api(request, self.event.id)).status_code, 400)
+        request.app.embeddings.regenerate_review_description.assert_not_called()
+        self.assertEqual(self.events, [])
+
+    def test_review_untagged_regeneration_does_not_send_completion(self):
+        api, request = self.prepare_review_pipeline()
+        request.headers.clear()
+        saved = threading.Event()
+        original_save = self.processor.requestor.send_data
+
+        def save(*args):
+            original_save(*args)
+            saved.set()
+
+        self.processor.requestor.send_data = save
+        response = asyncio.run(api(request, self.event.id))
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(saved.wait(5))
+        self.assertEqual(self.events, [("inference", None), ("save", "review-description")])
+        self.assertFalse(self.completed.is_set())
 
     def test_object_actual_api_ipc_provider_and_save_success(self):
         self.object_pipeline()

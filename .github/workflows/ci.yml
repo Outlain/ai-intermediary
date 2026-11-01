@@ -44,20 +44,7 @@ jobs:
         run: |
           fixture_dir=$(mktemp -d)
           echo "FRIGATE_BRIDGE_SOURCE_FIXTURES=$fixture_dir" >> "$GITHUB_ENV"
-          paths=(
-            frigate/api/event.py
-            frigate/api/review.py
-            frigate/embeddings/__init__.py
-            frigate/embeddings/maintainer.py
-            frigate/data_processing/post/object_descriptions.py
-            frigate/data_processing/post/review_descriptions.py
-            frigate/genai/plugins/ollama.py
-          )
-          for i in "${!paths[@]}"; do
-            curl --fail --silent --show-error --location --retry 3 --max-time 30 \
-              "https://raw.githubusercontent.com/blakeblackshear/frigate/bb6c2e9/${paths[$i]}" \
-              --output "$fixture_dir/$i.py"
-          done
+          python3 integrations/frigate/fetch_test_sources.py "$fixture_dir"
 
       - name: Test pinned Frigate bridge
         run: python3 -m unittest discover -s integrations/frigate -p 'test_*.py' -v

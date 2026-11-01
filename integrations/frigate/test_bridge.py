@@ -1,5 +1,6 @@
 """Run: python3 -m unittest discover -s integrations/frigate -p 'test_*.py'."""
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -135,6 +136,23 @@ class BridgeTests(unittest.TestCase):
             native(processor(), attempt=TICKET)
         self.assertEqual(events, ["child-native-finished", "parent-returned", "success"])
 
+    def test_live_analysis_returns_without_waiting_for_child(self):
+        release = threading.Event()
+        entered = threading.Event()
+
+        def child():
+            entered.set()
+            release.wait(5)
+
+        worker = bridge.start_analysis_thread(target=child, args=())
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertTrue(worker.is_alive(), "Live analysis should remain asynchronous")
+        finally:
+            release.set()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
     def test_live_and_two_attempt_threads_do_not_contaminate_each_other(self):
         barrier = threading.Barrier(3)
         seen = {}
@@ -233,7 +251,7 @@ class InstallerTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(fixtures / f"{number}.py", path)
             prepared = installer.prepare(root)
-            self.assertEqual(len(prepared), 8)
+            self.assertEqual(len(prepared), len(installer.HASHES) + 1)
             for path, source in prepared.items():
                 compile(source, str(path), "exec")
             api = prepared[root / "frigate/api/review.py"]
@@ -243,6 +261,33 @@ class InstallerTests(unittest.TestCase):
             review = prepared[root / "frigate/data_processing/post/review_descriptions.py"]
             self.assertIn('kwargs={"attempt": request_data.get("attempt")}', review)
             self.assertIn("intermediary_bridge.start_analysis_thread", review)
+            route = next(node for node in ast.parse(api).body
+                         if isinstance(node, ast.AsyncFunctionDef)
+                         and node.name == "regenerate_review_description")
+            decorators = " ".join(ast.unparse(node) for node in route.decorator_list)
+            self.assertIn("router.put('/review/{review_id}/regenerate_description'", decorators)
+            self.assertIn("dependencies=[Depends(require_role(['admin']))]", decorators)
+
+    @unittest.skipUnless(os.environ.get("FRIGATE_BRIDGE_SOURCE_FIXTURES"), "optional exact-source integration fixtures not provided")
+    def test_stable_live_processing_and_ipc_lock_are_preserved(self):
+        fixtures = Path(os.environ["FRIGATE_BRIDGE_SOURCE_FIXTURES"])
+        originals = {relative: (fixtures / f"{number}.py").read_text()
+                     for number, relative in enumerate(installer.HASHES)}
+
+        def named_function(source, name):
+            return next(node for node in ast.walk(ast.parse(source))
+                        if isinstance(node, ast.FunctionDef) and node.name == name)
+
+        # The new retained-review route must not replace stable live handling
+        # or regress the stable IPC socket concurrency fix.
+        for relative, name in (
+            ("frigate/data_processing/post/review_descriptions.py", "process_data"),
+            ("frigate/comms/embeddings_updater.py", "send_data"),
+        ):
+            original = originals[relative]
+            transformed = installer.transform(relative, original)
+            self.assertEqual(ast.dump(named_function(original, name)),
+                             ast.dump(named_function(transformed, name)))
 
 
 if __name__ == "__main__":
