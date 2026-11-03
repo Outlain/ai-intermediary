@@ -1,4 +1,4 @@
-FROM node:24-alpine
+FROM node:26-alpine
 
 ARG INTERMEDIARY_BUILD=unknown
 ENV NODE_ENV=production \
